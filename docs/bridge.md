@@ -76,6 +76,8 @@ bash scripts/verify-patch.sh   # 全新克隆上游 → 打 patch → node --che
 
 含 `scope: 'server'` 路由的声明，host 主人必须在 zen-remote 设置页「插件桥」里逐插件打开，默认 OFF。没打开时面板 503，reason 是 `consent-off`。这是设计，不是 bug。
 
+> **⚠️ 两个开关，别用错（2026-11-22 源码核查，zen-remote 2.5.4）**：设置页「插件桥」开关保存后写 row 层，生效值与 file 层相同，但 row 会遮蔽 file——保存过一次之后，改 `lan-gate.config.json` 不再起作用。**插件详情页顶部的向导开关不要点**：它把同意值存成 JSON 字符串，读取侧 `consentMap` 拒收，点完看着成功了、实际同意没生效。想用 UI 开同意，只走设置页。证据见 `test-work/task4-result.md`（源码推导，未 live 复现）。
+
 打开之前想清楚：远程能完整操作 Bots 面板，包括招团队、删卡片、改设置、代答提问、上传图片。只给可信设备开；不用时关掉。
 
 ## 单机同环部署：relay 会 401（2026-11-22 实测）

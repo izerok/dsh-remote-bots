@@ -100,7 +100,7 @@
 
 - 方式：两端 profile 的 `package.json` 依赖改为 `"@kadaliao/dsh-bots": "link:/home/hatch/workspace/dsh-remote-bots/test-work/bots-0171-patched"`（绝对路径 link），`bundles` 不变；各跑 `pnpm install --no-frozen-lockfile`
 - 结果：两端 `node_modules/@kadaliao/dsh-bots` 均为指向 `bots-0171-patched` 的 symlink，`package.json` 版本读出 `0.17.2-zen.1`
-- 同意开关：`admin/plugin-bridge` 是 **GET-only**（POST 返回 405），同意值存在插件配置 `pluginBridgeConsent`（name→boolean map）里；配置支持 file 层，因此在 host 的 `<DSH_HOME>/lan-gate.config.json` 写 `{"pluginBridgeConsent": {"@kadaliao/dsh-bots": true}}`——与设置页 UI 勾选后落盘的是同一个值；**浏览器 UI 点勾选这条路本身未验**（沙箱无浏览器，见“未验”）
+- 同意开关：`admin/plugin-bridge` 是 **GET-only**（POST 返回 405），同意值存在插件配置 `pluginBridgeConsent`（name→boolean map）里；配置支持 file 层，因此在 host 的 `<DSH_HOME>/lan-gate.config.json` 写 `{"pluginBridgeConsent": {"@kadaliao/dsh-bots": true}}`——与设置页 UI 勾选后**最终生效的值相同（同一键、同一对象值），但落盘位置不同**：设置页保存写 row 层（DSH 配置行文档），row 优先于 file，保存后改 `lan-gate.config.json` 不再起作用。**注意：插件详情页顶部的向导开关不要用**——它把同意值存成 JSON 字符串，读取侧 `consentMap` 拒收，点完表面成功、同意静默不生效（zen-remote 2.5.4 源码核查，`GatewayWizard.tsx:810` vs `config.ts:293`，未 live 复现；详见 `test-work/task4-result.md`）。**浏览器 UI 点勾选这两条路本身未验**（沙箱浏览器够不着回环服务，见“未验”）
 - 重启两端（host 带 `LAN_GATE_HOST=0.0.0.0`，原因见 T4 附录）后验证：
   - host `GET /__dsh_bots/state` → 200，`botsVersion: 0.17.2-zen.1`，6 机器人（T2 hire 的 OPC 团队在重启后仍在）
   - host `GET admin/plugin-bridge` → 200：`[{"plugin":"@kadaliao/dsh-bots","version":"0.17.2-zen.1","hasServerScope":true,"consent":true,"adapted":false}]`——声明已登记、同意为真、有 server scope、非适配器代接
@@ -129,7 +129,7 @@
 ## 未验（缺条件，非失败）
 
 1. **一切需要模型调用的行为**：机器人实际回复、Atlas 调度分派、定时任务、token 统计——无模型 key，按任务要求不编造，全部未验
-2. **设置页 UI 点勾选同意**：同意开关是经 `lan-gate.config.json` 的 file 层设置的（与 UI 落盘同一配置值）；浏览器里点“插件桥”勾选的路径未走（沙箱浏览器够不着回环服务）
+2. **设置页 UI 点勾选同意**：同意开关是经 `lan-gate.config.json` 的 file 层设置的；设置页开关保存后最终生效值与 file 层相同、但落盘在 row 层（row 遮蔽 file）。另插件详情页向导开关经源码核查为静默失效（存 JSON 字符串，读取侧拒收），不要用。浏览器里实际点这两个开关的路径均未走（沙箱浏览器够不着回环服务）
 3. **真实双机 relay**：本测试的 host/client 同在一台沙箱机器，relay 靠 `127.0.1.1` 绕法连通；两台真实机器之间的 relay 未测（协议本身已验证，见 T4 附录）
 4. **真机/手机端**：配对流程全程走 HTTP 路由，未用真手机或 PWA
 
