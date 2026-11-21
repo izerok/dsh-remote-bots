@@ -1,0 +1,47 @@
+diff --git a/index.js b/index.js
+index 61615f9..ad3ecc7 100644
+--- a/index.js
++++ b/index.js
+@@ -6488,6 +6488,30 @@ export function apply(ctx, config, deps = {}) {
+   if (typeof ctx.inject === 'function') ctx.inject(['webServer'], mountRoutes);
+   else if (ctx.webServer) mountRoutes({ webServer: ctx.webServer, effect: (fn) => ctx.effect(fn) });
+ 
++  // dsh-remote-bots: zen-remote Plugin Bridge declaration (optional).
++  // No zen-remote installed -> ctx.inject(['zenRemote']) never fires, so this
++  // is a no-op and Bots behaves exactly as upstream. With dsh-zen-remote
++  // >= 2.1 installed on BOTH ends, the Bots panel (/__dsh_bots/*) is forwarded
++  // to the host instead of falling back to the client machine's empty data.
++  // Scope is 'server' because the panel is whole-machine data (teams, board,
++  // usage, settings), not one session: the host owner must explicitly enable
++  // it per plugin in zen-remote Settings -> Plugin Bridge (default OFF).
++  // maxBody 41943040 (40 MiB) covers Bots' own limits: postJson default
++  // MAX_BODY 4 MiB, and the images route limit MAX_IMAGE_UPLOAD 40 MiB.
++  if (typeof ctx.inject === 'function') ctx.inject(['zenRemote'], (scope) => {
++    const bridge = scope.zenRemote;
++    if (!bridge || typeof bridge.bridge !== 'function') return;
++    const declaration = {
++      plugin: '@kadaliao/dsh-bots',
++      version: '0.17.2-zen.1',
++      routes: [
++        { path: '/__dsh_bots', prefix: true, scope: 'server', methods: ['GET', 'POST'], maxBody: 41943040 },
++      ],
++    };
++    const dispose = bridge.bridge(declaration);
++    ctx.effect(() => dispose, 'bots: zen-remote bridge declaration');
++  });
++
+   /**
+    * `${R}/image/<attachment id>`: an image of a message (Bots 0.17), read from Harness's attachment store,
+    * which verifies the bytes against the reference. Only images a message here named are served.
+diff --git a/package.json b/package.json
+index fffd478..bbbf1d3 100644
+--- a/package.json
++++ b/package.json
+@@ -1,6 +1,6 @@
+ {
+   "name": "@kadaliao/dsh-bots",
+-  "version": "0.17.1",
++  "version": "0.17.2-zen.1",
+   "type": "module",
+   "description": "Grok-style bots for DeepSeek Harness: create bots with their own avatar, persona, model, skills, apps, scheduled tasks and memory; they message each other, a dispatcher bot hands out the work through each team's lead, a board shows every request as a card filed under projects (with their own memory), and a usage view counts tokens by bot, task and day.",
+   "exports": {

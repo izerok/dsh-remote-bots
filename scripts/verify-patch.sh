@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # End-to-end patch check, no DSH needed:
-# fresh-clone upstream dsh-bots @ f51ca93 -> apply the patch -> node --check
-# -> run the bridge declaration validator.
+# fresh-clone upstream dsh-bots @ c265612 (0.17.1) -> apply the patch
+# -> node --check -> run the bridge declaration validator.
 # Usage: bash scripts/verify-patch.sh  (run from the repo root)
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

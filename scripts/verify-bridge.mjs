@@ -43,6 +43,14 @@ check(route.scope === 'server', "route.scope is 'server' (panel is whole-machine
 check(JSON.stringify([...route.methods].sort()) === JSON.stringify(['GET', 'POST']), 'route.methods are GET+POST', JSON.stringify(route.methods));
 check(Number.isInteger(route.maxBody) && route.maxBody > 0 && route.maxBody <= 500 * 1024 * 1024, 'route.maxBody within 1..500 MiB', String(route.maxBody));
 check(route.maxBody >= 40 * 1024 * 1024, 'route.maxBody covers bots image-upload limit (40 MiB)', String(route.maxBody));
+// rewriteIds (zen-remote 2.4+, PB-25a): the { fields } form is the value
+// deep-scan PLUS a position rewrite for newly-created ids at the declared
+// paths. POST send/open and the ticket routes answer a top-level
+// `sessionId` the panel feeds to env.openSession(); without this the host's
+// real id reaches the remote browser and "open conversation" fails.
+check(route.rewriteIds !== undefined && typeof route.rewriteIds === 'object' && !Array.isArray(route.rewriteIds), 'route.rewriteIds is the { fields } form (not true, not absent)', JSON.stringify(route.rewriteIds));
+check(Array.isArray(route.rewriteIds?.fields) && JSON.stringify(route.rewriteIds.fields) === JSON.stringify(['sessionId']), "route.rewriteIds.fields is exactly ['sessionId']", JSON.stringify(route.rewriteIds?.fields));
+check(Array.isArray(route.rewriteIds?.fields) && route.rewriteIds.fields.every((f) => typeof f === 'string' && f.length > 0 && f.split('.').every((s) => /^[A-Za-z0-9_-]+$/.test(s) && !/^\d+$/.test(s))), 'rewriteIds.fields paths are valid dot paths (PB-25a: no empty/numeric/wildcard segments)', JSON.stringify(route.rewriteIds?.fields));
 check(src.includes("ctx.inject(['zenRemote']"), "ctx.inject(['zenRemote']) present");
 check(src.includes("ctx.effect(() => dispose, 'bots: zen-remote bridge declaration')"), 'dispose registered via ctx.effect');
 check(!Object.keys(declaration).some((k) => !['plugin', 'version', 'routes'].includes(k)), 'no unknown declaration fields');

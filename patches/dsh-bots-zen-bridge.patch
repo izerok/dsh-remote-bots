@@ -1,8 +1,8 @@
 diff --git a/index.js b/index.js
-index 61615f9..ad3ecc7 100644
+index 61615f9..8f9f567 100644
 --- a/index.js
 +++ b/index.js
-@@ -6488,6 +6488,30 @@ export function apply(ctx, config, deps = {}) {
+@@ -6488,6 +6488,40 @@ export function apply(ctx, config, deps = {}) {
    if (typeof ctx.inject === 'function') ctx.inject(['webServer'], mountRoutes);
    else if (ctx.webServer) mountRoutes({ webServer: ctx.webServer, effect: (fn) => ctx.effect(fn) });
  
@@ -16,14 +16,24 @@ index 61615f9..ad3ecc7 100644
 +  // it per plugin in zen-remote Settings -> Plugin Bridge (default OFF).
 +  // maxBody 41943040 (40 MiB) covers Bots' own limits: postJson default
 +  // MAX_BODY 4 MiB, and the images route limit MAX_IMAGE_UPLOAD 40 MiB.
++  // rewriteIds { fields: ['sessionId'] } (zen-remote 2.4+, PB-25a): the
++  // { fields } form is the value deep-scan PLUS a position rewrite for
++  // newly-created ids at the declared paths. POST send/open and the ticket
++  // routes answer a top-level `sessionId` the panel then feeds to
++  // env.openSession(); without this the host's real id reaches the remote
++  // browser and "open conversation" fails (the id is unknown on the client).
++  // Known limits: object KEYS are never rewritten (state.sessionMap keys
++  // stay real), and ids nested in arrays (bots[].sessionId in teams/hire)
++  // are only rewritten when already in the request/known inventory — a
++  // newly hired bot's home id is neither, so it stays real.
 +  if (typeof ctx.inject === 'function') ctx.inject(['zenRemote'], (scope) => {
 +    const bridge = scope.zenRemote;
 +    if (!bridge || typeof bridge.bridge !== 'function') return;
 +    const declaration = {
 +      plugin: '@kadaliao/dsh-bots',
-+      version: '0.17.2-zen.1',
++      version: '0.17.2-zen.2',
 +      routes: [
-+        { path: '/__dsh_bots', prefix: true, scope: 'server', methods: ['GET', 'POST'], maxBody: 41943040 },
++        { path: '/__dsh_bots', prefix: true, scope: 'server', methods: ['GET', 'POST'], maxBody: 41943040, rewriteIds: { fields: ['sessionId'] } },
 +      ],
 +    };
 +    const dispose = bridge.bridge(declaration);
@@ -34,14 +44,14 @@ index 61615f9..ad3ecc7 100644
     * `${R}/image/<attachment id>`: an image of a message (Bots 0.17), read from Harness's attachment store,
     * which verifies the bytes against the reference. Only images a message here named are served.
 diff --git a/package.json b/package.json
-index fffd478..bbbf1d3 100644
+index fffd478..c6e8315 100644
 --- a/package.json
 +++ b/package.json
 @@ -1,6 +1,6 @@
  {
    "name": "@kadaliao/dsh-bots",
 -  "version": "0.17.1",
-+  "version": "0.17.2-zen.1",
++  "version": "0.17.2-zen.2",
    "type": "module",
    "description": "Grok-style bots for DeepSeek Harness: create bots with their own avatar, persona, model, skills, apps, scheduled tasks and memory; they message each other, a dispatcher bot hands out the work through each team's lead, a board shows every request as a card filed under projects (with their own memory), and a usage view counts tokens by bot, task and day.",
    "exports": {
