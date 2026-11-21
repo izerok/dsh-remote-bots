@@ -1,0 +1,46 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      # Gate: the patch must still verify against its pinned upstream commit
+      # before anything is packaged.
+      - run: bash scripts/verify-patch.sh
+      - name: Assemble release package
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          PKG="dsh-remote-bots-${TAG}"
+          mkdir -p "${PKG}"
+          cp README.md LICENSE "${PKG}/"
+          cp -r docs patches scripts "${PKG}/"
+          zip -r "${PKG}.zip" "${PKG}"
+          cp patches/dsh-bots-zen-bridge.patch "dsh-bots-zen-bridge-${TAG}.patch"
+          sha256sum "${PKG}.zip" "dsh-bots-zen-bridge-${TAG}.patch" patches/dsh-bots-zen-bridge-0.17.0.patch > sha256sums.txt
+          ls -l "${PKG}.zip" "dsh-bots-zen-bridge-${TAG}.patch" patches/dsh-bots-zen-bridge-0.17.0.patch sha256sums.txt
+          cat sha256sums.txt
+      - name: Create prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          PKG="dsh-remote-bots-${TAG}"
+          gh release create "${TAG}" \
+            --prerelease \
+            --title "${TAG}" \
+            --notes-file .github/release-notes.md \
+            "${PKG}.zip" \
+            "dsh-bots-zen-bridge-${TAG}.patch" \
+            patches/dsh-bots-zen-bridge-0.17.0.patch \
+            sha256sums.txt
+          gh release view "${TAG}" --json tagName,isPrerelease,assets --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[] | {name: .name, size: .size}]}'
