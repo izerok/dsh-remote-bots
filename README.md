@@ -22,10 +22,10 @@ Bot 队的定时任务（早报、收件箱扫荡）本来就在主机上跑，�
 
 | 组件 | 已核版本 | 说明 |
 | --- | --- | --- |
-| DeepSeek Harness | 0.2.x（建议 0.2.2） | zen-remote 要求 `>=0.2.1-alpha.2 <0.3.0`；0.1.x 上 zen-remote 不支持 |
+| DeepSeek Harness | 0.2.2-rc.5 | zen-remote 要求 `>=0.2.1-alpha.2 <0.3.0`；0.1.x 上 zen-remote 不支持；npm 最新是 rc.5，无 0.2.2 正式版 |
 | dsh-zen-remote | 2.5.4 | npm `dsh-zen-remote` |
-| dsh-bots | 0.17.0（上游 commit `f51ca93`） | npm `@kadaliao/dsh-bots`；patch 针对此 commit |
-| 桥接后 bots 版本 | 0.17.1-zen.1 | 只在打了 patch 的副本里，见下 |
+| dsh-bots | 0.17.1（上游 commit `c265612`） | npm `@kadaliao/dsh-bots`；patch 针对此 commit |
+| 桥接后 bots 版本 | 0.17.2-zen.1 | 只在打了 patch 的副本里，见下 |
 
 ## 开箱即用的部分（不用打 patch）
 
@@ -48,12 +48,14 @@ bash scripts/install.sh
 
 ## 缺口：Bots 面板本身远程用不了（开箱状态）
 
-Bots 的管理面板（招团队、改 Bot 人设/模型、Requests 看板、用量统计）数据走它自己的后端路由 `GET/POST /__dsh_bots/*`。zen-remote 没有给它做内置适配，bots 上游也没有声明 zen-remote 的 Plugin Bridge。按 zen-remote 的 fail-closed 规则，远程打开面板会返回 503 `x-zen-remote: unbridged`，不会静默回落到本机空数据。
+Bots 的管理面板（招团队、改 Bot 人设/模型、Requests 看板、用量统计）数据走它自己的后端路由 `GET/POST /__dsh_bots/*`。zen-remote 没有给它做内置适配，bots 上游也没有声明 zen-remote 的 Plugin Bridge。
+
+> **2026-11-22 实测更正**：本仓早期版本写的是“远程打开面板回 503 `x-zen-remote: unbridged`”，这是错的。全面测试实测：未打 patch 时远程视角返回 **HTTP 200 + client 本机数据**，无任何 `x-zen-remote` 头——**静默错机**，不是可见报错。根因是 zen-remote 的路由拦截器只对已登记声明的路由生效，未声明的插件直接走本机 handler。503 只出现在已声明路由的拒绝场景。详见 [docs/bridge.md](docs/bridge.md)。
 
 补这个缺口的办法在本仓的 `patches/` 里，详见 [docs/bridge.md](docs/bridge.md)：
 
-- `patches/dsh-bots-zen-bridge.patch`：给 bots 0.17.0（`f51ca93`）加一份 zen-remote 协作声明，一条 prefix 路由盖住全部 `/__dsh_bots/*`，`scope: 'server'`，`methods: ['GET','POST']`，`maxBody: 41943040`（40 MiB，覆盖 bots 自己的 4 MiB 默认和 40 MiB 图片上传上限）。
-- 打了 patch 的 bots 版本号变为 `0.17.1-zen.1`。桥接要求两端插件名、版本、声明摘要完全一致，所以 **host 和 client 两台 DSH 都必须装打过 patch 的同一版本**，混装上游原版会 503（`declaration-mismatch` / `version-mismatch`）。
+- `patches/dsh-bots-zen-bridge.patch`：给 bots 0.17.1（`c265612`）加一份 zen-remote 协作声明，一条 prefix 路由盖住全部 `/__dsh_bots/*`，`scope: 'server'`，`methods: ['GET','POST']`，`maxBody: 41943040`（40 MiB，覆盖 bots 自己的 4 MiB 默认和 40 MiB 图片上传上限）。旧版 patch（bots 0.17.0 → 0.17.1-zen.1）已归档为 `patches/dsh-bots-zen-bridge-0.17.0.patch`。
+- 打了 patch 的 bots 版本号变为 `0.17.2-zen.1`。桥接要求两端插件名、版本、声明摘要完全一致，所以 **host 和 client 两台 DSH 都必须装打过 patch 的同一版本**，混装上游原版会 503（`declaration-mismatch` / `version-mismatch`）。
 - `scope: 'server'` 是整机数据，host 主人必须在 zen-remote 设置页「插件桥」里逐插件手动打开，默认 OFF。打开后远程能完整操作 Bots 面板，包括招团队、删卡片、改设置、代答提问，只给可信设备开。
 
 没装 zen-remote 时这份声明零影响：`ctx.inject(['zenRemote'])` 永不触发，bots 行为与上游完全一致。
@@ -67,16 +69,26 @@ Bots 的管理面板（招团队、改 Bot 人设/模型、Requests 看板、用
 
 ## 验证状态（诚实版）
 
+**2026-11-22 全面测试已跑完**（隔离环境，DSH 0.2.2-rc.5 + zen-remote 2.5.4 + bots 0.17.1，三个独立 DSH_HOME，未碰主力 profile，无真实模型 key）。完整记录在 [docs/validation-2026-11-22.md](docs/validation-2026-11-22.md)，主代理已从盘上复核关键证据。
+
 已验：
 
-- patch 在全新克隆的上游 0.17.0（`f51ca93`）上 `git apply --check` 通过，打完后 `node --check index.js` 通过，打完文件与生成时逐字节一致。
-- `scripts/verify-bridge.mjs` 校验声明字段符合 zen-remote Plugin Bridge 规范（插件名、版本与 package.json 一致、路径、scope、方法、maxBody 上限）。
+- DSH 安装与两插件上游原版同装：启动成功，bots 路由全 200，hire 一个 OPC 团队建出 6 个机器人（无模型 key 即可）。
+- 会话级远程：分享 Atlas 成功，48 小时有效；`admin/plugin-bridge` 基线为空。
+- **面板缺口复现（与早期文档预期不符）**：远程视角未回 503，而是 **200 + 本机数据（静默错机）**，对照与远程返回同一 client 本机机器人 id，根因已读代码核实。
+- Patch rebase 到 0.17.1：新 patch（0.17.2-zen.1）`git apply --check` + `node --check` 通过，校验器 17/17 PASS，未改校验器。
+- 打 patch 版两端安装：host 声明登记且 `consent:true`，client `bridgedPlugins` 含 `@kadaliao/dsh-bots`，两端启动零报错。
+- 两端远程面板转发：远程读到 **host 的 6 个机器人**；远程 `POST hire dev` 建出的 3 个机器人在 host 的 roster 上（写转发也通）。
+- 回归：无 zen-remote 的实例上 patch 版 bots 启动干净，日志零 `zen` 提及，行为与上游一致。
+- 单机同环 relay 401 已找到绕法：网关绑 `0.0.0.0`、client 走 `127.0.1.1:3088` 配对（见 [docs/bridge.md](docs/bridge.md)）。
 - 两插件的 cordis id、包名、路由、存储目录无冲突（源码核对）。
 
 未验：
 
-- **没有在真机 DSH 上同装同跑过**：没有跑通一次 host + client 两端都装打 patch 版、打开同意开关、在手机上打开 Bots 面板的全链路。请先在 web profile 上按 [docs/bridge.md](docs/bridge.md) 的核对表走一遍再上主力。
-- 上游发新版后 patch 可能要重打：patch 只钉在 0.17.0 / `f51ca93`，新版先跑 `scripts/verify-patch.sh`，失败就别硬打。
+- 一切需要模型调用的行为（机器人实际回复、Atlas 调度分派、定时任务、token 统计）——无模型 key，未编造。
+- 设置页 UI 点勾选同意（同意是经配置文件层设置的同一值，浏览器点选路径未走）。
+- 真实双机 relay、真机/手机端。
+- 上游发新版后 patch 可能要重打：patch 只钉在 0.17.1 / `c265612`，新版先跑 `scripts/verify-patch.sh`，失败就别硬打。
 
 ## 出处与许可
 

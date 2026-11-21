@@ -7,7 +7,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-UPSTREAM_COMMIT="f51ca938794cfc97c963c0624ea70c908a50d7a9"
+UPSTREAM_COMMIT="c265612a9a09e1b7f26b8e1f145e8da78e0fb471"
 
 git clone -q --depth 1 https://github.com/kadaliao/dsh-bots.git "$WORK/dsh-bots"
 cd "$WORK/dsh-bots"
