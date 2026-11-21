@@ -84,9 +84,15 @@ host 和 client 在同一台机器上时，client 的 relay 流量永远是回�
 
 已验证的绕法（仅用于同机调试）：网关改绑 `0.0.0.0`（host 启动时 `LAN_GATE_HOST=0.0.0.0`），client 改用 **`http://127.0.1.1:3088`** 配对——`isLoopbackIp()` 只精确匹配 `127.0.0.1`/`::1`，而 `isPrivateOrLoopbackIp()` 接受整个 `127/8`，请求于是走设备认证、网关打戳、DSH 门通过。注意沙箱/代理环境下须把 `127.0.1.1` 追加进 `no_proxy`。两台真实机器之间部署没有这个问题。是否向 zen-remote 上游提 issue（回环客户端的设备认证被本地直连判定吞掉）待定。
 
-## 回环免 token 观察（2026-11-22，DSH/bots 侧行为，与 patch 无关）
+## 回环免 token 观察（2026-11-22，已查根因：DSH 的设计，不是 bots 的 bug）
 
-`GET /__dsh_bots/state` 从 localhost **不带任何 token 也返回 200**，内容与带 token 一致。插件的 `webServer` 路由似乎绕过了浏览器的 token fence（仅限 localhost）。如在意，可进一步确认这是 DSH 的设计还是 bots 的路由配置问题。
+`GET /__dsh_bots/state` 从 localhost **不带任何 token 也返回 200**，内容与带 token 一致。根因已读 DSH 0.2.2-rc.5 源码核实：
+
+- DSH 的 `WebServer` 服务（`@deepseek-ai/dsh-host-webserver/src/index.ts`，`handle()`）按路径直接分发给注册的 handler，**全程不查 cookie、token、Host、Origin**；其 `readResource()` 的文档原话就是 "This method checks no cookie, Host, or Origin"。
+- bots 经 `web.register()` 注册的是裸 handler，自己也不做鉴权。
+- `?token=` 那道 fence 不在 `webServer` 里，而在浏览器连接层（`@deepseek-ai/dsh-client-connection/src/browser-auth.ts`，token 换 303 + set-cookie 只管 SPA 连接流程），插件路由根本不经过它。
+
+所以这是平台属性，不是 bots 一家的问题：**所有经 `webServer.register()` 注册的插件路由都不带鉴权**。缓解因素是 `dsh web` 默认只绑一个具体的回环地址（配置里明确拒绝通配绑定，理由是“会把远程代码执行暴露给网络”），所以默认只影响本机；但只要把 DSH web 绑到局域网地址或放到反代后面，`/__dsh_bots/*` 这类插件路由对能到达的人就是免 token 的——反代上的 token 检查如果有，也只拦 SPA 连接，不拦插件路由。是否向 DSH 上游反馈，由用户定；本仓的桥接 patch 不改变这一点。
 
 ## 503 原因速查
 

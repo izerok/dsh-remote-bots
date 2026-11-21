@@ -90,6 +90,10 @@ Bots 的管理面板（招团队、改 Bot 人设/模型、Requests 看板、用
 - 真实双机 relay、真机/手机端。
 - 上游发新版后 patch 可能要重打：patch 只钉在 0.17.1 / `c265612`，新版先跑 `scripts/verify-patch.sh`，失败就别硬打。
 
+## 去中心化路线
+
+“能不能像 EasyTier 一样去中心化”已研究完（2026-11-22），结论：zen-remote 的 peer 模式数据面本来就已经是 EasyTier 的形态（直连优先、网关只中转密文），真正差距在发现与信令；中心点共 5 个，其中 lan-gate、gateway-server 都是自建，唯一第三方且去不掉的是 Web Push 厂商服务。推荐 A+B 组合、零代码：先 B（桌面改 peer 角色、网关自建落地），再 A 的桌面部分（进同一 EasyTier 网作第二条路），手机保留公网域名入口保 PWA/推送。详见 [docs/decentralization.md](docs/decentralization.md)。**实施已暂停，网关落点待拍板。**
+
 ## 出处与许可
 
 - dsh-bots：MIT，作者 kadaliao；dsh-zen-remote：MIT，作者 KyoMio。本仓新增内容（指南、patch、脚本）同样 MIT。
