@@ -1,0 +1,1229 @@
+/**
+ * Peer-gateway UDP path establishment (PG-7, tasks/peer-gateway/PG-7.md).
+ * Three pieces, zero third-party deps (node:dgram / node:os / node:crypto
+ * plus `./crypto.js` and `./wire.js` only):
+ *
+ * 1. `collectLanEndpoints()` — enumerate this machine's non-loopback
+ *    IPv4 interfaces (RFC1918 plus the 100.64.0.0/10 CGNAT range that
+ *    Tailscale uses) as `ip:port` punch candidates.
+ *
+ * 2. `probeStunNatType()` — NAT self-check against the gateway's two
+ *    UDP ports with ONE local socket: the same mapping seen from two
+ *    remote ports proves cone (or plain public when the reflexive ip is
+ *    one of ours), different mappings prove symmetric NAT, and missing
+ *    answers downgrade to `unknown` so the caller plans accordingly.
+ *
+ * 3. `PeerPunchManager` — the per-peer 1000ms priority hole punch.
+ *    When the relay hands us a peer's candidate endpoints we fire
+ *    signed HELLO bursts (one per 100ms, at most 10 rounds) at every
+ *    candidate with a fresh X25519 key; an admitted peer's valid HELLO is
+ *    answered immediately, and its signed ACK to our fresh nonce derives
+ *    `PeerSessionCiphers` (PG-1 dual-simplex AEAD). The endpoint that
+ *    worked is classified `lan` (loopback, exact own-IP, or RFC1918
+ *    subnet match — CGNAT/Tailscale always lands on `p2p`), with a
+ *    measured RTT. If the
+ *    1000ms window expires the caller gets `onPunchFallback` — go use
+ *    the gateway WS relay NOW — while a silent reprobe retries on a
+ *    5s/15s/60s backoff and hot-upgrades to direct on the first later
+ *    success.
+ *    Established paths are kept alive with 5s encrypted PING/PONG;
+ *    the path is declared lost (`onDirectLost`) exactly `keepAliveMs` *
+ *    `keepAliveLostFrames` (15s) after the last authenticated receive —
+ *    decoupled from the PING tick — and re-enters the reprobe cycle.
+ *
+ * Wire shapes here are JSON control packets (`zr:1`, Ed25519-signed over
+ * a domain-separated canonical line) plus PG-1 sealed frames once
+ * ciphers exist. All timing goes through an injectable clock so tests
+ * drive the state machine deterministically while real sockets do the
+ * I/O.
+ */
+import dgram from 'node:dgram';
+import os from 'node:os';
+import { createPrivateKey, createPublicKey, randomBytes, sign, verify } from 'node:crypto';
+import { buildPeerHandshakeEnvelope, derivePeerSessionCiphers, generateEphemeralX25519, parsePeerHandshakeEnvelope, verifySelfCertifyingNodeId, } from './crypto.js';
+import { PeerFrameType, decodeFrameHeader, packEncryptedFrame, unpackEncryptedFrame } from './wire.js';
+// -- shared hex/endpoint plumbing --------------------------------------------------
+const NODE_ID_PATTERN = /^[0-9a-f]{8}$/;
+const NETWORK_ID_PATTERN = /^[0-9a-fA-F]{16}$/;
+const HEX64 = /^[0-9a-fA-F]{64}$/;
+const MAX_PUNCH_CANDIDATES = 16;
+const FAST_PROBE_COOLDOWN_MS = 5_000;
+/** STUN 探针控制包的域分隔前缀。 */
+export const STUN_PROBE_DOMAIN = 'zr-stun-probe-v1';
+function isIPv4Family(family) {
+    return family === 'IPv4' || family === 4;
+}
+function requireNetworkId(value) {
+    if (typeof value !== 'string' || !NETWORK_ID_PATTERN.test(value)) {
+        throw new TypeError('networkId must be 16 hex characters');
+    }
+    return value.toLowerCase();
+}
+function requireIdentity(value) {
+    if (!value || typeof value !== 'object')
+        throw new TypeError('identity must be a PeerIdentityKeyPair');
+    const record = value;
+    if (typeof record.publicKeyHex !== 'string' || !HEX64.test(record.publicKeyHex)) {
+        throw new TypeError('identity.publicKeyHex must be 64 hex characters');
+    }
+    if (typeof record.privateKeyHex !== 'string' || !HEX64.test(record.privateKeyHex)) {
+        throw new TypeError('identity.privateKeyHex must be 64 hex characters');
+    }
+    if (typeof record.nodeId !== 'string' || !NODE_ID_PATTERN.test(record.nodeId)) {
+        throw new TypeError('identity.nodeId must be 8 lowercase hex characters');
+    }
+    return record;
+}
+/** Split `host:port` (v4-shaped candidates only; the punch path is udp4). */
+function parseEndpoint(endpoint) {
+    if (typeof endpoint !== 'string')
+        return null;
+    const colon = endpoint.lastIndexOf(':');
+    if (colon <= 0 || colon === endpoint.length - 1)
+        return null;
+    const host = endpoint.slice(0, colon);
+    const portPart = endpoint.slice(colon + 1);
+    if (!/^\d+$/.test(portPart))
+        return null;
+    const port = Number(portPart);
+    if (port < 1 || port > 65535)
+        return null;
+    if (host.length === 0 || /\s/.test(host))
+        return null;
+    return { host, port };
+}
+/**
+ * All non-loopback IPv4 addresses of `interfaces` as `ip:port` punch
+ * candidates. Loopback (internal flag) and IPv6 are useless for
+ * punching; link-local 169.254/16 is excluded too — it never routes.
+ * RFC1918 and the 100.64.0.0/10 CGNAT range (Tailscale) are the
+ * interesting cases and ride along with any public ips.
+ */
+export function collectLanEndpoints(interfaces, port) {
+    const endpoints = [];
+    for (const list of Object.values(interfaces)) {
+        for (const entry of list ?? []) {
+            if (!isIPv4Family(entry.family) || entry.internal)
+                continue;
+            const address = entry.address;
+            if (typeof address !== 'string' || address.startsWith('127.') || address.startsWith('169.254.'))
+                continue;
+            endpoints.push(`${address}:${port}`);
+        }
+    }
+    return endpoints;
+}
+/**
+ * Which KIND of path does this endpoint represent? `lan` when it is
+ * loopback, one of `localIps` exactly, or a private (RFC1918) address
+ * that shares a /24 with one of our interfaces — i.e. a same-subnet
+ * path we can usually reach without any NAT help. Everything else is
+ * `p2p` (public reflexive mapping, foreign private nets, and CGNAT
+ * 100.64/10: a Tailscale overlay peer sharing our /24 is still a
+ * virtual tunnel, possibly DERP-relayed — never lan). Unparseable
+ * candidates answer `p2p` — never promoted on a guess.
+ */
+export function classifyPunchEndpoint(endpoint, localIps) {
+    const parsed = parseEndpoint(endpoint);
+    if (!parsed)
+        return 'p2p';
+    const ip = parsed.host;
+    if (ip.startsWith('127.'))
+        return 'lan';
+    if (localIps.includes(ip))
+        return 'lan';
+    const isPrivate = ip.startsWith('10.')
+        || ip.startsWith('192.168.')
+        || /^172\.(1[6-9]|2\d|3[01])\./.test(ip);
+    const isCgnat = /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip);
+    // CGNAT (Tailscale overlay) is never lan: a /24 share with a tailnet
+    // interface does not mean a local link — the tunnel may ride a relay.
+    if (isCgnat)
+        return 'p2p';
+    if (!isPrivate)
+        return 'p2p';
+    const slash24 = (value) => value.split('.').slice(0, 3).join('.');
+    return localIps.some((local) => slash24(local) === slash24(ip)) ? 'lan' : 'p2p';
+}
+function isReflexiveIpLocal(ip) {
+    if (ip.startsWith('127.'))
+        return true;
+    for (const list of Object.values(os.networkInterfaces())) {
+        for (const entry of list ?? []) {
+            if (isIPv4Family(entry.family) && !entry.internal && entry.address === ip)
+                return true;
+        }
+    }
+    return false;
+}
+/**
+ * NAT self-check against the gateway's primary port and (when
+ * `altPort > 0`) its alternate port. Both ports agree → cone NAT
+ * (`public` when the reflexive ip is one of this machine's own
+ * addresses — no NAT at all). They disagree → symmetric NAT
+ * (per-destination mappings; simple hole punching cannot work). Only
+ * the primary answers → `unknown`; nothing answers → `unknown` with a
+ * null endpoint.
+ *
+ * **Socket reuse (PG-8, load-bearing)**: pass `socket` to probe from an
+ * ALREADY-BOUND socket — the punch layer's own — instead of a throwaway.
+ * The gateway records and re-publishes the REFLEXIVE ENDPOINT it saw, and
+ * peers punch at that endpoint; only a probe from the punch socket itself
+ * makes the recorded port the one peers can actually reach. A probe from a
+ * temporary socket would register a port that is closed the moment the
+ * probe returns, and every punch at it would fly into the void. When
+ * `socket` is given it is NOT bound or closed here — the punch layer keeps
+ * owning it; this function attaches its own `message` listener for the
+ * probe's lifetime and removes exactly that listener on the way out (the
+ * punch manager's own listeners are untouched, and its `handlePacket`
+ * silently ignores non-frame `stun-reply` JSON anyway).
+ *
+ * Wire format (PG-8, aligned with gateway-server's udp-stun.ts): the
+ * probe is `{ type:'stun-probe', networkId, nodeId, publicKeyHex, nonce,
+ * timestamp, signatureHex }` signed over
+ * `zr-stun-probe-v1|<networkId>|<nodeId>|<nonce>|<timestamp>`; the reply
+ * is parsed leniently — the gateway's
+ * `{ type:'stun-reply', nonce, reflexiveIp, reflexivePort, serverPortRole }`
+ * AND the pre-PG-8 node shape `{ kind:'zr-stun-reply', ip, port }` both
+ * count, so a node updated ahead of its gateway (or behind it) keeps
+ * classifying.
+ */
+export async function probeStunNatType(options) {
+    const primaryHost = options.primaryHost;
+    if (typeof primaryHost !== 'string' || primaryHost.length === 0) {
+        throw new TypeError('primaryHost must be a non-empty string');
+    }
+    if (!Number.isInteger(options.primaryPort) || options.primaryPort < 1 || options.primaryPort > 65535) {
+        throw new RangeError('primaryPort must be an integer in [1, 65535]');
+    }
+    const altPort = options.altPort ?? 0;
+    if (!Number.isInteger(altPort) || altPort < 0 || altPort > 65535) {
+        throw new RangeError('altPort must be an integer in [0, 65535]');
+    }
+    const networkId = requireNetworkId(options.networkId);
+    const identity = requireIdentity(options.identity);
+    const timeoutMs = options.timeoutMs ?? 500;
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1)
+        throw new RangeError('timeoutMs must be an integer ≥ 1');
+    const reused = options.socket;
+    if (reused !== undefined && typeof reused.send !== 'function') {
+        throw new TypeError('socket must be a dgram Socket when provided');
+    }
+    // Reuse path: no bind, no close — the punch layer keeps the socket. Our
+    // own `message` listener is tracked so ONLY it is removed on exit.
+    let socket;
+    let bound = false;
+    if (reused !== undefined) {
+        socket = reused;
+        try {
+            bound = socket.address().port > 0;
+        }
+        catch {
+            bound = false;
+        }
+        if (!bound) {
+            // Reused sockets are expected to be bound already (the punch layer
+            // binds its own); a stranger unbound socket is still usable — bind it
+            // here once, but leave it open (the caller closes what it passed).
+            await new Promise((resolve, reject) => {
+                const onError = (err) => {
+                    socket.removeListener('error', onError);
+                    reject(err);
+                };
+                socket.once('error', onError);
+                socket.bind(0, () => {
+                    socket.removeListener('error', onError);
+                    resolve();
+                });
+            });
+        }
+    }
+    else {
+        socket = dgram.createSocket('udp4');
+        socket.on('error', () => { }); // ICMP port-unreachables are routine here; never crash
+        await new Promise((resolve, reject) => {
+            const onError = (err) => {
+                socket.removeListener('error', onError);
+                reject(err);
+            };
+            socket.once('error', onError);
+            socket.bind(0, () => {
+                socket.removeListener('error', onError);
+                resolve();
+            });
+        });
+    }
+    const nonce = randomBytes(8).toString('hex');
+    const timestamp = Date.now();
+    const message = Buffer.from(`${STUN_PROBE_DOMAIN}|${networkId}|${identity.nodeId}|${nonce}|${timestamp}`, 'utf8');
+    const packet = Buffer.from(JSON.stringify({
+        type: 'stun-probe',
+        networkId,
+        nodeId: identity.nodeId,
+        publicKeyHex: identity.publicKeyHex,
+        nonce,
+        timestamp,
+        signatureHex: ed25519Sign(message, identity),
+    }));
+    // One socket, two remote ports: the mapping comparison is only
+    // meaningful because both probes share the same local endpoint.
+    const slots = new Map();
+    const replies = new Map();
+    let settleEarly = () => { };
+    const early = new Promise((resolve) => {
+        settleEarly = resolve;
+    });
+    let timer;
+    const deadline = new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+    });
+    const onMessage = (buf, rinfo) => {
+        let parsed;
+        try {
+            parsed = JSON.parse(buf.toString('utf8'));
+        }
+        catch {
+            return;
+        }
+        // Dual-format reply: the gateway's `type:'stun-reply'` and the legacy
+        // node shape `kind:'zr-stun-reply'` both carry (nonce, ip, port) under
+        // different names; read whichever is present.
+        const kind = parsed.type ?? parsed.kind;
+        if (kind !== 'stun-reply' && kind !== 'zr-stun-reply')
+            return;
+        if (parsed.nonce !== nonce)
+            return;
+        const ip = parsed.reflexiveIp ?? parsed.ip;
+        const port = parsed.reflexivePort ?? parsed.port;
+        if (typeof ip !== 'string' || ip.length === 0)
+            return;
+        if (typeof port !== 'number' || !Number.isInteger(port) || port < 0 || port > 65535)
+            return;
+        const slot = slots.get(rinfo.port);
+        if (!slot || replies.has(slot))
+            return;
+        replies.set(slot, { ip, port });
+        if (replies.size === slots.size)
+            settleEarly();
+    };
+    socket.on('message', onMessage);
+    const send = (port, slot) => {
+        slots.set(port, slot);
+        socket.send(packet, port, primaryHost, (err) => {
+            if (err)
+                slots.delete(port);
+        });
+    };
+    try {
+        send(options.primaryPort, 'primary');
+        if (altPort > 0)
+            send(altPort, 'alt');
+        await Promise.race([deadline, early]);
+        clearTimeout(timer);
+        const primary = replies.get('primary');
+        if (!primary)
+            return { reflexiveEndpoint: null, natType: 'unknown' };
+        const reflexiveEndpoint = `${primary.ip}:${primary.port}`;
+        const alt = replies.get('alt');
+        if (!alt)
+            return { reflexiveEndpoint, natType: 'unknown' };
+        if (primary.port !== alt.port)
+            return { reflexiveEndpoint, natType: 'symmetric' };
+        return { reflexiveEndpoint, natType: isReflexiveIpLocal(primary.ip) ? 'public' : 'cone' };
+    }
+    finally {
+        clearTimeout(timer);
+        // The reuse contract: leave the punch layer's socket exactly as we found
+        // it — our listener removed, everything else untouched. The throwaway
+        // path (no `socket` given) closes its own.
+        socket.removeListener('message', onMessage);
+        if (reused === undefined)
+            socket.close();
+    }
+}
+// -- Ed25519 helpers (crypto.ts keeps its JWK round-trips private) -------------------
+/** Sign a raw message with the node's long-term identity (64-byte sig → 128 hex). Shared with the mux's WS-relayed control envelopes. */
+export function ed25519Sign(message, identity) {
+    const privateKey = createPrivateKey({
+        key: {
+            kty: 'OKP',
+            crv: 'Ed25519',
+            x: Buffer.from(identity.publicKeyHex, 'hex').toString('base64url'),
+            d: Buffer.from(identity.privateKeyHex, 'hex').toString('base64url'),
+        },
+        format: 'jwk',
+    });
+    return sign(null, message, privateKey).toString('hex');
+}
+/** Verify a raw-message Ed25519 signature against a raw 32-byte public key. Never throws. */
+export function ed25519Verify(message, publicKeyHex, sigHex) {
+    try {
+        const publicKey = createPublicKey({
+            key: { kty: 'OKP', crv: 'Ed25519', x: Buffer.from(publicKeyHex, 'hex').toString('base64url') },
+            format: 'jwk',
+        });
+        return verify(null, message, publicKey, Buffer.from(sigHex, 'hex'));
+    }
+    catch {
+        return false;
+    }
+}
+const realClock = {
+    now: () => Date.now(),
+    setTimeout: (fn, ms) => setTimeout(fn, ms),
+    clearTimeout: (handle) => clearTimeout(handle),
+};
+/**
+ * One UDP socket, many peers. See the module doc for the state machine.
+ * After `onDirectReady`, hand `frameSenderFor(peerNodeId)` to an ARQ
+ * session as its `sendFrame` and route `onEncryptedFrame` into
+ * `handleFrame` — frames and keepalive share one monotonic AEAD
+ * sequence per direction, exactly what the frame layer's replay window
+ * requires.
+ */
+export class PeerPunchManager {
+    options;
+    clock;
+    networkId;
+    identity;
+    socket;
+    ownsSocket;
+    readInterfaces;
+    pingRetryDelayMs;
+    sessions = new Map();
+    lanEndpointList = [];
+    closed = false;
+    readyPromise;
+    constructor(options) {
+        this.options = options;
+        this.networkId = requireNetworkId(options.networkId);
+        this.identity = requireIdentity(options.identity);
+        const knob = (value, fallback, name) => {
+            const resolved = value ?? fallback;
+            if (!Number.isInteger(resolved) || resolved < 1)
+                throw new RangeError(`${name} must be an integer ≥ 1`);
+            return resolved;
+        };
+        knob(options.punchIntervalMs, 100, 'punchIntervalMs');
+        knob(options.punchRounds, 10, 'punchRounds');
+        knob(options.punchWindowMs, 1000, 'punchWindowMs');
+        knob(options.reprobeIntervalMs, 60_000, 'reprobeIntervalMs');
+        if (options.reprobeInitialDelaysMs !== undefined) {
+            if (!Array.isArray(options.reprobeInitialDelaysMs) || options.reprobeInitialDelaysMs.length !== 2) {
+                throw new RangeError('reprobeInitialDelaysMs must be a 2-tuple of integers ≥ 1');
+            }
+            knob(options.reprobeInitialDelaysMs[0], 5_000, 'reprobeInitialDelaysMs[0]');
+            knob(options.reprobeInitialDelaysMs[1], 15_000, 'reprobeInitialDelaysMs[1]');
+        }
+        const keepAliveMs = knob(options.keepAliveMs, 5000, 'keepAliveMs');
+        knob(options.keepAliveLostFrames, 3, 'keepAliveLostFrames');
+        if (options.fastConfirmDelayMs !== undefined && options.fastConfirmDelayMs !== 0) {
+            knob(options.fastConfirmDelayMs, 200, 'fastConfirmDelayMs');
+        }
+        if (options.pingRetryDelayMs !== undefined && options.pingRetryDelayMs !== 0) {
+            const rawRetry = knob(options.pingRetryDelayMs, 0, 'pingRetryDelayMs');
+            const maxRetry = Math.floor((keepAliveMs - 1) / 2);
+            this.pingRetryDelayMs = maxRetry >= 1 ? Math.min(rawRetry, maxRetry) : 0;
+        }
+        else {
+            this.pingRetryDelayMs = 0;
+        }
+        this.clock = options.clock ?? realClock;
+        this.readInterfaces = options.interfaces
+            ?? (() => os.networkInterfaces());
+        if (options.socket) {
+            this.socket = options.socket;
+            this.ownsSocket = false;
+        }
+        else {
+            this.socket = dgram.createSocket('udp4');
+            this.ownsSocket = true;
+        }
+        // Probing dead ports earns ICMP errors on macOS/Windows; routine, never fatal.
+        this.socket.on('error', () => { });
+        this.socket.on('message', (buf, rinfo) => this.handlePacket(buf, rinfo));
+        let boundPort = 0;
+        try {
+            boundPort = this.socket.address().port;
+        }
+        catch {
+            boundPort = 0;
+        }
+        if (boundPort > 0) {
+            this.refreshLanEndpoints(boundPort);
+            this.readyPromise = Promise.resolve();
+        }
+        else {
+            this.readyPromise = new Promise((resolve) => {
+                this.socket.once('listening', () => {
+                    try {
+                        this.refreshLanEndpoints(this.socket.address().port);
+                    }
+                    finally {
+                        resolve();
+                    }
+                });
+            });
+            if (this.ownsSocket)
+                this.socket.bind({ port: 0, address: options.bindHost ?? undefined });
+        }
+    }
+    /** Resolves once the socket has a bound port (immediately for pre-bound sockets). */
+    ready() {
+        return this.readyPromise;
+    }
+    /** This machine's non-loopback IPv4 addresses with our bound port,
+     *  enumerated LIVE each call (T4): a hot-plugged NIC is a punch
+     *  candidate on the very next query. Falls back to the last known
+     *  list while the socket has no bound port. */
+    lanEndpoints() {
+        try {
+            const port = this.socket.address().port;
+            if (port > 0) {
+                this.lanEndpointList = collectLanEndpoints(this.readInterfaces(), port);
+            }
+        }
+        catch {
+            // Socket between close calls — answer the last known list.
+        }
+        return [...this.lanEndpointList];
+    }
+    /**
+     * Start (or restart) the 1000ms priority punch toward a peer: fresh
+     * X25519 key, fresh nonce, HELLOs to every candidate endpoint —
+     * round 0 immediately, then one round per `punchIntervalMs` up to
+     * `punchRounds` total. On success the window/rounds timers are
+     * cancelled; on expiry `onPunchFallback` fires exactly once and the
+     * silent reprobe cycle takes over.
+     */
+    beginPunch(peer) {
+        if (this.closed)
+            return;
+        if (typeof peer.peerNodeId !== 'string' || !NODE_ID_PATTERN.test(peer.peerNodeId.toLowerCase())) {
+            throw new TypeError('peerNodeId must be 8 hex characters');
+        }
+        const nodeId = peer.peerNodeId.toLowerCase();
+        if (!verifySelfCertifyingNodeId(nodeId, peer.peerPublicKeyHex)) {
+            throw new TypeError('peerNodeId is not the self-certifying hash of peerPublicKeyHex');
+        }
+        if (nodeId === this.identity.nodeId)
+            throw new TypeError('cannot punch ourselves');
+        const candidates = [];
+        const raw = [...(Array.isArray(peer.lanEndpoints) ? peer.lanEndpoints : [])];
+        if (peer.reflexiveEndpoint)
+            raw.push(peer.reflexiveEndpoint);
+        for (const endpoint of raw) {
+            if (typeof endpoint === 'string' && parseEndpoint(endpoint) && !candidates.includes(endpoint)) {
+                candidates.push(endpoint);
+            }
+        }
+        const existing = this.sessions.get(nodeId);
+        if (existing) {
+            // Preserve an already-confirmed direct UDP session when late control
+            // signals (e.g. punch-coordinate) arrive — wiping ciphers mid-flight
+            // would drop active ARQ stream frames.
+            if (existing.state === 'direct' && existing.peerPublicKeyHex === peer.peerPublicKeyHex && existing.ciphers) {
+                for (const ep of candidates) {
+                    if (!existing.candidates.includes(ep))
+                        existing.candidates.push(ep);
+                }
+                return;
+            }
+            if (existing.state === 'punching' && existing.peerPublicKeyHex === peer.peerPublicKeyHex) {
+                const added = [];
+                for (const ep of candidates) {
+                    if (!existing.candidates.includes(ep)) {
+                        existing.candidates.push(ep);
+                        added.push(ep);
+                    }
+                }
+                if (added.length > 0)
+                    this.sendHellos(existing, added);
+                return;
+            }
+            this.clearSessionTimers(existing);
+            this.sessions.delete(nodeId);
+        }
+        const session = this.createSession(nodeId, peer.peerPublicKeyHex, candidates);
+        this.startPunchRounds(session);
+    }
+    /**
+     * Entry point for every datagram on our socket — sealed frames when a
+     * session has ciphers, signed JSON control packets otherwise. Public
+     * so tests (and unusual socket wirings) can inject datagrams.
+     */
+    handlePacket(bytes, rinfo) {
+        if (this.closed)
+            return;
+        const header = decodeFrameHeader(bytes);
+        if (header) {
+            if (header.dstNodeId !== this.identity.nodeId || header.srcNodeId === this.identity.nodeId)
+                return;
+            const session = this.sessions.get(header.srcNodeId);
+            if (!session?.ciphers)
+                return;
+            const opened = unpackEncryptedFrame(bytes, session.ciphers);
+            if (opened)
+                this.onOpenedFrame(session, opened.header, opened.plaintext, rinfo);
+            return;
+        }
+        this.handleControlPacket(bytes, rinfo);
+    }
+    /**
+     * The ARQ seam for an established peer: assign the returned function
+     * to a `PeerArqSession.sendFrame`. Every frame (application data and
+     * this manager's keepalive alike) takes the next value of one
+     * monotonic per-peer AEAD sequence, which is exactly what the frame
+     * layer's replay window needs.
+     */
+    frameSenderFor(peerNodeId) {
+        const nodeId = peerNodeId.toLowerCase();
+        return (frameType, streamId, payload, ack) => {
+            const session = this.sessions.get(nodeId);
+            if (!session)
+                throw new Error(`no punch session for ${nodeId}`);
+            this.sendEncryptedTo(session, frameType, streamId, payload, ack);
+        };
+    }
+    sessionCiphers(peerNodeId) {
+        const session = this.sessions.get(peerNodeId.toLowerCase());
+        return session?.state === 'direct' ? session.ciphers : null;
+    }
+    /** Last PING→PONG round trip for the peer, or null before the first PONG. */
+    sessionRttMs(peerNodeId) {
+        return this.sessions.get(peerNodeId.toLowerCase())?.rttMs ?? null;
+    }
+    /** Current punch state and age since last authenticated direct activity (null outside direct). */
+    peerState(peerNodeId) {
+        const session = this.sessions.get(peerNodeId.toLowerCase());
+        if (!session)
+            return null;
+        return {
+            state: session.state,
+            recentRxAgeMs: session.state === 'direct' ? Math.max(0, this.clock.now() - session.lastSeen) : null,
+        };
+    }
+    /** Revoke gateway/local admission and discard all UDP state for this peer. */
+    dropPeer(peerNodeId) {
+        const nodeId = peerNodeId.toLowerCase();
+        const session = this.sessions.get(nodeId);
+        if (session)
+            this.clearSessionTimers(session);
+        this.sessions.delete(nodeId);
+    }
+    /**
+     * Trigger an out-of-band RTT probe PING for an already-direct peer when
+     * `fastConfirmDelayMs > 0`, no PING is currently in flight, and the 5s
+     * per-peer cooldown has elapsed.
+     */
+    triggerFastProbe(peerNodeId, withFollowUp = true) {
+        if (this.closed || typeof peerNodeId !== 'string')
+            return false;
+        const fastDelay = this.options.fastConfirmDelayMs ?? 0;
+        if (fastDelay <= 0)
+            return false;
+        const session = this.sessions.get(peerNodeId.toLowerCase());
+        if (!session || session.state !== 'direct')
+            return false;
+        if (session.pendingPings.length > 0 || session.fastConfirmPending)
+            return false;
+        const now = this.clock.now();
+        if (session.lastFastProbeAt !== null && (now - session.lastFastProbeAt) < FAST_PROBE_COOLDOWN_MS) {
+            return false;
+        }
+        session.lastFastProbeAt = now;
+        if (withFollowUp) {
+            session.fastConfirmPending = true;
+            this.sendPing(session, false, false);
+            return true;
+        }
+        this.armTimer(session, () => {
+            if (!this.isLiveDirectSession(session) ||
+                session.pendingPings.length > 0 ||
+                session.fastConfirmPending) {
+                return;
+            }
+            this.sendPing(session, false, false);
+        }, fastDelay);
+        return true;
+    }
+    isLiveDirectSession(session) {
+        return !this.closed && this.sessions.get(session.peerNodeId) === session && session.state === 'direct';
+    }
+    /** Stop everything: per-peer timers cleared, sessions dropped, socket closed. */
+    close() {
+        if (this.closed)
+            return;
+        this.closed = true;
+        for (const session of this.sessions.values())
+            this.clearSessionTimers(session);
+        this.sessions.clear();
+        try {
+            this.socket.close();
+        }
+        catch {
+            // already closed — nothing left to do
+        }
+    }
+    // -- internals -------------------------------------------------------------------
+    createSession(nodeId, publicKeyHex, candidates) {
+        const session = {
+            peerNodeId: nodeId,
+            peerPublicKeyHex: publicKeyHex,
+            state: 'punching',
+            myEph: generateEphemeralX25519(),
+            nonce: randomBytes(8).toString('hex'),
+            awaitingAck: true,
+            peerEphPubHex: null,
+            derivedPair: null,
+            candidates,
+            endpoint: null,
+            ciphers: null,
+            rttMs: null,
+            lastHelloSentAt: null,
+            pendingPings: [],
+            pingRetryTimer: null,
+            lastFastProbeAt: null,
+            missedPings: 0,
+            fastConfirmPending: false,
+            reprobeAttempts: 0,
+            lastSeen: this.clock.now(),
+            timers: new Set(),
+            directRetryTimer: null,
+            frameSeq: 0n,
+        };
+        this.sessions.set(nodeId, session);
+        return session;
+    }
+    armTimer(session, fn, ms) {
+        const handle = this.clock.setTimeout(() => {
+            session.timers.delete(handle);
+            fn();
+        }, ms);
+        session.timers.add(handle);
+    }
+    clearSessionTimers(session) {
+        for (const handle of session.timers)
+            this.clock.clearTimeout(handle);
+        session.timers.clear();
+        session.directRetryTimer = null;
+        session.pingRetryTimer = null;
+    }
+    clearPingRetryTimer(session) {
+        if (session.pingRetryTimer !== null) {
+            this.clock.clearTimeout(session.pingRetryTimer);
+            session.timers.delete(session.pingRetryTimer);
+            session.pingRetryTimer = null;
+        }
+    }
+    clearDirectRetryTimer(session) {
+        if (session.directRetryTimer !== null) {
+            this.clock.clearTimeout(session.directRetryTimer);
+            session.timers.delete(session.directRetryTimer);
+            session.directRetryTimer = null;
+        }
+    }
+    startDirectChallengeRetry(session, target) {
+        this.clearDirectRetryTimer(session);
+        this.sendHellos(session, [target]);
+        const intervalMs = this.punchIntervalMsOrDefault();
+        const maxRetries = Math.max(5, Math.min(10, this.punchRoundsOrDefault()));
+        let retries = 0;
+        const step = () => {
+            session.directRetryTimer = null;
+            if (this.closed || session.state !== 'direct' || !session.awaitingAck)
+                return;
+            retries += 1;
+            this.sendHellos(session, [target]);
+            if (retries < maxRetries) {
+                const handle = this.clock.setTimeout(() => {
+                    session.timers.delete(handle);
+                    step();
+                }, intervalMs);
+                session.directRetryTimer = handle;
+                session.timers.add(handle);
+            }
+        };
+        const handle = this.clock.setTimeout(() => {
+            session.timers.delete(handle);
+            step();
+        }, intervalMs);
+        session.directRetryTimer = handle;
+        session.timers.add(handle);
+    }
+    addCandidate(session, target) {
+        if (!parseEndpoint(target) || session.candidates.includes(target))
+            return;
+        if (session.candidates.length >= MAX_PUNCH_CANDIDATES) {
+            const evictIdx = session.candidates.findIndex((ep) => ep !== session.endpoint);
+            session.candidates.splice(evictIdx >= 0 ? evictIdx : 0, 1);
+        }
+        session.candidates.push(target);
+    }
+    refreshLanEndpoints(port) {
+        this.lanEndpointList = collectLanEndpoints(this.readInterfaces(), port);
+    }
+    startPunchRounds(session) {
+        session.state = 'punching';
+        // A new round cycle is a new key exchange: invalidate everything
+        // derived from the previous ephemeral key.
+        session.myEph = generateEphemeralX25519();
+        session.nonce = randomBytes(8).toString('hex');
+        session.awaitingAck = true;
+        session.peerEphPubHex = null;
+        session.derivedPair = null;
+        session.ciphers = null;
+        session.rttMs = null;
+        let round = 0;
+        const fire = () => {
+            if (this.closed || session.state !== 'punching')
+                return;
+            this.sendHellos(session);
+            round += 1;
+            if (round < this.punchRoundsOrDefault())
+                this.armTimer(session, fire, this.punchIntervalMsOrDefault());
+        };
+        fire();
+        this.armTimer(session, () => this.onPunchWindowExpired(session), this.punchWindowMsOrDefault());
+    }
+    punchIntervalMsOrDefault() {
+        return this.options.punchIntervalMs ?? 100;
+    }
+    punchRoundsOrDefault() {
+        return this.options.punchRounds ?? 10;
+    }
+    punchWindowMsOrDefault() {
+        return this.options.punchWindowMs ?? 1000;
+    }
+    reprobeIntervalMsOrDefault() {
+        return this.options.reprobeIntervalMs ?? 60_000;
+    }
+    keepAliveMsOrDefault() {
+        return this.options.keepAliveMs ?? 5000;
+    }
+    keepAliveLostFramesOrDefault() {
+        return this.options.keepAliveLostFrames ?? 3;
+    }
+    onPunchWindowExpired(session) {
+        if (this.closed || session.state !== 'punching')
+            return;
+        session.state = 'idle';
+        this.clearSessionTimers(session); // stop any rounds still armed
+        this.options.onPunchFallback?.(session.peerNodeId);
+        this.scheduleReprobe(session);
+    }
+    scheduleReprobe(session) {
+        if (this.closed)
+            return;
+        // Back off instead of a flat 60s: a dead endpoint used to be hammered
+        // for a full minute before the first retry. Attempts 1/2 are quick
+        // (5s/15s); the option governs the 3rd-and-later cadence. The count
+        // resets on session rebuild (createSession) and on completeDirect.
+        session.reprobeAttempts += 1;
+        const [firstDelayMs, secondDelayMs] = this.options.reprobeInitialDelaysMs ?? [5_000, 15_000];
+        const delay = session.reprobeAttempts === 1 ? firstDelayMs
+            : session.reprobeAttempts === 2 ? secondDelayMs
+                : this.reprobeIntervalMsOrDefault();
+        this.armTimer(session, () => {
+            if (this.closed || session.state !== 'idle')
+                return;
+            this.startPunchRounds(session);
+        }, delay);
+    }
+    startKeepalive(session) {
+        // PC-04: the loss deadline is `lastSeen + keepAliveMs * keepAliveLostFrames`,
+        // decoupled from the 5s PING tick. One timer armed on the REMAINING budget;
+        // valid receives advance `lastSeen` without touching any timer, and a fire
+        // that lands early (a receive moved the deadline forward) re-arms itself on
+        // the new remaining budget instead of waiting for the next tick.
+        const lostAfterMs = this.keepAliveMsOrDefault() * this.keepAliveLostFramesOrDefault();
+        const onLossDeadline = () => {
+            if (this.closed || session.state !== 'direct')
+                return;
+            const silentFor = this.clock.now() - session.lastSeen;
+            if (silentFor < lostAfterMs) {
+                this.armTimer(session, onLossDeadline, lostAfterMs - silentFor);
+                return;
+            }
+            session.state = 'idle';
+            this.clearPingRetryTimer(session);
+            session.pendingPings.length = 0;
+            this.options.onDirectLost?.(session.peerNodeId);
+            this.scheduleReprobe(session);
+        };
+        const initialRemaining = session.lastSeen + lostAfterMs - this.clock.now();
+        this.armTimer(session, onLossDeadline, Math.max(1, initialRemaining));
+        const tick = () => {
+            if (!this.isLiveDirectSession(session))
+                return;
+            this.sendPing(session, true, false);
+            if (!this.isLiveDirectSession(session))
+                return;
+            this.armTimer(session, tick, this.keepAliveMsOrDefault());
+        };
+        this.armTimer(session, tick, this.keepAliveMsOrDefault());
+    }
+    recordMissedPing(session) {
+        session.missedPings += 1;
+        try {
+            this.options.onPingUnanswered?.(session.peerNodeId);
+        }
+        catch {
+            // A listener bug must never wound the state machine.
+        }
+    }
+    armPingRetry(session, entry, retryStage) {
+        this.clearPingRetryTimer(session);
+        if (!this.isLiveDirectSession(session) || this.pingRetryDelayMs <= 0)
+            return;
+        const handle = this.clock.setTimeout(() => {
+            session.timers.delete(handle);
+            session.pingRetryTimer = null;
+            if (!this.isLiveDirectSession(session))
+                return;
+            if (!session.pendingPings.includes(entry) || entry.countedMiss)
+                return;
+            entry.countedMiss = true;
+            this.recordMissedPing(session);
+            if (retryStage >= 1)
+                return;
+            if (!this.isLiveDirectSession(session))
+                return;
+            this.sendPing(session, true, true, retryStage + 1);
+        }, this.pingRetryDelayMs);
+        session.pingRetryTimer = handle;
+        session.timers.add(handle);
+    }
+    /**
+     * Fire one keepalive PING with a fresh random payload. When `preservePrevious`
+     * is false (e.g. a new periodic tick), any uncounted `countsForMiss` entry
+     * from the previous cycle counts once and the 2-slot ring is cleared so stale
+     * PONGs from superseded cycles never match. Intra-cycle retries preserve the
+     * prior slot (capping at 2 entries) so delayed valid PONGs still sample RTT.
+     */
+    sendPing(session, countsForMiss = true, preservePrevious = false, retryStage = 0) {
+        if (countsForMiss)
+            session.fastConfirmPending = false;
+        this.clearPingRetryTimer(session);
+        if (!preservePrevious) {
+            const hasUncountedMiss = session.pendingPings.some((p) => p.countsForMiss && !p.countedMiss);
+            if (hasUncountedMiss) {
+                this.recordMissedPing(session);
+                if (!this.isLiveDirectSession(session))
+                    return;
+            }
+            session.pendingPings.length = 0;
+        }
+        else if (session.pendingPings.length >= 2) {
+            session.pendingPings.shift();
+        }
+        const entry = {
+            payload: randomBytes(8),
+            sentAt: this.clock.now(),
+            countsForMiss,
+            countedMiss: false,
+        };
+        session.pendingPings.push(entry);
+        try {
+            this.sendEncryptedTo(session, PeerFrameType.PING, 0, entry.payload, 0);
+        }
+        catch {
+            // Socket closing or transient datagram failure — the loss deadline handles lost links cleanly.
+        }
+        if (countsForMiss && this.pingRetryDelayMs > 0) {
+            this.armPingRetry(session, entry, retryStage);
+        }
+    }
+    sendHellos(session, endpoints = session.candidates) {
+        const timestamp = this.clock.now();
+        session.lastHelloSentAt = timestamp;
+        const packet = buildPeerHandshakeEnvelope({
+            kind: 'hello',
+            networkId: this.networkId,
+            identity: this.identity,
+            selfEphPubHex: session.myEph.publicKeyHex,
+            peerNodeId: session.peerNodeId,
+            peerEphPubHex: null,
+            nonce: session.nonce,
+            timestamp,
+        });
+        for (const endpoint of endpoints) {
+            const parsed = parseEndpoint(endpoint);
+            if (!parsed)
+                continue;
+            try {
+                this.socket.send(packet, parsed.port, parsed.host);
+            }
+            catch {
+                // Unroutable or closed UDP socket — skip candidate without crashing host timers.
+            }
+        }
+    }
+    sendHelloAck(session, echoNonce, initiatorEphPubHex, rinfo) {
+        const packet = buildPeerHandshakeEnvelope({
+            kind: 'ack',
+            networkId: this.networkId,
+            identity: this.identity,
+            selfEphPubHex: session.myEph.publicKeyHex,
+            peerNodeId: session.peerNodeId,
+            peerEphPubHex: initiatorEphPubHex,
+            nonce: echoNonce,
+            timestamp: this.clock.now(),
+        });
+        try {
+            this.socket.send(packet, rinfo.port, rinfo.address);
+        }
+        catch {
+            // Closed or unroutable UDP socket.
+        }
+    }
+    handleControlPacket(bytes, rinfo) {
+        // PC-12：UDP 与 WS 共用同一份信封契约解析。UDP 传 timeWindowMs=0——
+        // 用户裁定本路径不新增时间窗（timestamp 只进签名，不做新鲜度检查）。
+        const parsed = parsePeerHandshakeEnvelope(bytes, {
+            networkId: this.networkId,
+            selfNodeId: this.identity.nodeId,
+            nowMs: this.clock.now(),
+            timeWindowMs: 0,
+        });
+        if (!parsed)
+            return;
+        if (parsed.kind === 'hello')
+            this.onHello(parsed, rinfo);
+        else
+            this.onHelloAck(parsed, rinfo);
+    }
+    onHello(parsed, rinfo) {
+        // Admission comes exclusively from beginPunch (gateway announcement + TOFU).
+        const session = this.sessions.get(parsed.nodeId);
+        if (!session || session.peerPublicKeyHex !== parsed.publicKeyHex)
+            return;
+        // A peer can recover just before our scheduled reprobe. Give this exchange
+        // its own window now, so the old timer cannot rotate our key/nonce before
+        // the reply arrives. Admission still requires the ACK to our fresh nonce.
+        if (session.state === 'idle') {
+            this.clearSessionTimers(session);
+            this.startPunchRounds(session);
+        }
+        this.sendHelloAck(session, parsed.nonce, parsed.ephPubHex, rinfo);
+        const target = `${rinfo.address}:${rinfo.port}`;
+        this.addCandidate(session, target);
+        // A signed HELLO can be recorded forever. Never adopt its key or endpoint:
+        // ask the live identity to sign our fresh nonce instead. Keep the local DH
+        // key stable so simultaneous handshakes converge.
+        if (session.peerEphPubHex !== parsed.ephPubHex || !session.ciphers) {
+            if (!session.awaitingAck) {
+                session.nonce = randomBytes(8).toString('hex');
+                session.awaitingAck = true;
+            }
+            if (session.state === 'direct') {
+                this.startDirectChallengeRetry(session, target);
+            }
+            else {
+                this.sendHellos(session, [target]);
+            }
+        }
+    }
+    onHelloAck(parsed, rinfo) {
+        const session = this.sessions.get(parsed.nodeId);
+        // Key pinning: the ack must come from the identity we set out to reach.
+        if (!session || session.peerPublicKeyHex !== parsed.publicKeyHex)
+            return;
+        // The echoed nonce binds this ack to OUR current round; stale rounds die here.
+        if (!session.awaitingAck || parsed.nonce !== session.nonce)
+            return;
+        // 回绑的 dstEph 必须是本机当前在途临时钥（v2 签名已覆盖这一等式，解析层复核零成本）。
+        if (parsed.peerEphPubHex !== session.myEph.publicKeyHex)
+            return;
+        if (typeof session.lastHelloSentAt === 'number') {
+            session.rttMs = Math.max(0, this.clock.now() - session.lastHelloSentAt);
+        }
+        if (!this.integratePeerEphemeral(session, parsed.ephPubHex, rinfo))
+            return;
+        session.awaitingAck = false;
+        this.clearDirectRetryTimer(session);
+        // completeDirect (reached via integratePeerEphemeral above) sends the
+        // one immediate PING — nothing more here or a handshake emits two.
+    }
+    /**
+     * Adopt a peer ephemeral key and (re)derive the session ciphers. The
+     * working endpoint is refreshed on every call; derivation happens
+     * only when the ephemeral key is actually new, and `derivedPair`
+     * keeps the direct-ready callback to one shot per key pair — hot
+     * upgrades (a fresh reprobe from the peer) still fire again.
+     */
+    integratePeerEphemeral(session, peerEphPubHex, rinfo) {
+        if (session.peerEphPubHex !== peerEphPubHex || session.ciphers === null) {
+            let ciphers;
+            try {
+                ciphers = derivePeerSessionCiphers({
+                    networkId: this.networkId,
+                    myNodeId: this.identity.nodeId,
+                    peerNodeId: session.peerNodeId,
+                    myEphPrivateKeyHex: session.myEph.privateKeyHex,
+                    myEphPublicKeyHex: session.myEph.publicKeyHex,
+                    peerEphPublicKeyHex: peerEphPubHex,
+                });
+            }
+            catch {
+                // Even a signed public key can be low-order/invalid. Preserve live state.
+                return false;
+            }
+            session.peerEphPubHex = peerEphPubHex;
+            session.ciphers = ciphers;
+        }
+        session.endpoint = `${rinfo.address}:${rinfo.port}`;
+        this.clearDirectRetryTimer(session);
+        const pairKey = `${session.myEph.publicKeyHex}|${peerEphPubHex}`;
+        if (session.state === 'direct' && session.derivedPair === pairKey)
+            return true;
+        session.derivedPair = pairKey;
+        this.completeDirect(session, session.ciphers);
+        return true;
+    }
+    completeDirect(session, ciphers) {
+        session.state = 'direct';
+        session.lastSeen = this.clock.now();
+        // New direct epoch: the silent-reprobe backoff restarts at 5s and a
+        // stale outstanding PING from a previous epoch is forgotten (otherwise
+        // the first keepalive would count a bogus miss).
+        session.reprobeAttempts = 0;
+        session.pendingPings.length = 0;
+        session.missedPings = 0;
+        session.lastFastProbeAt = null;
+        this.clearSessionTimers(session); // punch rounds / window / pending reprobe / ping retry all die
+        this.startKeepalive(session);
+        const endpoint = session.endpoint ?? '';
+        this.options.onDirectReady?.(session.peerNodeId, {
+            // NICs change under a running process — classify against a LIVE
+            // read, not the constructor's snapshot (T4).
+            mode: classifyPunchEndpoint(endpoint, collectLocalIps(this.readInterfaces())),
+            endpoint,
+            rttMs: session.rttMs ?? 0,
+            ciphers,
+        });
+        // Both directions complete here (initiator via onHelloAck, responder
+        // via onOpenedFrame) — ONE immediate encrypted PING measures the
+        // session RTT inside the first round trip, no keepalive wait (T4).
+        // Does not count toward missedPings if lost in the cipher derivation race.
+        const fastDelay = this.options.fastConfirmDelayMs ?? 0;
+        session.fastConfirmPending = fastDelay > 0;
+        this.sendPing(session, false, false);
+        if (fastDelay > 0) {
+            const initialPing = session.pendingPings[0];
+            // If the immediate PING above arrived at the responder before our HELLO-ACK
+            // (cipher-derivation race), retry once at +fastDelay while the original
+            // handshake PING is still outstanding and fastConfirmPending is unconsumed.
+            this.armTimer(session, () => {
+                if (!this.isLiveDirectSession(session) ||
+                    !session.fastConfirmPending ||
+                    !initialPing ||
+                    !session.pendingPings.includes(initialPing)) {
+                    return;
+                }
+                this.sendPing(session, false, true);
+            }, fastDelay);
+        }
+    }
+    onOpenedFrame(session, header, plaintext, rinfo) {
+        session.lastSeen = this.clock.now();
+        // Any authenticated frame refreshes the peer's current endpoint —
+        // a roaming phone behind NAT gets followed automatically.
+        session.endpoint = `${rinfo.address}:${rinfo.port}`;
+        // Opening an AEAD-authenticated frame under ciphers derived from our
+        // HELLO-ACK proves our HELLO-ACK reached the peer AND their encrypted
+        // traffic reaches us: 3-way bidirectional UDP confirmation complete!
+        if (session.state !== 'direct' && session.ciphers && session.peerEphPubHex) {
+            session.derivedPair = `${session.myEph.publicKeyHex}|${session.peerEphPubHex}`;
+            this.completeDirect(session, session.ciphers);
+        }
+        if (header.frameType === PeerFrameType.PING) {
+            if (session.state === 'direct') {
+                try {
+                    this.sendEncryptedTo(session, PeerFrameType.PONG, 0, Buffer.from(plaintext), 0);
+                }
+                catch {
+                    // Transient send failure; peer keepalive retries.
+                }
+            }
+            return;
+        }
+        if (header.frameType === PeerFrameType.PONG) {
+            // Only a PONG echoing one of OUR in-flight PING payloads counts as a
+            // sample — a late PONG from a previous cycle (or a duplicate) is ignored
+            // silently: it neither clears pendingPings nor feeds the RTT estimator.
+            let matched;
+            for (let i = session.pendingPings.length - 1; i >= 0; i--) {
+                const candidate = session.pendingPings[i];
+                if (plaintext.length === candidate.payload.length &&
+                    plaintext.every((byte, index) => byte === candidate.payload[index])) {
+                    matched = candidate;
+                    break;
+                }
+            }
+            if (matched) {
+                session.rttMs = Math.max(0, this.clock.now() - matched.sentAt);
+                session.pendingPings.length = 0;
+                this.clearPingRetryTimer(session);
+                session.missedPings = 0;
+                try {
+                    this.options.onRttSample?.(session.peerNodeId, session.rttMs);
+                }
+                catch {
+                    // A listener bug must never wound the state machine.
+                }
+                if (session.fastConfirmPending) {
+                    session.fastConfirmPending = false;
+                    const fastDelay = this.options.fastConfirmDelayMs ?? 0;
+                    if (fastDelay > 0 && this.isLiveDirectSession(session)) {
+                        this.armTimer(session, () => {
+                            if (!this.isLiveDirectSession(session) || session.pendingPings.length > 0)
+                                return;
+                            this.sendPing(session, false, false);
+                        }, fastDelay);
+                    }
+                }
+            }
+            return;
+        }
+        this.options.onEncryptedFrame?.(header, plaintext, rinfo);
+    }
+    sendEncryptedTo(session, frameType, streamId, payload, ack) {
+        if (this.closed)
+            throw new Error('punch manager closed');
+        if (!session.ciphers)
+            throw new Error(`no established session for ${session.peerNodeId}`);
+        const endpoint = session.endpoint;
+        if (!endpoint)
+            throw new Error(`no known endpoint for ${session.peerNodeId}`);
+        const parsed = parseEndpoint(endpoint);
+        if (!parsed)
+            throw new Error(`malformed endpoint ${endpoint}`);
+        const seq = session.frameSeq++;
+        const frame = packEncryptedFrame({
+            frameType,
+            srcNodeId: this.identity.nodeId,
+            dstNodeId: session.peerNodeId,
+            streamId,
+            seq,
+            ack,
+        }, payload, session.ciphers);
+        try {
+            this.socket.send(frame, parsed.port, parsed.host);
+        }
+        catch {
+            // Closed or unroutable UDP socket; ARQ / keepalive handles packet loss cleanly.
+        }
+    }
+}
+function collectLocalIps(interfaces) {
+    const ips = [];
+    for (const list of Object.values(interfaces)) {
+        for (const entry of list ?? []) {
+            if (isIPv4Family(entry.family) && !entry.internal)
+                ips.push(entry.address);
+        }
+    }
+    return ips;
+}
+//# sourceMappingURL=punch.js.map

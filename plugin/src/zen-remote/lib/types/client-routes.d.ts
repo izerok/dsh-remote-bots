@@ -1,0 +1,250 @@
+/**
+ * Sub-client backend routes (T16): pairing claim and connection status for a
+ * DSH process running `role: 'client'` — this machine's settings page is the
+ * ONLY browser surface that talks to them, same-origin like the host's admin
+ * routes (T14). The claim route forwards the pairing code to the SERVER's
+ * gateway (`<serverUrl>/lan-gate/pair/claim-desktop`) and hands the returned
+ * token straight back to the browser, which writes it into the row's
+ * `deviceToken` secret field; this process itself never persists or logs the
+ * token — it only ever puts it into an Authorization header for the status
+ * probe. The status route reads `serverUrl` / `deviceToken` from the plugin
+ * ROW PER REQUEST (both are volatile `{ get() }`-wrapped fields, so the row
+ * object `apply()` received is the only live source) and probes the server's
+ * relay ping, reporting one of the five connection states.
+ *
+ * Same walls as the admin routes, in the same order: `admit` first (webServer
+ * routes skip DSH's /api authentication), then for the POST also the
+ * same-origin gate and a 16 KiB JSON-object body cap. Built by a factory so
+ * the tests drive it over a real socket with a mock server gateway.
+ *
+ * T41b adds the plain-HTTP relay under `client/http/<route>`: the GETs the
+ * browser fetch wrapper intercepted (`/api/changes.summary` / `changes.diff`
+ * naming a virtual session id) are re-issued here through the relay client's
+ * `http()` with the original id restored, and the upstream status,
+ * content type and body travel back verbatim.
+ */
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import type { AdminAdmission } from './admin-routes.js';
+import type { LogRingEntry } from './log-ring.js';
+import type { FetchRouteInterceptDiagnostics } from './fetch-route-intercept.js';
+import type { CurrentSessionRead, InterceptDiagnostics } from './intercept.js';
+import type { PluginRouteInterceptDiagnostics } from './plugin-route-intercept.js';
+import type { PeerEngine } from './peer/engine.js';
+import type { BridgeStatus } from './plugin-bridge.js';
+import type { RelayClient } from './relay-client.js';
+import type { RelayPool } from './relay-pool.js';
+/** Prefix all client routes live under (one webServer prefix registration). */
+export declare const CLIENT_ROUTE_PREFIX = "/_dsh/zen-remote/client";
+/** POST `{serverUrl, code, name}`: redeem a desktop pairing code. */
+export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
+/** GET: the current connection state (never carries the token). */
+export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
+/** POST: one immediate reconnect attempt (T43, the settings page's 立即重连);
+ * answered 409 unless the relay client is currently `offline`. */
+export declare const CLIENT_RECONNECT_ROUTE = "/_dsh/zen-remote/client/reconnect";
+/** POST: the browser's NETWORK-RESTORED hint.
+ *
+ * Why this route exists: the host half runs in a plain Node process with no
+ * OS network events, and the browser half cannot touch the relay client's
+ * memory across the HTTP boundary. So the browser — the only place that can
+ * observe `online`/`visibilitychange` — reports the hint here, and the host
+ * turns it into ONE controlled probe + reconnect.
+ *
+ * Deliberately narrower than `reconnect`:
+ *  - it first runs `probeHealth()` (authenticated GET /ping); a hint NEVER
+ *    alone proves the link is back (`navigator.onLine === true` is not
+ *    evidence);
+ *  - only a successful probe advances to `networkRestored()`, which itself
+ *    refuses outside `offline` and inside its 3s anti-storm gap;
+ *  - it answers the probe outcome so the page can log/annotate it.
+ *
+ * It NEVER changes state by itself: `probeHealth` is read-only, and
+ * `networkRestored` is the same controlled path the settings button uses. */
+export declare const CLIENT_NETWORK_HINT_ROUTE = "/_dsh/zen-remote/client/network-hint";
+/** GET: the remote-session status the T34 client parts render from (T34) —
+ * the relay's serving state, the interface-compatibility verdict, the
+ * handshake's server name, and the closed-session map. The prefix is
+ * registered on BOTH roles (T34-fix): a host — no relay client wired —
+ * answers the empty `{state:'unpaired', versionMismatch:false, serverName:'',
+ * closed:{}}` conclusion. It carries no token and no server address. */
+export declare const CLIENT_REMOTE_STATUS_ROUTE = "/_dsh/zen-remote/client/remote-status";
+/** GET: the redacted diagnostic report (CU-3, SPEC 方案 C) — `_meta`,
+ * `config`, `status`, optional `gateway`, `logs` plates, assembled by
+ * {@link assembleDebugReport} and safe to paste into a GitHub issue. Mounted
+ * on BOTH roles (each answers its own report); a request that arrived
+ * through the gateway is refused BEFORE dispatch (the wizard's via wall) —
+ * diagnostics are a machine-local export, and the gateway must never be able
+ * to fetch this machine's report for its own device table either. */
+export declare const CLIENT_DEBUG_REPORT_ROUTE = "/_dsh/zen-remote/client/debug-report";
+/** POST `{sessionId: <虚拟 id>}`: close one remote session from THIS machine
+ * (T34) — the backend forwards the ORIGINAL id through the relay's
+ * `POST relay/v1/unshare`, so the server closes it with reason `'client'`. */
+export declare const CLIENT_UNSHARE_ROUTE = "/_dsh/zen-remote/client/unshare";
+/** POST `{sessionId: string | null}`: the browser's report of which session
+ * the host UI currently has open (T62) — the intercept layer runs in this
+ * backend process and cannot read the browser's localStorage itself. `null`
+ * means a readable signal says nothing is open; the sink stores the value
+ * and re-judges the mergers immediately. */
+export declare const CLIENT_CURRENT_SESSION_ROUTE = "/_dsh/zen-remote/client/current-session";
+/** POST `{entryId?: string, all?: boolean}` (MS-5): remove one paired server
+ * by its entry id, or every paired server at once (`all: true`). The paired
+ * list lives in `zen-remote-state.json`; this route goes through the pool so
+ * the live clients stop with their records. Pool-mode only — a mount without
+ * a pool has no paired list to edit and answers the unknown-path 404. */
+export declare const CLIENT_UNPAIR_ROUTE = "/_dsh/zen-remote/client/unpair";
+/** Prefix of the peer-role management routes (PG-9). All of them sit behind
+ * the same walls as the rest of the prefix, PLUS the via-marker wall before
+ * dispatch: a request wearing the gateway's marker came from a remote
+ * device, and NO remote device may read or write this machine's peer state.
+ * The POSTs additionally run the same-origin gate; every answer is free of
+ * key material (`privateKeyHex`, the invite's `joinKey`). */
+export declare const CLIENT_PEER_PREFIX = "/_dsh/zen-remote/client/peer";
+/** GET: the peer engine's snapshot — this machine's node id, the gateway
+ * admission state, the joined network's id + HTTP origin, the announced
+ * device cap and one row per network device with its view path
+ * (`lan` / `p2p` / `relay` / `mismatch` / `offline`). */
+export declare const CLIENT_PEER_STATUS_ROUTE = "/_dsh/zen-remote/client/peer/status";
+/** POST `{inviteUri}`: join a network by pasting its `zr-net(s)://…` invite.
+ * The engine's refusal keeps its code as a 400. */
+export declare const CLIENT_PEER_JOIN_ROUTE = "/_dsh/zen-remote/client/peer/join";
+/** POST `{}`: leave the current network (unmount everything, close the WS,
+ * clear the persisted membership). */
+export declare const CLIENT_PEER_LEAVE_ROUTE = "/_dsh/zen-remote/client/peer/leave";
+/** POST `{nodeId, mounted}`: mount or ignore one network device's shared
+ * sessions (forwards to `peerEngine.setNodeDisabled(nodeId, !mounted)`). */
+export declare const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = "/_dsh/zen-remote/client/peer/toggle-mount";
+/** POST `{nodeId}`: explicit local confirmation to trust a peer's NEW public
+ * key after a `mismatch` verdict (`peerEngine.trustPeer`). */
+export declare const CLIENT_PEER_TRUST_ROUTE = "/_dsh/zen-remote/client/peer/trust";
+/** POST `{}`: re-run the UDP hole-punch for every eligible device. */
+export declare const CLIENT_PEER_REPROBE_ROUTE = "/_dsh/zen-remote/client/peer/reprobe";
+/** POST `{}`: dismiss the persisted post-admission gateway revocation banner. */
+export declare const CLIENT_PEER_DISMISS_REVOKED_ROUTE = "/_dsh/zen-remote/client/peer/dismiss-revoked";
+/** Prefix of the plain-HTTP relay routes (T41b):
+ * `GET ${CLIENT_HTTP_ROUTE_PREFIX}<route>?<query>` relays one intercepted
+ * `/api/<route>` call (the fetch wrapper's rewrites land here) to the
+ * server, with the virtual session id swapped back to the original. */
+export declare const CLIENT_HTTP_ROUTE_PREFIX = "/_dsh/zen-remote/client/http/";
+/** The fetch face this module needs; injectable for tests. */
+export type FetchLike = (url: string | URL, init?: RequestInit) => Promise<Response>;
+export interface ClientHandlerOptions {
+    /** The connection service's admit, injected by apply(); tests fake it. */
+    admit: (req: IncomingMessage) => AdminAdmission;
+    /** The plugin ROW as apply() received it — `serverUrl` / `deviceToken` are
+     * volatile, so they must be read through this at request time, never
+     * snapshotted at registration. */
+    getRowConfig: () => unknown;
+    /** Outbound fetch, defaulting to the global one. */
+    fetchImpl?: FetchLike;
+    /** Longest wait (ms) for one connection probe or live handshake; defaults to
+     * {@link PROBE_TIMEOUT_MS} (5000). Tests inject a small value. */
+    probeTimeoutMs?: number;
+    /** Upload-redirect service probe (RD-6): lazily reflects `connection` /
+     * `fileUploads` from a context that already resolved, plus whether the
+     * fetch-route inject callback ever fired. Answers WHY the upload
+     * redirection is absent on compositions where one of the two services
+     * never becomes available (cordis keeps such injects silently PENDING). */
+    getServiceProbe?: () => Record<string, unknown>;
+    /** The live relay client (T23a), once apply() built one. When it has LEFT
+     * its initial `unpaired` state — a connection attempt ran — the status
+     * route reports ITS verdict (state + handshake server name) and skips the
+     * ping probe; the probe below stays as the fallback for a client that
+     * never connected, so the settings page still gets a fresh answer while
+     * the startup `connect()` is still unpaired. */
+    getRelayClient?: () => RelayClient | undefined;
+    /** MS-5 POOL mode: the multi-server relay pool. When present it REPLACES
+     * the row-driven single-client facts everywhere: the paired list (not the
+     * row's serverUrl/deviceToken) is the truth, claim pairs straight into the
+     * pool (the token never reaches the browser), unpair/reconnect address
+     * pool entries, and status / remote-status report the whole list (the
+     * top level keeps the FIRST entry's fields so the existing page keeps
+     * rendering). The single-`getRelayClient` form above stays exactly as it
+     * was for the old wiring and the tests. */
+    pool?: RelayPool;
+    /** MS-5: the PB-2 bridge verdict for ONE pool entry, computed PER CALL off
+     * that entry's own handshake table and connection state — per-server
+     * isolation for the status / remote-status bodies. Undefined (old tests,
+     * the unwired host mount): every per-server `pluginBridge` / per-server
+     * `bridgedPlugins` list reads `[]`. */
+    getPluginBridgeStatusForServer?: (serverId: string | undefined, client: RelayClient) => BridgeStatus[];
+    /** The typert interception's diagnostics (T23b-1), read live per request.
+     * Shapes, counters and failure codes only — never a token. Undefined when
+     * this composition never even attempted an install (no typertGateway). */
+    getIntercept?: () => InterceptDiagnostics | undefined;
+    /** The exact-fetch-route interception's diagnostics (T51), read live per
+     * request: the local upload route's remote-forwarding install state and
+     * its refusal counters. Undefined when this composition never attempted
+     * one (no connection service, or no fileUploads service to inject). */
+    getFetchRouteIntercept?: () => FetchRouteInterceptDiagnostics | undefined;
+    /** The plugin-route interception's diagnostics (PB-4), read live per
+     * request: the local webServer `match` wrap that forwards bridged-plugin
+     * requests for remote sessions. Undefined when this composition never
+     * attempted one (a host role, or no webServer). */
+    getPluginRouteIntercept?: () => PluginRouteInterceptDiagnostics | undefined;
+    /** The plugin bridge's live verdict (PB-2), computed PER CALL off the local
+     * registry, the last handshake's `plugins` table and the connection state —
+     * never a stored conclusion. Wired only by the CLIENT role's mount; absent
+     * (the host mount, old tests) both routes answer the empty shape: status's
+     * `pluginBridge: []` and remote-status's `bridgedPlugins: []`. */
+    getPluginBridgeStatus?: () => BridgeStatus[];
+    /** Serve ONLY the remote-status route (T41a-fix2, the host role's mount):
+     * every other route under the prefix answers the same 404 an unknown path
+     * would. The claim / status / reconnect / unshare routes exist for a
+     * CLIENT — a host carries no relay client and no pairing surface, so
+     * answering them (even with their empty conclusions) is exposure without
+     * a user. The remote-status route stays: the T34 client parts poll it on
+     * whatever role this process runs. */
+    remoteStatusOnly?: boolean;
+    /** T62: the sink for the browser's current-session reports — stores the
+     * latest value (memory, last write wins across windows) and makes the
+     * intercept re-judge at once. Wired only on the CLIENT mount; the HOST
+     * mount's remoteStatusOnly wall 404s the route before this matters, and
+     * a client handler WITHOUT the sink answers the same 404 (no sink, no
+     * route). */
+    onCurrentSession?: (read: CurrentSessionRead, reportedLang?: 'zh' | 'en') => void;
+    /** Language for route error messages (`'zh'` default, `'en'` English). */
+    lang?: 'zh' | 'en' | (() => 'zh' | 'en') | undefined;
+    /** CU-3, the debug-report route's inputs — all optional; the route answers
+     * its 404-shaped refusal without them (an unwired composition must not
+     * pretend to have diagnostics). Wired on BOTH role mounts.
+     *
+     * The log ring's snapshot (CU-1), oldest first. */
+    getLogSnapshot?: () => readonly LogRingEntry[];
+    /** The gateway child's summary plate (HOST mount only): liveness, port,
+     * device and share counts — counts, never tokens. May be async (it probes
+     * the gateway's own status). */
+    getGatewaySummary?: () => Record<string, unknown> | Promise<Record<string, unknown>>;
+    /** The profile context's display name, when the composition has one. */
+    getProfileName?: () => string | undefined;
+    /** This package's own version, read at module load in src/index.ts. */
+    getPluginVersion?: () => string;
+    /** PG-2: the live pairing cap (`resolveConfig`'s `maxServers`), read PER
+     * REQUEST — the field is volatile and deliberately not a restart field, so
+     * a change reaches the next request without any reload. POOL-mode mounts
+     * do NOT read this for the cap (PG-2-fix): status and the claim pre-check
+     * follow {@link effectiveMaxServers}, i.e. `pool.maxServers()` — the one
+     * synthesis that folds the peer mode's network cap in, matching what
+     * `pool.pair()` enforces. This getter answers only as the fallback for a
+     * mount without a pool, or a pool predating the getter (test stubs).
+     * Missing answers the historic constant 8. */
+    getMaxServers?: () => number;
+    /** PG-9: the live peer-role engine, read PER REQUEST (undefined on a
+     * non-peer composition — every peer route then answers 503
+     * `peer-unavailable`). Wired only by the connects-role mount. */
+    getPeerEngine?: () => PeerEngine | undefined;
+    /** PS-2: sanitized identity load error (`'state-file-unreadable'`) when a
+     * peer row failed to read or chmod `zen-remote-state.json` at apply time. */
+    getPeerIdentityError?: () => string | undefined;
+    /** PG-9: the joined network's HTTP origin for the peer status body, read
+     * PER REQUEST off the state file's `peerNetwork` block (absent when not
+     * joined). Address-shaped, never a secret. */
+    getPeerNetworkOrigin?: () => string | undefined;
+}
+export type ClientHandler = (req: IncomingMessage, res: ServerResponse) => Promise<void>;
+/**
+ * Build the client route handler for one plugin row. The returned handler
+ * owns the full response lifecycle of every request under
+ * {@link CLIENT_ROUTE_PREFIX} and never throws.
+ */
+export declare function createClientHandler(options: ClientHandlerOptions): ClientHandler;
+//# sourceMappingURL=client-routes.d.ts.map

@@ -1,0 +1,605 @@
+/**
+ * The local gateway interception (T23b-1): a sub-client's own DSH process
+ * keeps serving its local UI, but calls that mention a remote session must
+ * travel to the relay server instead. Installed directly on the RAW gateway
+ * instance (`ctx.typertGateway[symbols.original]`) as own properties — the
+ * load-bearing fact from docs/spike-relay.md §2.2 is that the gateway's
+ * constructor registers arrow functions which look `openWireStream` /
+ * `dispatchRpc` up on the instance at EVERY call, so an own property
+ * shadows the prototype method. `checkGatewayShape` (intercept-shape.ts)
+ * proves that property before anything is installed.
+ *
+ * Forwarding rules, mirroring the server side (relay-access.ts) so the two
+ * ends disagree on nothing:
+ *
+ * - a call is "remote" only when a REGISTERED field of its method carries a
+ *   virtual id (`zr~<serverId>~<id>`, virtual-id.ts). Methods outside the
+ *   table get one defensive deep scan instead — a virtual id found anywhere
+ *   must never reach the local DSH, so the call is refused
+ *   (`remote-unsupported`); for registered methods only the registered
+ *   fields are read, the same decoy discipline the server applies. The three
+ *   field-less GLOBAL reads (`workspace/follow`, `session/control`,
+ *   `session/list`) never refuse on their arguments either — since T23b-2
+ *   they are MERGED instead: the local answer passes through and the relay's
+ *   filtered answer is folded in by src/merge-streams.ts (remote workspaces
+ *   appear as `zr~`-prefixed groups after the local ones; a remote baseline
+ *   never reaches the UI as a second baseline).
+ * - before forwarding, the call's virtual ids must all belong to ONE server
+ *   AND to the server this relay client is handshook with (`remote-mismatch`);
+ *   with no handshake at all the answer is `remote-offline`.
+ * - a registered method forwards via `relay.invoke` / `relay.openStream`
+ *   with the registered fields restored to original ids (`request.address`
+ *   maps by kind: `session` → `sessionId`, `subagent` → `parentSessionId`;
+ *   the childSessionId is already the server's own id and passes through).
+ *   Results and stream frames are rewritten field by field — never by whole
+ *   string replacement, event bodies keep their own ids — per the verified
+ *   0.2.0-rc.1 wire inventory (see the per-method notes on
+ *   {@link rewriteFrame} / {@link rewriteResult}).
+ * - the wire shapes the host MANDATES are honored: every failure envelope
+ *   carries `error.details` as an object (dsh-client-connection refuses a
+ *   failure without one), every uplink the multiplex channel hands us is
+ *   released and the stream forwarded anyway (the mux always passes an
+ *   UplinkInbox — refusing uplinks would refuse every remote stream), and
+ *   every error THROWN on the stream route is marked `isDSHRemoteError` with
+ *   a string `code` (dsh-typert-protocol's remoteErrorOf folds unmarked
+ *   errors into `gateway/internal`, losing the code).
+ * - the 0.2.0 `openWireStream` is an ASYNC method — the host's mux does
+ *   `await this.open(...)` and then `for await` over the result. The merge
+ *   routes therefore await the local original too and hands the host back a
+ *   promise of the merged iterable, the same shape the real method returns.
+ *
+ * T32 adds the forwarded-event pair, mirroring the server side:
+ *
+ * - `openWireStream('$events', …)` stays the stream the UI opened — local
+ *   frames pass through untouched — while a relay `$zr/events` leg, reopened
+ *   for as long as the relay is online, folds the SERVER's approval/question
+ *   waterfalls in. Remote frames are rewritten before the UI ever sees them:
+ *   `agentId` and `eventId` become `zr~<serverId>~…` virtual ids (those are
+ *   the ONLY session ids a forwarded waterfall carries — the request bodies
+ *   are tool/question data, verified against dsh-tools/dsh-user-questions),
+ *   and the remote `ready`/`emit` frames are DROPPED — except, since T75, a
+ *   shared session's `api-session/status` emit, which crosses with its
+ *   session id virtualized (the one share-scoped emit; every other emit
+ *   broadcasts server-wide state the UI must not mistake for local
+ *   sessions). The client face of the
+ *   gateway (dsh-api-gateway lib/client.js) accepts a ready frame only as
+ *   the FIRST frame of the stream and would fail the stream on a second one.
+ *   Prompts this leg showed are closed when the leg dies —
+ *   each gets a synthesized `cancel` — so a disconnect cannot leave an
+ *   approval on screen that no server can settle anymore (T32-fix).
+ * - `dispatchRpc('$events/result', …)` splits on the eventId: a virtual id
+ *   is swapped back to the original and answered through the relay's
+ *   `postEventResult` (the server composes the gateway payload with its own
+ *   clientId — the local payload's clientId is the local stream's and is
+ *   discarded); anything else reaches the local gateway verbatim. A relay
+ *   refusal that means "this event is already over" (`unknown-event`,
+ *   `not-shared` — the route's 403 refusals) is answered as silent
+ *   success — exactly how DSH treats a stale result — because a thrown
+ *   answer fails the UI's whole `$events`
+ *   generation (client face: pumpEvents aborts on answer failures).
+ */
+import type { RelayClient, RelayClock } from './relay-client.js';
+import type { RelayPool } from './relay-pool.js';
+import type { GatewayShapeCheck } from './intercept-shape.js';
+import { type ResultAttachment } from './invoke-binary.js';
+import { type SessionHistoryCache, type SessionHistoryCacheOptions, type SessionHistoryCacheStats } from './session-history-cache.js';
+import { type SessionPrewarmOptions } from './session-prewarm.js';
+import { virtualizeProjectionValues } from './merge-streams.js';
+export { virtualizeProjectionValues };
+import type { MergerLang } from './merge-streams.js';
+/** The session-locating argument fields, as registered per method. Identical
+ * in name and meaning to relay-access.ts's `SessionField`; a field named
+ * without a dot is TOP-LEVEL. `request.workspaceId` locates a remote create
+ * by its target workspace (never a share-table id on the server — the route
+ * probes the workspace and auto-shares the result); top-level
+ * `sessionId` / `workspaceFileScopeId` ARE session ids (terminal's retain/list
+ * half and the workspace-files group). */
+export type SessionField = 'request.sessionId' | 'request.address' | 'request.parentSessionId' | 'request.childSessionId' | 'request.beforeSessionId' | 'request.workspaceId' | 'parentSessionId' | 'childSessionId' | 'sessionId' | 'workspaceFileScopeId' | 'agentId';
+/**
+ * The client-side half of the server's `RELAY_METHODS` registry: which
+ * argument field locates the session for each method. METHODS AND FIELDS
+ * MUST stay identical to the server table (test/intercept-core.test.cjs pins the
+ * equality by reading relay-access's table directly) — a method the server
+ * does not serve would answer `forbidden-method` forever, and a field the
+ * server does not check would strand a virtual id un-rewritten.
+ *
+ * The three global reads carry no field: nothing in their arguments is
+ * session-scoped, so they are never REFUSED on their arguments — a stray
+ * virtual id there is unowned data. Instead the T23b-2 routes merge their
+ * answers with the relay's filtered ones (merge-streams.ts).
+ */
+export declare const CLIENT_METHOD_FIELDS: Readonly<Record<string, readonly SessionField[]>>;
+/** Optional session-locating fields checked/restored when present (keeps
+ * `CLIENT_METHOD_FIELDS` identically keyed to `RELAY_METHODS[endpoint].fields`). */
+export declare const OPTIONAL_CLIENT_METHOD_FIELDS: Partial<Record<string, readonly SessionField[]>>;
+/** `dispatchRpc`'s failure shape as the UI mandates it: dsh-client-connection's
+ * server-response parser (`invalid server-response failure`) and the gateway's
+ * rpcErrorSchema both demand `code` AND `message` as strings AND `details` as
+ * an object — a details-less refusal crashes the client's parser, so every
+ * envelope WE construct carries `details: {}` (the host rpcFailure's
+ * fallback). */
+export type DispatchEnvelope = {
+    ok: true;
+    value: unknown;
+    attachments?: ResultAttachment[];
+} | {
+    ok: false;
+    error: {
+        code: string;
+        message?: string;
+        details: Record<string, unknown>;
+    };
+};
+/**
+ * The READ methods of the client registry (T34, whitelist form per T34-fix):
+ * the methods allowed through while the relay is not `online`. Everything in
+ * {@link CLIENT_METHOD_FIELDS} NOT listed here is a WRITE and is refused
+ * locally with `remote-offline` while offline — a write can only fail out
+ * there, and the honest local answer beats a dead round-trip. Maintaining
+ * the READ side keeps the failure mode safe: a future table entry nobody
+ * classified lands on the write side (refused offline), never silently
+ * forwarded into a dead link.
+ *
+ * The read list, method by method:
+ *
+ * - every `stream: true` entry of the server table — a subscription
+ *   observes, it never mutates: `session/follow`, `session/control`,
+ *   `job/list`, `job/follow`, `workspace/follow`, and the T32
+ *   `$zr/events` pair entry (never client-dialed, listed for the table
+ *   guard);
+ * - `session/list` — the unscoped first-page read the merge route folds in;
+ * - `session/page` (history read), `session/projections` (control-key
+ *   read), `session/attachment` — verified against RT: it READS one durable
+ *   image back (base64), it does not attach anything;
+ * - `skills/list`, `messageFeedback/list`, `schedule/list` — list reads;
+ * - `fileReferences/list` (T31) — the @-reference listing; its put/delete
+ *   siblings would be writes, but only this listing is in the table.
+ *
+ * Everything else — `session/prompt|cancel|rename|selectModel|updateQueue`
+ * (send, cancel, rename, model switch, inbox mutation), `session/create` /
+ * `session/fork` (T31: new sessions on the server), `subagents/prompt` /
+ * `subagents/interruptByParent` / `subagents/interruptByUser` (T31: prompt/interrupt a remote subagent),
+ * `fileUploads/upload` (T31: attachments into a remote session), `job/kill`,
+ * `messageFeedback/put|delete`, the workspace session-list mutations, and
+ * the T41a mutations (`goals/edit|pause|resume|clear`, `commands/execute`,
+ * `agentPresets/select`, `sessionFeedback/record`,
+ * `terminal/create|write|resize|rename|close|follow`) — is a write.
+ * `terminal/follow` joined the write side (T41a-fix2): its attachment is
+ * NOT a pure read — RT dsh-api-terminal-controller follow: "Attach with
+ * exclusive input control; an older attachment becomes read-only" — so a
+ * follow flips which follower owns the terminal's input, and offline it
+ * must refuse like every other mutation instead of silently stealing
+ * control from a connection that is not there.
+ */
+export declare const REMOTE_READ_METHODS: ReadonlySet<string>;
+/** Whether `endpoint` (a client-table method) is a remote WRITE: anything
+ * the read whitelist does not name (T34-fix). */
+export declare function isRemoteWrite(endpoint: string): boolean;
+/**
+ * Stream endpoints whose caller-supplied `uplink` iterable and
+ * `uplinkWindow` travel to the relay instead of being half-closed locally
+ * with `releaseUplink`. DSH 0.2.2+ replaced `terminal/follow|write|resize`
+ * with the duplex `terminal/attach` stream (`TerminalInput` write/resize
+ * commands ride the uplink; `ack` frames ride the downlink). The relay
+ * client's pump (relay-client.ts) is the other half: it forwards the host's
+ * frames through the server's `/v1/stream-uplink` channel and releases the
+ * host inbox itself when the stream ends — the interceptor only hands the
+ * iterable over, it never half-closes a member of this set.
+ */
+export declare const REMOTE_UPLINK_STREAM_METHODS: ReadonlySet<string>;
+export type InterceptLang = MergerLang;
+/**
+ * The session-level streams the CP4 hold-through-the-outage behavior is FOR
+ * (CP5 scope): only these endpoints' UI consumers turn a CLEAN stream end
+ * (≥1 frame accepted) into a `RemoteStreamCarrierError` and reopen at once,
+ * so ending the held stream cleanly on recovery is the one signal they
+ * retry. Endpoint by endpoint, verified against the RT bundle:
+ *
+ * - `session/follow` — dsh-api-gateway lib/client.js:1165, the
+ *   RemoteJournalStream `ended` callback: accepted →
+ *   `RemoteStreamCarrierError("… ended without a terminal result")`, which
+ *   feeds `waitForRemoteStreamRetry`;
+ * - `job/list` / `job/follow` — dsh-api-job-controller lib/client.js:269/303,
+ *   the same shape ("ended before release" / "ended before settlement");
+ * - `session/control` — dsh-api-session-controller lib/client.js:387
+ *   ("session control stream ended without a terminal result");
+ * - `workspace/follow` — dsh-api-workspace-controller lib/client.js:477
+ *   ("Workspace state stream ended without a terminal result").
+ *
+ * Every endpoint OUTSIDE the list has a consumer that renders a clean end as
+ * a TERMINAL error, so a hold would leave it frozen on recovery with no
+ * retry — those end with the ORIGINAL error code the moment the link dies
+ * (the pre-CP4 behavior). Verified: `workspaceFiles/changes`
+ * (dsh-api-workspace-files lib/client.js:112 — plain
+ * `Error("workspace file changes of … ended")`; dsh-client-ui-sidebar-files
+ * lib/client.js:229 — `Error("Directory watch ended: …")`),
+ * `terminal/retain` (dsh-api-terminal-controller lib/client.js:549 —
+ * `RemoteError("terminal/unavailable", "Terminal hold ended")`),
+ * `terminal/follow` (same file, lib/client.js:240 —
+ * `TerminalViewError("attachmentEnded")`).
+ *
+ * `session/control` and `workspace/follow` travel the MERGED route today
+ * (empty field tables → `mergedGlobalStream`, which holds by its own T23b-2
+ * design), so on this route the list's live members are `session/follow`,
+ * `job/list` and `job/follow`; they stay listed to keep the RT fact in one
+ * place. A future stream endpoint nobody classifies lands OUTSIDE the list —
+ * the honest terminal error, never a silent hold — the same safe default as
+ * the READ whitelist below it.
+ */
+export declare const SESSION_STREAM_HOLD_ENDPOINTS: ReadonlySet<string>;
+/**
+ * T58/T62: the vocabulary of the current-session signal. The value travels
+ * from the BROWSER — the only place the host's persisted selection
+ * (localStorage `dsh.sessions.current`) is readable — through the client
+ * route `current-session` into this process, because the intercept layer
+ * runs in the backend Node process (it wraps the typert gateway there) and
+ * cannot read the browser's storage itself (the T58 localStorage read was
+ * exactly that mistake: Node's global localStorage without a
+ * `--localstorage-file` never answers, so every read degraded to
+ * `unavailable` and tombstones never hid).
+ *
+ * - `unavailable`: no usable signal has arrived yet — the conservative
+ *   fallback keeps every tombstone;
+ * - `none`: a readable signal says no session is open;
+ * - `open`: this session's page is open (the raw id as the UI knows it — a
+ *   virtual id for a remote session, a local id otherwise).
+ */
+export type CurrentSessionRead = {
+    kind: 'unavailable';
+} | {
+    kind: 'none';
+} | {
+    kind: 'open';
+    sessionId: string;
+};
+/** One remote-call failure in the diagnostics ring. */
+export interface InterceptFailureRecord {
+    /** ISO timestamp of the moment the failure was recorded. */
+    time: string;
+    endpoint: string;
+    code: string;
+}
+/**
+ * One INCOMPATIBLE remote call (T42): a forwarded call the SERVER refused
+ * because the two DSH versions disagree about the interface — the runtime
+ * symptom layer three of the version-tolerance design watches for (see
+ * {@link INCOMPATIBLE_CALL_CODES} for exactly which codes qualify). Only
+ * that one panel errors; the record feeds the settings page's diagnostics
+ * so the mismatch is explainable. `time` is epoch milliseconds — the number
+ * form the settings view's failure rows render directly.
+ */
+export interface IncompatibleCallRecord {
+    time: number;
+    endpoint: string;
+    code: string;
+}
+/**
+ * The gateway error codes that count as version-mismatch symptoms, verified
+ * against dsh-api-gateway 0.2.0-rc.1 (`lib/index.js`):
+ * `gateway/arguments-invalid` — the args fields do not match the endpoint's
+ * descriptor; `gateway/input-invalid` — a wire field failed the codec's
+ * boundary parse; `gateway/invocation-unavailable` — no active Remote method
+ * exports the endpoint at all (the client called an interface an older
+ * server does not have). Other gateway codes answer different questions
+ * (a cancelled call, a missing service binding) and are NOT version
+ * symptoms. Deliberately ABSENT: `gateway/result-invalid` — despite the
+ * name it only means "a stream Remote method did not return an iterable"
+ * (a server implementation bug class); the gateway does NOT schema-validate
+ * results, so a result-shape disagreement between versions is invisible
+ * here and stays the fingerprint layer's job.
+ */
+export declare const INCOMPATIBLE_CALL_CODES: ReadonlySet<string>;
+/** The behavior self-check's verdict (spike §4.1 check 4). */
+export type SelfCheckResult = {
+    ok: true;
+} | {
+    ok: false;
+    reason: string;
+};
+/**
+ * One remote session the SERVER is no longer serving to this device (T34,
+ * refined by T34-fix): the virtual id plus the close reason ('manual' |
+ * 'client' | 'idle'; anything uncertain reads 'manual'). Two sources: an
+ * `unshared` error frame on a session stream that was OPEN, and a
+ * session-scoped stream refused `not-shared` at open (the closure happened
+ * before this page arrived — no event was ever observed, so the reason
+ * degrades to manual). Drives the session page's 远程已关闭 banner and the
+ * `remote-status` route's `closed` map. Cleared PER SESSION only, when a
+ * call for it succeeds again (re-shared and served) — never wholesale on a
+ * reconnect: a link that flapped while the server still holds the closure
+ * would otherwise flash the banner away and back (T34-fix).
+ */
+export interface ClosedSessionRecord {
+    sessionId: string;
+    reason: 'manual' | 'client' | 'idle';
+}
+/** What the client status route surfaces about the interception. Contains
+ * only shapes, counters and codes — never a token. */
+export interface InterceptDiagnostics {
+    installed: boolean;
+    shape: GatewayShapeCheck;
+    /** Set once the wiring's startup self-check ran; undefined while it is
+     * still in flight. */
+    selfCheck?: SelfCheckResult;
+    /** The most recent remote-call failures, oldest first, capped at 20. */
+    recentFailures: InterceptFailureRecord[];
+    /** The most recent VALIDATION-refused remote calls (T42), oldest first,
+     * capped at 50 — the runtime-degradation half of the version-tolerance
+     * diagnostics. */
+    incompatibleCalls: IncompatibleCallRecord[];
+    /** Remote sessions closed server-side while a page had them open (T34),
+     * oldest first, capped at 200. */
+    closedSessions: ClosedSessionRecord[];
+}
+/** PB-25b: one merged global stream's share of the KNOWN-real-session
+ * inventory. REPLACE semantics: each `replace` call carries that stream's
+ * FULL current set (the workspace merger's sessionHome snapshot — every real
+ * id the sidebar currently holds as a `zr~` id), never a delta; `dispose`
+ * drops the share (the stream ended — its merger is gone, its ids may no
+ * longer be in the UI's view). The wiring unions the live shares into the
+ * read-only set the plugin-route rewrite consults; nothing here hands out a
+ * mutable reference to merge state. */
+export interface SessionInventorySlot {
+    replace(ids: ReadonlySet<string>): void;
+    dispose(): void;
+}
+export interface InstallInterceptOptions {
+    /** The RAW gateway instance (`ctx.typertGateway[symbols.original]`), not
+     * the cordis proxy — own properties on the proxy are ignored by everyone. */
+    raw: object;
+    /** SINGLE-SERVER mode (the original wiring, kept for compatibility): the
+     * one client relay client the calls travel through. Either this +
+     * {@link getServerId}, or {@link pool} — never required together. */
+    relay?: RelayClient;
+    /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+     * call; `undefined` (never handshook) makes every remote call a
+     * `remote-offline` — a different fact from pointing at the wrong server
+     * (`remote-mismatch`). */
+    getServerId?: () => string | undefined;
+    /** MS-3 POOL mode: the multi-server relay pool (up to
+     * `MAX_PAIRED_SERVERS` paired servers). When present it replaces the
+     * single-relay routing: every call/stream/event routes by the virtual
+     * id's `serverId` to the matching pool entry, and the three global reads
+     * plus the model catalog merge ALL paired servers in pairing order. */
+    pool?: RelayPool;
+    /** Progress logging, wired to the context logger by index.ts. */
+    log?: (format: string, ...args: unknown[]) => void;
+    /** Clock/timers for the merged streams' reopen backoff (CP4); defaults to
+     * the same real clock the relay client's ladder uses. Tests inject a
+     * manual clock to drive the reopen delays without real waiting. */
+    clock?: RelayClock;
+    /** The current-session signal, read live per use (T62): the browser half
+     * reports the host UI's open session through the client route
+     * (`current-session`) and the wiring holds the latest value here. The
+     * intercept runs in the BACKEND Node process — the browser's localStorage
+     * is not reachable from it, which is exactly what the T58 localStorage
+     * read got wrong — so the value must be carried in. Default: permanently
+     * `unavailable` (the conservative fallback — tombstones stay). */
+    getCurrentSession?: () => CurrentSessionRead;
+    /** PB-25b: the inventory slot factory — one slot per merged global stream
+     * (only the workspace merger ever reports; the control merger has no
+     * session inventory). The wiring unions the live slots' shares into the
+     * set the plugin-route rewrite consults. MS-3: the factory receives the
+     * slot's `serverId`, so a pool wiring can keep per-server inventories
+     * (the plain single-server wiring can ignore the argument). Absent: no
+     * shares are ever reported and the plugin-route value scan stays exactly
+     * the request-local behavior. */
+    createSessionInventorySlot?: (serverId?: string) => SessionInventorySlot;
+    /** Language for error messages and sidebar group suffixes (`'zh'` default,
+     * `'en'` English). Accepts a getter for live resolution. */
+    lang?: InterceptLang | (() => InterceptLang) | undefined;
+    /** T4: optional in-memory session history cache (instance, options, or `false`
+     * to disable). Defaults to a `64 MiB` cache using the install clock. */
+    historyCache?: SessionHistoryCache | SessionHistoryCacheOptions | false;
+    /** T5: optional cold-safe automatic session prewarm options, or `false` to disable. */
+    prewarm?: SessionPrewarmOptions | false;
+}
+export interface InterceptHandle {
+    /** Remove both own properties, restoring exactly what was installed over
+     * (another wrapper's value, or nothing). Idempotent. */
+    uninstall(): void;
+    /** The status-route view: installed flag, the shape verdict recorded at
+     * install time, the self-check verdict, the failure ring. */
+    diagnostics(): InterceptDiagnostics;
+    /** How many calls entered each wrapper (local passthroughs included) —
+     * diagnostic traffic counters for the status surface; the behavior
+     * self-check proves "the wrap was reached" by probe-payload identity
+     * instead. */
+    wrappedCalls(): {
+        openWireStream: number;
+        dispatchRpc: number;
+    };
+    /** Record the wiring's self-check verdict (and uninstall + log on
+     * failure — the wiring owns that decision, this only records). */
+    noteSelfCheck(result: SelfCheckResult): void;
+    /** T62: the browser just reported a new current-session value (the
+     * client route's sink calls this). Every live merged global stream
+     * re-judges NOW — the mergers dedupe no-change calls — instead of
+     * waiting for the next frame or the 1s fallback poll. */
+    currentSessionChanged(): void;
+    /** PB-26a: trigger a summary-sync check for virtual session ids discovered
+     * OUTSIDE workspace/follow (a sidechat childId the plugin bridge just
+     * minted in a response rewrite, for instance). Empty and non-virtual
+     * entries are dropped; a batch with nothing left is a no-op. Reaches every
+     * live merged `$events` stream, and the pending slot when none is open. */
+    nudgeSummarySync(ids: readonly string[]): void;
+    /** MS-3 (pool mode only meaningful, harmless otherwise): the pool's entry
+     * set or any entry's identity moved — the wiring forwards the pool's
+     * `onServerRemoved` / `onStateChange` callbacks here. Every live merged
+     * stream re-scans `pool.entries()` NOW: slots for removed entries leave
+     * (only THAT server's shown groups and pending events are torn down),
+     * slots for new entries start, and renames re-title the groups. */
+    notePoolEvent(): void;
+    /** P55-2: resolve which remote session (serverId + real sessionId) should
+     * serve a path-only `/api/file?path=...` request, or `undefined` when the
+     * local route should handle it. Read by the fetch-route wrap (its media
+     * mount only exists while the wiring hands THIS handle's method over), so
+     * a Markdown image of a remote session's reply loads from the server's
+     * disk instead of 404ing on the sub-client's own. */
+    resolveRemoteFileScope(path: string): {
+        serverId: string;
+        sessionId: string;
+    } | undefined;
+    /** T4: read-only snapshot of the in-memory session history cache stats. */
+    historyCacheStats?(): SessionHistoryCacheStats;
+}
+/**
+ * Execute `fn` while bypassing {@link installIntercept} on this process's
+ * `typertGateway` so server-side handlers (`relayHandler`, `admin-routes`) in
+ * dual-role `peer` mode read/mutate ONLY local sessions and never re-enter
+ * outbound merged streams (anti-daisy-chaining + stream-storm prevention).
+ */
+export declare function runWithoutIntercept<T>(fn: () => T): T;
+/**
+ * Build a local-only view over `typertGateway` whose `invoke`, `stream`,
+ * `wireStream.open` and `dispatchEventResult` bypass {@link installIntercept}.
+ */
+export declare function createLocalOnlyGateway<G extends object>(gateway: G): G;
+/** Rewrite one stream frame's session ids to virtual form. */
+export declare function rewriteFrame(endpoint: string, frame: unknown, serverId: string, remoteDefault?: unknown): unknown;
+/** Rewrite one invoke result's session ids to virtual form. */
+export declare function rewriteResult(endpoint: string, value: unknown, serverId: string, remoteDefault?: unknown): unknown;
+/**
+ * Rewrite one SERVER-side `$events` frame for the local UI (T32), or `null`
+ * to drop it. Wire shapes verified against dsh-api-gateway (frames:
+ * `openRemoteEvents`/`broadcastRemoteEvent`/`startRemoteEvent`/
+ * `finishRemoteEvent`; consumer validation: lib/client.js
+ * `parseRemoteEventFrame` — every variant demands EXACT keys, so rewriting
+ * must rename in place and never add or remove a field):
+ *
+ * - `waterfall`: `{type, event, eventId, agentId, request}` — `eventId` and
+ *   `agentId` become virtual; `request` passes verbatim (the projection the
+ *   gateway already stripped `agent`/`signal` from carries no session id:
+ *   approval requests are `{toolName, callId, reason?, displayReason?}`,
+ *   question requests `{questions:[…]}` — dsh-tools / dsh-user-questions).
+ *   The server already prefixed the eventId with its per-subscription token
+ *   (`<token>.<eventId>`); this layer treats that as opaque and wraps the
+ *   whole thing in `zr~<serverId>~`.
+ * - `cancel`: `{type, eventId}` — the correlation id goes virtual so the UI
+ *   can match it against the waterfall it showed and close the prompt.
+ * - `emit`: dropped, with ONE exception (T75) — a well-formed
+ *   `api-session/status` frame (the only emit the server forwards, and only
+ *   for accessible sessions) has its `args[0]` session id virtualized and
+ *   its `args[1]` running flag passed through, so the UI's
+ *   `api-session/status` listener keeps the remote session's running state
+ *   in step with the host's (RT dsh-api-session-controller lib/client.js
+ *   `handleSessionStatus`).
+ * - everything else — `ready`, non-status emits, non-objects, unknown
+ *   types, and any frame failing the client face's exact-keys shape — is
+ *   DROPPED (T32-fix2 mirrors the server side). `ready` and the other emits
+ *   carry facts the UI must never see (the local stream opened with ITS
+ *   ready frame; emits broadcast server-wide state); a malformed frame that
+ *   slipped through would fail `parseRemoteEventFrame` and take the UI's
+ *   whole `$events` generation down with it, failing and reconnecting in a
+ *   loop. Mirrors the server's own forwardable-shape gate, so the two ends
+ *   disagree on nothing.
+ */
+export declare function rewriteRemoteEventFrame(frame: unknown, serverId: string): unknown | null;
+/**
+ * T63: the shared summary-sync hub between the merged streams. The sidebar
+ * renders a session row only when the UI's `sessions.list` snapshot holds a
+ * summary for it (RT dsh-client-ui-workspace orderByRecency drops a member
+ * with `summaries[id] === void 0`, groupByWorkspace skips
+ * `list.byId[id] === undefined`), and that snapshot is written only by the
+ * `session/list` pull — which runs once per page load, when the relay may
+ * still be offline — and by the `api-session/added` event. The events leg
+ * consumes the sync (fetches the server list and synthesizes one
+ * `api-session/added` emit per row); the workspace route produces the
+ * mid-page nudges (a forwarded frame carrying a session id no sync has
+ * announced yet).
+ *
+ * T65: the hub is pure broadcast. The announced/asked bookkeeping lives in
+ * EACH merged `$events` stream (a new page's stream starts with empty sets,
+ * so its first online sync is never skipped by the previous page's
+ * knowledge), and a forwarded batch reaches EVERY live stream — a page
+ * refresh's old and new generations each judge for themselves.
+ */
+export interface SessionSummarySync {
+    /** The workspace route reports the virtual session ids one forwarded frame
+     * batch carried. Broadcast to every live $events stream; each judges its
+     * own announced/asked sets (T65). */
+    noteForwardedSessionIds(ids: readonly string[]): void;
+    /** Subscribe to every forwarded batch. All live subscribers get the
+     * broadcast (T65 — the old latest-subscriber-wins shape starved the older
+     * stream of mid-page nudges); a disposer removes only its own listener. */
+    onForwardedSessionIds(fn: (ids: readonly string[]) => void): () => void;
+    /** The most recent forwarded batch's ids, when one arrived since the last
+     * consume — the catch-up for a nudge that landed before the $events
+     * stream opened. Consumed on read. */
+    consumePendingRequest(): readonly string[];
+}
+/**
+ * Install the two own-property wrappers on the raw gateway. Assumes
+ * {@link checkGatewayShape} passed (the wiring gates on it) — this function
+ * records the verdict but does not re-gate, so it stays usable in tests
+ * that install over deliberately odd shapes.
+ */
+/**
+ * P55-2: whether `filePath` lives at or under `cwd` — the /api/file
+ * attribution test. Both paths are compared backslash-folded to `/` (a
+ * server-Windows cwd meets a server-Windows image path, and the Markdown
+ * renderer may hand either separator over), trailing separators of `cwd`
+ * are dropped, and the match is exact-or-subpath (`cwd + '/'` prefix — a
+ * directory merely PREFIXED by the cwd string is not a match). Windows
+ * drive-rooted pairs compare case-insensitively WHOLE (`C:\Users` vs
+ * `c:\users` — the drive letter is the visible case hazard, but NTFS is
+ * case-insensitive end to end, and a missed match costs a permanently
+ * broken image while an over-match needs two same-server cwds differing
+ * only by case); everything else stays case-sensitive (POSIX is).
+ * Deliberately NOT node:path — the two ends may run on different platforms,
+ * so the rule is pure string arithmetic over the server's paths.
+ */
+export declare function pathMatchesCwd(filePath: string, cwd: string): boolean;
+export declare function installIntercept(options: InstallInterceptOptions): InterceptHandle;
+export interface SelfCheckOptions {
+    /** How long the probe may wait for its first frame; default 5000 ms. */
+    timeoutMs?: number;
+    /** The owner Peer the probe opens as. DSH 0.2.1-alpha.3 removed
+     * `gateway.operatorPeer()` and requires a live Peer on every stream; see
+     * owner-peer.ts. Undefined falls back to `operatorPeer()` where it still
+     * exists (≤ alpha.2), else to no Peer. */
+    getPeer?: () => unknown;
+}
+/**
+ * The startup behavior self-check (spike §4.1 check 4): open the one stream
+ * the shape check cannot prove — that the wrap is actually REACHED — through
+ * `wireStream.open('workspace/follow', …)` and demand a `baseline` first
+ * frame whose `value.items` is an array (the real workspace baseline's
+ * shape). The probe payload is marked in {@link probePayloads} before the
+ * call and the wrapper flags that exact object, so the verdict covers both
+ * faults at once: frames that are not a workspace feed, and a wire adapter
+ * that routes around the wrapper. The real gateway's `openWireStream` is
+ * `async` (RT dsh-api-gateway), so the adapter's `open()` returns a PROMISE
+ * of the stream — the await sits inside the same timeout race as the
+ * first-frame wait, so an upstream that never settles fails the check
+ * instead of hanging startup.
+ */
+export declare function behaviorSelfCheck(raw: object, options?: SelfCheckOptions): Promise<SelfCheckResult>;
+export interface RunSelfCheckOptions {
+    /** The handle whose self-check verdict, uninstall and installed state are
+     * driven. */
+    handle: Pick<InterceptHandle, 'noteSelfCheck' | 'uninstall' | 'diagnostics'>;
+    /** How long to wait before the single retry; default 3000 ms. */
+    retryDelayMs?: number;
+    /** Failure logging, wired to the context logger by index.ts. */
+    log?: (format: string, ...args: unknown[]) => void;
+    /** Success logging (one line once the probe passes). */
+    info?: (format: string, ...args: unknown[]) => void;
+    /** Forwarded to {@link behaviorSelfCheck}. */
+    getPeer?: () => unknown;
+}
+/**
+ * Run the behavior self-check with the wiring's failure policy: ONE retry
+ * after a pause (a transiently unready upstream must not cost the whole
+ * interception), and only a second failure uninstalls and records. Each
+ * attempt is judged on its own — the probe payload is recognized inside the
+ * wrapper by identity, so streams the UI opens during the check change
+ * nothing. The plugin may be disposed while a check is in flight (a row
+ * reload during startup), so the handle's installed state is re-read before
+ * the retry and after every attempt: an uninstalled check exits silently —
+ * no further probe, no verdict, no "interception removed" warning (that
+ * removal was not ours to announce, and a post-uninstall probe would run
+ * against the unwrapped gateway and fail spuriously).
+ */
+export declare function runSelfCheck(raw: object, options: RunSelfCheckOptions): Promise<SelfCheckResult>;
+//# sourceMappingURL=intercept.d.ts.map

@@ -1,0 +1,1086 @@
+/**
+ * Staged configuration form for the `dsh-zen-remote` plugin row, in the same
+ * shape the dsh-llm-verifier page uses (a control stages what the user types,
+ * one save writes every staged edit as a single revision-fenced path mutation
+ * through the shared `configForms` form). Browser-import-free so tests drive
+ * it directly:
+ *
+ * - `deriveSettingsView(status)` maps the `GET /_dsh/zen-remote/admin/status`
+ *   body (T14's same-origin route wrapping the gateway's local admin API) into
+ *   what the settings block renders: per-field effective value + source layer,
+ *   the device list, the live pairing code with its remaining seconds, and the
+ *   `viaGateway` flag that disables every server-local operation.
+ * - `deriveClientStatusView(status)` maps the `GET /_dsh/zen-remote/client/status`
+ *   body (T16's sub-client probe) into the client group's connection line.
+ * - `ZenRemoteSettingsForm` stages the row-layer field edits and saves them as
+ *   one `mutate(ops, expectedRevision)` call, and owns the two DIRECT writes
+ *   of the client group (pairing write / token clear) plus the device token's
+ *   configured flag read from the describe view's secrets sidecar. Since T17
+ *   it also carries the page's two-level role decision — the saved row role
+ *   first, the client-config probe as fallback — and the `restartPending`
+ *   flag behind the "saving reloads the plugin" note.
+ *
+ * The wire contract lives here because the host half that serves it is a
+ * separate task; the shapes mirror `lib/lan-gate-server.cjs`'s status payload
+ * (devices / pairing) plus the T14 envelope (ok / gateway / config / viaGateway).
+ */
+import { type PluginBridgeStatusView } from './plugin-bridge.ts';
+/** Where a resolved field value came from (mirror of src/config.ts's union; the client half cannot import the host module). */
+export type ConfigSource = 'env' | 'row' | 'file' | 'default';
+/** One paired gateway device, as the gateway's status payload lists it. */
+export interface AdminDevice {
+    id: string;
+    name: string;
+    role: 'web' | 'desktop-client';
+    kind: 'auto' | 'phone' | 'desktop';
+    createdAt: number;
+    lastSeen: number;
+    ua?: string;
+    hasPush: boolean;
+}
+/** The one currently-live pairing code, if any. */
+export interface AdminPairing {
+    code: string;
+    expiresAt: number;
+    role: 'web' | 'desktop-client';
+}
+/**
+ * The gateway's `/lan-gate/status` reply, relayed verbatim inside
+ * `admin/status`'s `gateway` field (see lib/lan-gate-server.cjs's
+ * statusHandler — this mirror keeps only what the settings block reads).
+ */
+export interface GatewayStatus {
+    state?: string;
+    port?: number;
+    target?: string;
+    devices?: AdminDevice[];
+    pairing?: AdminPairing | null;
+    pushSubscriptions?: number;
+}
+/**
+ * The `GET /_dsh/zen-remote/admin/status` body, exactly as src/admin-routes.ts
+ * answers it: the gateway payload lives NESTED under `gateway` (null when the
+ * gateway did not answer healthily) and `gatewayStatus` is the HTTP status the
+ * route saw (`null` when there was no answer at all).
+ */
+export interface AdminStatusBody {
+    ok?: boolean;
+    gateway?: GatewayStatus | null;
+    gatewayReachable?: boolean;
+    gatewayStatus?: number | null;
+    config?: {
+        values?: Record<string, unknown>;
+        sources?: Record<string, string>;
+    };
+    viaGateway?: boolean;
+}
+/** Same-origin admin routes the settings block talks to (host half: T14). */
+export declare const ADMIN_STATUS_ROUTE = "/_dsh/zen-remote/admin/status";
+export declare const ADMIN_PAIR_ROUTE = "/_dsh/zen-remote/admin/pair";
+export declare const ADMIN_ACTION_ROUTE = "/_dsh/zen-remote/admin/action";
+export declare const ADMIN_PUSH_TEST_ROUTE = "/_dsh/zen-remote/admin/push-test";
+/** PB-5: the plugin bridge's registered-plugin listing (GET, server-local only). */
+export declare const ADMIN_PLUGIN_BRIDGE_ROUTE = "/_dsh/zen-remote/admin/plugin-bridge";
+/** Same-origin client routes the sub-client block talks to (host half: T16). */
+export declare const CLIENT_CLAIM_ROUTE = "/_dsh/zen-remote/client/claim";
+export declare const CLIENT_STATUS_ROUTE = "/_dsh/zen-remote/client/status";
+/** T43: one immediate reconnect — answered 409 unless the client is offline. */
+export declare const CLIENT_RECONNECT_ROUTE = "/_dsh/zen-remote/client/reconnect";
+/** MS-6: POST `{ entryId }` (or `{ all: true }`) removes one / all paired
+ * servers from the pool (host half: src/client-routes.ts, mirrored here
+ * because the browser half cannot import the host module). */
+export declare const CLIENT_UNPAIR_ROUTE = "/_dsh/zen-remote/client/unpair";
+/** CU-4: the redacted diagnostic report (GET, both roles, machine-local only
+ * — a gateway-forwarded fetch is refused server-side). */
+export declare const CLIENT_DEBUG_REPORT_ROUTE = "/_dsh/zen-remote/client/debug-report";
+/** PG-9: the peer management routes (mirror of src/client-routes.ts's
+ * constants — the browser half cannot import the host module). The via wall
+ * and same-origin gates live server-side; the browser just talks to them. */
+export declare const CLIENT_PEER_STATUS_ROUTE = "/_dsh/zen-remote/client/peer/status";
+export declare const CLIENT_PEER_JOIN_ROUTE = "/_dsh/zen-remote/client/peer/join";
+export declare const CLIENT_PEER_LEAVE_ROUTE = "/_dsh/zen-remote/client/peer/leave";
+export declare const CLIENT_PEER_TOGGLE_MOUNT_ROUTE = "/_dsh/zen-remote/client/peer/toggle-mount";
+export declare const CLIENT_PEER_TRUST_ROUTE = "/_dsh/zen-remote/client/peer/trust";
+export declare const CLIENT_PEER_REPROBE_ROUTE = "/_dsh/zen-remote/client/peer/reprobe";
+export declare const CLIENT_PEER_DISMISS_REVOKED_ROUTE = "/_dsh/zen-remote/client/peer/dismiss-revoked";
+/**
+ * MS-6: the paired-server pool's cap — the browser mirror of
+ * src/state-store.ts's constant of the same name (the host module cannot be
+ * imported here). The settings page and the wizard read it for the
+ * `已配对 N / 8 台` counters and the limit gating.
+ */
+export declare const MAX_PAIRED_SERVERS = 8;
+/** The lightweight client-facing config route (host half, both roles): the
+ * settings page's FALLBACK role probe (T17) — it registers wherever a
+ * webServer exists, and since T17 its body carries the effective `role`
+ * (resolveConfig's merged value, nothing sensitive). */
+export declare const CLIENT_CONFIG_ROUTE = "/_dsh/mobile-nav/client-config";
+/** The body of `GET /_dsh/mobile-nav/client-config` — the interface-half knobs
+ * the client bundle reads, plus (T17) the effective role the settings page
+ * falls back to. */
+export interface ClientConfigBody {
+    role?: unknown;
+    turnFoldDesktop?: boolean;
+    keyboardLiftRatio?: number;
+    keyboardLiftMaxPx?: number;
+    keyboardSafetyPadPx?: number;
+}
+/** Field name of the row secret the pairing flow writes (never echoed back
+ * anywhere; the describe view's secrets sidecar is the only "is it set"). */
+export declare const DEVICE_TOKEN_FIELD = "deviceToken";
+/**
+ * The `GET /_dsh/zen-remote/client/status` body, exactly as
+ * src/client-routes.ts answers it: `serverUrl` is present only once a token
+ * exists (the unpaired answer is `{ state: 'unpaired' }` alone). The token
+ * itself never rides any status response. The T43 diagnostics fields ride
+ * only on a failed live connect of a wired relay client; `intercept` (T23b)
+ * and `compat` (T42) are rendered only when the body carries them — earlier
+ * servers answer neither.
+ */
+export interface ClientStatusBody {
+    /** The probe vocabulary (`connected` / `unreachable` / `revoked` /
+     * `unexpected`), the row's two own answers (`unpaired` / `invalid-url`),
+     * the relay verdicts (`revoked` / `incompatible`) — and, since the
+     * relay-wired route reports the relay client's own state verbatim, the
+     * `online` / `offline` words too ({@link deriveClientStatusView} maps
+     * them; T55). */
+    state?: string;
+    serverUrl?: string;
+    serverName?: unknown;
+    /** Epoch ms of the relay client's next automatic reconnect (offline only). */
+    nextRetryAt?: unknown;
+    /** The error code of the last failure — a code, never a message or URL. */
+    lastError?: unknown;
+    /**
+     * The SERVER's record of THIS device's name (T59, presence-gated like the
+     * diagnostics fields — older servers answer without it). The settings page
+     * follows it into the row while the user is not editing the field.
+     */
+    deviceName?: unknown;
+    /** T23b request-interceptor diagnostics (provisional shape; presence-gated). */
+    intercept?: unknown;
+    /** T42 relay compat diagnostics: `{ identical: string[], different:
+     * string[], unavailable: string[], incompatibleCalls: { time: number,
+     * endpoint: string, code: string }[] }` (presence-gated). */
+    compat?: unknown;
+    /** PB-2: the per-plugin bridge verdicts (`BridgeStatus[]` verbatim,
+     * presence-gated — older servers answer without it). */
+    pluginBridge?: unknown;
+    /** PB-4: the plugin-route interception's diagnostics (presence-gated —
+     * a host role or a refused install may still answer it; a server without
+     * the field never does). */
+    pluginRouteIntercept?: unknown;
+    /** RD-6: the upload-redirect service probe (presence-gated — an older
+     * plugin answers without it). */
+    serviceProbe?: unknown;
+    /** MS-6: the pool list, one row per paired server (`poolStatusBodyOf`'s
+     * `servers`), presence-gated like every diagnostic field — a pre-MS-5
+     * server (or the row-probe fallback) answers without it. */
+    servers?: unknown;
+    /** MS-6: the pool cap as the body reports it (8). */
+    maxServers?: unknown;
+}
+/** One remote-call failure line in the diagnostics lists. `time` is epoch
+ * milliseconds — ISO-stamped rings are parsed at derive time; `method`
+ * carries the wire's method-or-endpoint name. */
+export interface ClientDiagFailureView {
+    time: number;
+    method: string;
+    code: string;
+}
+/**
+ * T23b interceptor diagnostics as the block renders them. The wire field is
+ * presence-gated: `undefined` here means the body carried none (an older
+ * server), and the whole interceptor group stays hidden.
+ */
+export interface ClientInterceptView {
+    installed: boolean;
+    /** Shape-detection failure reasons — non-empty means remote features are off. */
+    reasons: string[];
+    /** The most recent remote call failures (at most 10). */
+    recentFailures: ClientDiagFailureView[];
+}
+/** T42 compat diagnostics as the block renders them (presence-gated like {@link ClientInterceptView}). */
+export interface ClientCompatView {
+    /** Names of the groups whose fingerprints differ. */
+    mismatchedGroups: string[];
+    /** The most recent incompatible calls (at most 10). */
+    recentCalls: ClientDiagFailureView[];
+}
+/**
+ * MS-6: ONE paired server of the pool, as the per-server list renders it —
+ * the parsed form of one `client/status` `servers[]` row (no token ever
+ * rides any status answer). `state` speaks the same view vocabulary as the
+ * top level (the wire aliases mapped); every field degrades to its default
+ * on a junk row, and a row without an `entryId` (the route's stable key)
+ * drops whole.
+ */
+export interface ClientServerView {
+    entryId: string;
+    serverId: string;
+    serverUrl: string;
+    serverName: string;
+    /** The pool's deduplicated display name (`-1` / `-2` suffixes included). */
+    displayName: string;
+    state: ClientConnectionView['state'];
+    nextRetryAt: number | undefined;
+    lastError: string;
+    compat: ClientCompatView | undefined;
+    pluginBridge: PluginBridgeStatusView[];
+}
+/** One client connection as the block renders it. */
+export interface ClientConnectionView {
+    state: 'unpaired' | 'connected' | 'revoked' | 'unreachable' | 'unexpected' | 'invalid-url' | 'incompatible';
+    serverUrl: string;
+    serverName: string;
+    /** Verbatim from the body when it carried a finite number; the countdown
+     * math happens at render time against the live clock. */
+    nextRetryAt: number | undefined;
+    /** The last failure's code, '' when none is reported. */
+    lastError: string;
+    /** The SERVER's record of this device's name (T59): '' when the body did
+     * not carry one — empty means "nothing to follow". */
+    deviceName: string;
+    intercept: ClientInterceptView | undefined;
+    compat: ClientCompatView | undefined;
+    /** PB-5: the bridge verdicts as the 诊断区 renders them, input order kept
+     * (undefined when the body carried none — the group stays hidden). */
+    pluginBridge: PluginBridgeStatusView[] | undefined;
+    /** PB-5: the route interception's install state (`installed: false`
+     * renders the 本机改道未启用 line with the shape reasons; undefined when
+     * the body carried none). */
+    pluginRouteIntercept: {
+        installed: boolean;
+        reasons: string[];
+    } | undefined;
+    /** RD-6: the upload-redirect service probe from the same body, passed
+     * through tolerantly (undefined when the body carried none — an older
+     * plugin — and the diagnostics row stays hidden). */
+    uploadProbe: Readonly<Record<string, unknown>> | undefined;
+    /** MS-6: every paired server of the pool, in pairing order. Empty on a
+     * legacy body (or a row-less unpaired answer) — the pre-MS-6 page shape. */
+    servers: readonly ClientServerView[];
+    /** MS-6: the pool's cap, from the body when it carried a sane number,
+     * {@link MAX_PAIRED_SERVERS} otherwise. */
+    maxServers: number;
+    /** MS-6: `servers.length >= maxServers` — the red 已配满 note and the
+     * new-address submit gate both read this. */
+    limitReached: boolean;
+}
+/**
+ * Map one `client/status` body into the view the client group renders.
+ * Tolerant like {@link deriveSettingsView}: an unexpected shape degrades to
+ * "unpaired" instead of throwing into the plugin page.
+ */
+export declare function deriveClientStatusView(body: ClientStatusBody): ClientConnectionView;
+/**
+ * The peer/status body's sync-readiness counts (PS-3a). Additive and optional —
+ * an older body without the block stays `undefined`; invalid counts degrade
+ * field-by-field to `undefined`.
+ */
+export interface PeerSyncReadinessView {
+    /** Mounted candidates whose pool client completed the remote handshake. */
+    readyCount?: number | undefined;
+    /** Eligible peers currently mounted into the pool. */
+    mountedCandidateCount?: number | undefined;
+    /** Eligible (not ignored, not mismatched) peers discovered in the network. */
+    candidateCount?: number | undefined;
+    /** User-ignored devices — excluded from the candidates, counted aside. */
+    ignoredCount?: number | undefined;
+    /** Locally blocked identities awaiting the trust decision. */
+    mismatchCount?: number | undefined;
+}
+/**
+ * The `GET /_dsh/zen-remote/client/peer/status` body as the peer section
+ * renders it (PG-9): this machine's node id, the gateway admission state,
+ * the joined network's id + HTTP origin (both absent while not joined), the
+ * announced device cap, and one tolerant row per network device. The route
+ * itself never carries key material, so neither does this view.
+ */
+export interface PeerStatusView {
+    /** The engine reports a joined network. */
+    configured: boolean;
+    /** This machine's 8-hex node id ('' when the body carried none). */
+    nodeId: string;
+    /** The engine's gateway state word verbatim (`authorized`,
+     * `pending-approval`, `connecting`, `offline`, `unconfigured`,
+     * `mismatch`, `paused`, `revoked`, `identity-error`). */
+    gatewayState: string;
+    /** Sanitized identity load failure code when `gatewayState === 'identity-error'`. */
+    identityError?: string | undefined;
+    /** Optional gateway denial reason when `gatewayState` is `revoked`/`paused`. */
+    deniedReason?: string | undefined;
+    networkId: string | undefined;
+    gatewayOrigin: string | undefined;
+    /** The network's announced device cap, INCLUDING this node — verbatim from
+     * the body (undefined while it answered null / nothing). NOT the mount cap. */
+    maxPeers: number | undefined;
+    /** PC-11a: this machine's EFFECTIVE remote-mount cap, verbatim from the
+     * body when it carried a safe integer in the config's own 1..64 band
+     * (PC-11a-fix1). `undefined` on an older body — or a fractional/out-of-band
+     * one — means UNKNOWN, never derived from `maxPeers - 1` (which would paper
+     * over a local explicit cap the old answer simply did not carry) and never
+     * the settings constant either. */
+    maxServers: number | undefined;
+    /** PC-11a: this machine's actual mounted remotes — the body's count when it
+     * carried a non-negative safe integer, otherwise the explicit `mounted`
+     * flags of the rows, and only when EVERY row carries one (PC-11a-fix1: a
+     * list with missing/ambiguous flags stays unknown instead of reading its
+     * unknowns as unmounted; an explicit empty list is a real zero). Never the
+     * discovered-online rows and never the network's occupied seats. */
+    mountedCount: number | undefined;
+    /** PC-11a: `mountedCount >= maxServers` once BOTH facts are known (an
+     * over-cap stock after a downscale reads `true`); `undefined` while the
+     * cap is unknown — `false` would claim room that may not exist. */
+    limitReached: boolean | undefined;
+    peers: PeerStatusDeviceView[];
+    /** T4: the effective direct-RTT cap (ms, 0 = uncapped), verbatim from the
+     * body when it carried a safe integer ≥ 0; `undefined` on an older body —
+     * the demoted note's cap display falls back to '—' then. */
+    directCapMs: number | undefined;
+    /** PC-14a: the sync-readiness block (the third light's data). `undefined`
+     * on an older body — never guessed from the peers rows. */
+    sync: PeerSyncReadinessView | undefined;
+    /** Persisted post-admission revocation notice shown until dismissed or re-admitted. */
+    revokedNotice?: PeerRevokedNoticeView | undefined;
+    /** T6: sanitized bidirectional version sync evaluation from /client/peer/status. */
+    versionSync?: PeerVersionSyncView | undefined;
+}
+export interface PeerVersionSyncView {
+    pluginVersion: string;
+    gatewayVersion: string | null;
+    recommendedGatewayVersion: string;
+    wireCompatLevel: number;
+    gatewayOutdated: boolean;
+    pluginOutdated: boolean;
+    newerPluginVersion: string | null;
+    inferredLegacyGateway: boolean;
+    gatewayConsoleUrl: string | null;
+}
+export interface PeerRevokedNoticeView {
+    deviceName: string;
+    gatewayHost: string;
+    networkId: string;
+    reason: string;
+    revokedAt: number;
+}
+/** One network-device row the peer section renders (wizard's
+ * {@link PeerDeviceView} shape, mirrored here — settings-form cannot import
+ * from wizard.ts, the wizard imports THIS module). */
+export interface PeerStatusDeviceView {
+    nodeId: string;
+    name: string;
+    mounted: boolean;
+    path: PeerDevicePathView;
+    rttMs: number | null;
+    /** The smoothed UDP measurement while a peer is (or was) direct-ready —
+     *  null before the first sample. Rides the demoted note. */
+    directRttMs: number | null;
+    /** The engine demoted this peer to relay for exceeding the RTT cap. */
+    directDemoted: boolean;
+}
+/** The device row's path word (the wizard module's `PeerDevicePath`). */
+export type PeerDevicePathView = 'lan' | 'p2p' | 'relay' | 'mismatch' | 'offline';
+/**
+ * Map one `client/peer/status` body into the view the peer section renders.
+ * Tolerant like every derive in this file: a junk body (a plain-client 503
+ * JSON, an older plugin) reads "not configured, no devices" instead of
+ * throwing into the plugin page; a junk device row drops whole; an unknown
+ * path word degrades to `offline`.
+ */
+export declare function derivePeerStatusView(body: unknown): PeerStatusView;
+/**
+ * The export's download name, `zen-remote-debug-<role>-<yyyymmdd-hhmm>.json`,
+ * stamped in the browser's local time (CU-4). Extracted here so the check
+ * scripts can pin it and so a peer node exports under its OWN role word —
+ * `peer`, never the host name.
+ */
+export declare function debugExportFileName(role: 'host' | 'client' | 'peer', now: Date): string;
+/**
+ * Which connection line the block renders (T43 diagnostics wording, chosen
+ * as a pure descriptor so the copy table and the countdown math stay
+ * testable without a browser): connected prefers the handshake's server
+ * name; any verdict the body backs with a `nextRetryAt` is OFFLINE first —
+ * the relay client is mid-retry and the line counts down to it, whether the
+ * probe classified the failure `unreachable` or `unexpected` (T43-fix);
+ * without a `nextRetryAt` the two map one plain copy each. The rest map one
+ * state each.
+ */
+export type ClientStatusLine = {
+    kind: 'connectedName';
+    serverName: string;
+} | {
+    kind: 'connected';
+    serverUrl: string;
+} | {
+    kind: 'offlineRetry';
+    seconds: number;
+} | {
+    kind: 'offlineRetrySoon';
+} | {
+    kind: 'unreachable';
+} | {
+    kind: 'revoked';
+} | {
+    kind: 'incompatible';
+} | {
+    kind: 'unexpected';
+} | {
+    kind: 'invalidUrl';
+} | {
+    kind: 'unpaired';
+};
+export declare function clientStatusLineOf(view: ClientConnectionView, now: number): ClientStatusLine;
+/** The `POST /_dsh/zen-remote/client/claim` body (T16's pairing round-trip;
+ * on success `token` is the gateway-minted device token — it appears exactly
+ * once, on its way into the row's secret field). */
+export interface ClaimRouteBody {
+    ok?: boolean;
+    token?: unknown;
+    deviceId?: unknown;
+    deviceName?: unknown;
+    /** MS-8: the pool entry the pairing landed in (pool-mode answers carry it;
+     * the legacy single-server answer carries `token` instead and no
+     * `entryId` — the token never reaches the browser in pool mode). The
+     * wizard records it as the step-3 selected server. */
+    entryId?: unknown;
+    /** The normalized address the backend validated — what the form writes. */
+    serverUrl?: unknown;
+    code?: string;
+    message?: string;
+    retryAfterMs?: number;
+}
+/** The gateway's 32-character unambiguous pairing-code alphabet (no 0/O/1/I/L)
+ * and fixed 8-character length (`lib/lan-gate-server.cjs:330-335`). */
+export declare const PAIRING_CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+export declare const PAIRING_CODE_LENGTH = 8;
+/** What the pairing-code box keeps as its draft: uppercase, restricted to the
+ * 32-character pairing-code alphabet (excluding 0/O/1/I/L and symbols), and
+ * capped at 8 characters. */
+export declare function normalizePairingCode(input: string): string;
+/** What {@link canSubmitClientPairing} decides. */
+export interface CanSubmitClientPairingVerdict {
+    /** The 配对 button may act: everything locally checkable passes. */
+    allowed: boolean;
+    /** The typed address names an already-paired server — the claim will
+     * UPDATE that entry's token in place, not add a ninth one. */
+    isOverwrite: boolean;
+    /** A NEW address while the pool is full (`servers.length >= maxServers`):
+     * the claim must not even leave the page (the route would answer
+     * `limit-reached`). An overwrite never sets this. */
+    blockedByLimit: boolean;
+}
+/**
+ * The 配对 button's whole gate, as one pure truth table (MS-6): the claim
+ * needs an address and a COMPLETE 8-character pairing code (the input box
+ * normalizes as the user types; this judge is the same bar the route's code
+ * grammar enforces), a quiet page (`busy`), and a valid device-name draft
+ * (`deviceNameInvalid`, T60 — a red-boxed name would silently pair under the
+ * fallback copy). The pool cap blocks only NEW addresses: a full pool still
+ * accepts re-pairing an existing one in place, which is how a user whose
+ * token was revoked at 8/8 gets back in.
+ */
+export declare function canSubmitClientPairing(input: {
+    pairUrl: string;
+    pairCode: string;
+    servers: readonly ClientServerView[];
+    maxServers?: number;
+    busy?: boolean;
+    deviceNameInvalid?: boolean;
+}): CanSubmitClientPairingVerdict;
+/**
+ * Whether one successful client-side activation (a staged-save role switch, a
+ * first pairing) needs a page reload: the backend's restart-watcher only
+ * installs the stream interceptor when the row reloads into client mode, and
+ * the page's three resident global streams were opened under whatever gateway
+ * object was current AT LOAD TIME. Without a reload they stay unwrapped and
+ * the server's remote sessions never enter the merged sidebar lists.
+ *
+ * - A write that did not land, or a save that is not heading to `client`,
+ *   never reloads.
+ * - A host→client switch always reloads: the streams predate the interceptor.
+ * - An already-client page reloads only when the diagnostics say the
+ *   interceptor was NOT yet active (`streamInterceptAlreadyActive === false`).
+ *   `undefined` — an older server that answers no diagnostics — is UNKNOWN and
+ *   stays on the safe no-reload side (a re-pairing must not needlessly reload).
+ */
+export interface ClientActivationReloadInput {
+    /** Whether the page was ALREADY an effective client before this operation. */
+    wasEffectiveClient: boolean;
+    /** Whether the role after the operation is (or is switching to) client. */
+    nowClientRole: boolean;
+    /** Whether this operation actually landed (the save / pairing write). */
+    savedOrPaired: boolean;
+    /** The client/status diagnostics' interceptor flag before the operation
+     * (derived by the caller); `undefined` when unknown. */
+    streamInterceptAlreadyActive?: boolean;
+}
+export declare function shouldReloadAfterClientActivation(input: ClientActivationReloadInput): boolean;
+/**
+ * Poll {@link CLIENT_STATUS_ROUTE} until the backend answers ok — the bounded
+ * wait before the post-activation reload, covering the restart-watcher's row
+ * reload window (the route 404s / fails while the row restarts). Resolves
+ * after `maxMs` regardless, so the reload always fires. Injectable fetch and
+ * timings keep the check script fast; defaults are the page's 3 s / 250 ms.
+ */
+export declare function awaitClientStatusReady(fetchFn?: typeof fetch, maxMs?: number, intervalMs?: number): Promise<void>;
+/**
+ * Latest-wins sequencing for the status loads: every request takes a ticket,
+ * and only the newest ticket may still apply its result. An earlier request
+ * that answers LATE is dropped, so a stale body can never overwrite a fresh
+ * one (a revoked device reappearing, an old "no pairing code" answer wiping
+ * a just-minted code, an unpair racing a refresh).
+ */
+export interface LatestGate {
+    /** Issue the ticket for one new in-flight request. */
+    next(): number;
+    /** Whether that ticket is still the newest issued one. */
+    isLatest(ticket: number): boolean;
+}
+export declare function createLatestGate(): LatestGate;
+/**
+ * The SAVED role of the plugin row, read from the configForms snapshot's row
+ * document — the settings page's FIRST role signal (T16-fix 3). The resolved
+ * role an admin/status body reports is unusable here: a client deployment has
+ * no admin route at all, and a stale kept body pinned the page to the old
+ * role after a switch. `value` is the schema-resolved section the Host
+ * accepted; a row value that only lives in the raw user layer reads from
+ * there. Since T17 every row field is volatile, so the form (and this
+ * snapshot) carries every stored field — `role` included, with any volatile
+ * wrapper already peeled by the host's plainConfig (the dsh-settings
+ * describe path calls `value.get()` recursively before the wire).
+ *
+ * `undefined` when NEITHER layer carries a role: the field's value lives only
+ * in a lower layer (`lan-gate.config.json`) or nowhere. That is not "host" —
+ * the caller falls back to the effective role the client-config route
+ * reports ({@link settingsPollOf}), because a file-layer client row must
+ * still render the client page.
+ */
+export declare function savedRowRole(snapshot: {
+    value?: unknown;
+    user?: unknown;
+}): 'host' | 'client' | 'peer' | undefined;
+/**
+ * The EFFECTIVE role for one scope snapshot — the shared two-level decision
+ * every role-aware surface uses (the settings page via {@link settingsPollOf},
+ * the T33b session-sharing parts through the remote-share registration):
+ * while the namespace mirror is still loading the role is not knowable
+ * (`'unknown'` — a client deployment must never see a wasted `admin/*` 404);
+ * a snapshot whose row carries a role decides from it; a row-silent snapshot
+ * falls back to `probed`, the effective role fetched from
+ * `/_dsh/mobile-nav/client-config` (T17: the route carries the merged role),
+ * and stays `'unknown'` until that probe answers.
+ */
+export declare function settingsRoleOf(status: 'loading' | 'ready' | 'unavailable', snapshot: {
+    value?: unknown;
+    user?: unknown;
+}, probed?: 'host' | 'client' | 'peer'): 'unknown' | 'host' | 'client' | 'peer';
+/**
+ * Which status source the page polls for one scope snapshot —
+ * {@link settingsRoleOf} mapped onto poll sources (`'unknown'` polls
+ * nothing). See there for the decision.
+ */
+export declare function settingsPollOf(status: 'loading' | 'ready' | 'unavailable', snapshot: {
+    value?: unknown;
+    user?: unknown;
+}, probed?: 'host' | 'client' | 'peer'): 'none' | 'admin' | 'client';
+/**
+ * The row fields whose changed value reloads the plugin row after a save —
+ * re-exported from src/restart-fields.ts, the single list the host half's
+ * restart watcher fingerprints too (T17b collapsed the two copies; the leaf
+ * module is dependency-free so the client bundler can inline it). Only the
+ * fields this page edits can ever stage a draft here — `targetPort` /
+ * `pushEvents` are not page fields — but the list is the full shared set so
+ * a host-side change surfaces in the diff.
+ */
+export { RESTART_FIELDS } from '../restart-fields.ts';
+/** One path-addressed edit a save sends (the wire `SettingsPathOpView` shape). */
+export type SettingsFormOp = {
+    op: 'set';
+    path: string[];
+    value: unknown;
+} | {
+    op: 'unset';
+    path: string[];
+};
+/** Structural subset of the shared `ConfigForm` snapshot this form reads. */
+export interface SettingsFormScopeSnapshot {
+    status: 'loading' | 'ready' | 'unavailable';
+    value: Record<string, unknown> | undefined;
+    /** Composition layer; what a field reverts to once cleared. */
+    base: unknown;
+    /** Raw user layer as stored; field PRESENCE here marks an override. */
+    user: unknown;
+    /** Revision fencing the next write; sent back as `expectedRevision`. */
+    revision: number | undefined;
+    writable: boolean;
+}
+/**
+ * The form face this controller stages over (structural subset of
+ * ui-settings' `ConfigForm` — declared locally because this package does not
+ * depend on the ui-settings types).
+ */
+export interface SettingsFormScope {
+    getSnapshot(): SettingsFormScopeSnapshot;
+    subscribe(listener: () => void): () => void;
+    mutate(ops: readonly SettingsFormOp[], expectedRevision?: number): Promise<boolean>;
+}
+/**
+ * One secret path in the describe view's sidecar: the path plus whether it
+ * is set — the VALUE itself never rides any describe surface.
+ */
+export interface DescribeSecret {
+    path: string[];
+    set: boolean;
+}
+/**
+ * The `configForms.describe()` mirror (structural, like {@link ConfigFormsLike}
+ * — the dsh-client-ui-settings package is not a dependency). Read only for
+ * the secrets sidecar: whether the row's `deviceToken` is set.
+ */
+export interface ConfigFormsDescribe {
+    getSnapshot(): {
+        view?: {
+            namespaces?: ReadonlyArray<{
+                ns: string;
+                secrets?: ReadonlyArray<DescribeSecret>;
+            }>;
+        };
+    };
+    subscribe(listener: () => void): () => void;
+}
+/**
+ * The `configForms` service face this plugin uses, mirrored onto the cordis
+ * Context. Declared locally (the dsh-client-ui-settings package is not a
+ * dependency — same trick as the local `UiWorkspaceLike`): the runtime
+ * instance is provided by the host, and the lazy `ctx.inject(['configForms'], …)`
+ * in register-settings keeps a composition without the service loadable.
+ */
+export interface ConfigFormsLike {
+    get(entryId: string): SettingsFormScope;
+    describe(): ConfigFormsDescribe;
+    whileServed(namespaces: readonly string[], register: (served: ReadonlySet<string>) => () => void): () => void;
+}
+/** The write one staged draft performs when the form is saved. */
+export type SettingsFieldWrite = {
+    kind: 'set';
+    value: unknown;
+} | {
+    kind: 'clear';
+};
+/** How one field converts between its stored value and draft text. */
+export interface SettingsFieldSpec {
+    field: string;
+    format(value: unknown): string;
+    /** The staged write, or undefined when the draft is not a value this field accepts. */
+    parse(text: string): SettingsFieldWrite | undefined;
+}
+/** Free-text field: an empty draft clears, so the field re-inherits its default. */
+export declare function textField(field: string): SettingsFieldSpec;
+/** Whole-number field within inclusive bounds; empty clears, anything else out of range blocks the save. */
+export declare function intField(field: string, min: number, max: number): SettingsFieldSpec;
+/** Finite number in (min, max] — the `idleHours` shape: zero excluded, 8760 allowed. */
+export declare function hoursField(field: string, max: number): SettingsFieldSpec;
+/** `serverName`: an empty draft clears; a blank-but-nonempty draft or one over
+ * the 40-character cap is invalid and blocks the save (src/config.ts clips at
+ * resolve time, so an over-long write would silently lose its tail). */
+export declare function nameField(field: string, max: number): SettingsFieldSpec;
+/**
+ * The name one pairing claim registers under (T57, trimmed since T60): the
+ * shared 设备名称 field's CURRENT displayed value — a staged draft when one
+ * exists — trimmed FIRST and judged on the trimmed text (a 40-character name
+ * with padded spaces is legal; whitespace alone is not a name), returned
+ * trimmed so what the claim SENDS is exactly what a later save would store.
+ * Falls back to the default device-name copy otherwise. The fallback is
+ * load-bearing since T55: a client page reads no admin baseline, so an
+ * unstored name displays EMPTY and the claim must still carry a usable name.
+ */
+export declare function claimDeviceNameOf(displayText: string, fallback: string): string;
+/** One-of field over a fixed vocabulary (rendered as a select). */
+export declare function oneOfField(field: string, options: readonly string[]): SettingsFieldSpec;
+/** Boolean field staged as 'true'/'false' draft text (rendered as a checkbox). */
+export declare function boolField(field: string, defaultValue?: boolean): SettingsFieldSpec;
+/**
+ * `pluginBridgeConsent` (PB-5): a name → boolean map staged as its canonical
+ * JSON draft. Nothing renders it as text — the 插件桥 toggles stage the NEXT
+ * map wholesale (`togglePluginConsent` builds it, one key per click) — but
+ * riding the shared spec table is what puts the field on the SAME save path
+ * as `autoShareNewSessions`: one staged revision, one save button, one
+ * atomic mutation. `format` keeps the value's own key order so a staged
+ * draft equal to the displayed value reads as "no change"; an illegal stored
+ * map formats as `{}` (the toggle then writes from scratch, and the junk
+ * stays refused by the row validator, never laundered through).
+ */
+export declare function consentField(field: string): SettingsFieldSpec;
+/** Names of the row fields the settings page edits, in group order. */
+export type SettingsFieldName = 'role' | 'host' | 'port' | 'trustedProxies' | 'rateLimit' | 'vapidSubject' | 'pushSummary' | 'pushTurnEnd' | 'pushTool' | 'pushEnabled' | 'pushSessionName' | 'pushDebounceMs' | 'lang' | 'logLevel' | 'serverName' | 'idleHours' | 'autoShareNewSessions' | 'hideInactiveRemoteWorkspaces' | 'pluginBridgeConsent';
+/** Longest legal `serverName`, mirroring src/config.ts's cap. */
+export declare const SERVER_NAME_MAX = 40;
+/** Upper bound of `idleHours`, mirroring src/config.ts. */
+export declare const IDLE_HOURS_MAX = 8760;
+/** The row fields the settings page edits, in render order. */
+export declare const SETTINGS_FIELDS: readonly SettingsFieldSpec[];
+/**
+ * Whether the settings page's server-local operations (pairing, device
+ * management, the push probe) are usable: only once a status load answered
+ * AND it answered as the local machine (`viaGateway: false`). Everything
+ * else — no answer yet, or the page opened through the gateway — keeps them
+ * disabled. Pure so the check script pins all three cases.
+ */
+export declare function localOpsAllowed(view: SettingsView | undefined): boolean;
+/** Per-field presentation facts the block renders next to each control. */
+export interface SettingsFieldView {
+    /** Effective value (the resolved `config.values[field]`). */
+    value: unknown;
+    /** Layer that supplied the effective value. */
+    source: ConfigSource;
+    /** `source === 'env'`: shown locked, edits would be shadowed. */
+    locked: boolean;
+    /** `source === 'file'`: the legacy lan-gate.config.json supplies this. */
+    fromFile: boolean;
+    /** The row layer stores this field but another layer supplied the value —
+     * i.e. the saved value was illegal and resolveConfig skipped it. */
+    savedRowInvalid: boolean;
+}
+/** One device row the block renders. */
+export interface SettingsDeviceView {
+    id: string;
+    name: string;
+    role: 'web' | 'desktop-client';
+    kind: 'auto' | 'phone' | 'desktop';
+    lastSeen: number;
+    hasPush: boolean;
+}
+/** The live pairing code with its countdown, or null when none is active. */
+export interface SettingsPairingView {
+    code: string;
+    role: 'web' | 'desktop-client';
+    remainingSeconds: number;
+}
+/** Everything the settings block renders, derived from one status body. */
+export interface SettingsView {
+    /** The status route answered ok. */
+    available: boolean;
+    /** Which half this DSH process runs as (`client` shows only the role group). */
+    role: 'host' | 'client' | 'peer';
+    /** Opened through the gateway (a remote device): server-local operations disabled. */
+    viaGateway: boolean;
+    /** Whether the gateway child answers. */
+    gatewayReachable: boolean;
+    gatewayPort: number | undefined;
+    gatewayTarget: string | undefined;
+    /** The probe status the admin route saw from the gateway; null = no answer. */
+    gatewayStatus: number | null;
+    /** `gatewayStatus` is a non-2xx reply: the status line shows the abnormal message instead. */
+    gatewayAbnormal: boolean;
+    fields: Record<SettingsFieldName, SettingsFieldView>;
+    devices: SettingsDeviceView[];
+    pairing: SettingsPairingView | null;
+}
+export interface DeriveSettingsOptions {
+    /** Clock for the pairing countdown; defaults to `Date.now()`. */
+    now?: number;
+    /** The shared form snapshot's raw user layer; field presence marks a row-layer override. */
+    rowUser?: unknown;
+}
+/**
+ * Map one `admin/status` body into the view the settings block renders.
+ * Tolerant by design: every wire field is optional, an unexpected shape
+ * degrades to the conservative rendering (status unavailable, gateway down,
+ * no devices, no pairing) instead of throwing into the plugin page.
+ */
+export declare function deriveSettingsView(status: AdminStatusBody, options?: DeriveSettingsOptions): SettingsView;
+/** Card-level state the shared form frame renders. */
+export interface SettingsFormShellState {
+    available: boolean;
+    writable: boolean;
+    dirty: boolean;
+    invalid: boolean;
+    saving: boolean;
+    failed: boolean;
+}
+/** One control's state as its field renders it. */
+export interface SettingsFieldState {
+    text: string;
+    overridden: boolean;
+    invalid: boolean;
+    /** A clear is staged: the box keeps showing the CURRENT value — the next
+     * layer's value only exists after the save — and the field renders the
+     * "reverts on save" hint instead of a fake preview. */
+    cleared: boolean;
+    /** `admin/status` reported this field's value locked by an environment variable. */
+    locked: boolean;
+}
+/** The row secret's face: presence only, never a value. */
+export interface SettingsSecretFieldState {
+    /** The describe view's secrets sidecar reports `deviceToken` set. */
+    configured: boolean;
+}
+/** The whole staged-form snapshot the page renders. */
+export interface ZenRemoteFormState extends SettingsFormShellState {
+    /** The shared form's scope sync state, reactively exposed so the page's
+     * role probe can wait out the mirror's loading phase. */
+    scopeStatus: 'loading' | 'ready' | 'unavailable';
+    role: SettingsFieldState;
+    host: SettingsFieldState;
+    port: SettingsFieldState;
+    trustedProxies: SettingsFieldState;
+    rateLimit: SettingsFieldState;
+    vapidSubject: SettingsFieldState;
+    pushSummary: SettingsFieldState;
+    pushTurnEnd: SettingsFieldState;
+    pushTool: SettingsFieldState;
+    pushEnabled: SettingsFieldState;
+    pushSessionName: SettingsFieldState;
+    pushDebounceMs: SettingsFieldState;
+    lang: SettingsFieldState;
+    logLevel: SettingsFieldState;
+    serverName: SettingsFieldState;
+    idleHours: SettingsFieldState;
+    autoShareNewSessions: SettingsFieldState;
+    hideInactiveRemoteWorkspaces: SettingsFieldState;
+    /** The consent map's staged state (PB-5). No text control renders it — the
+     * 插件桥 toggles stage the next map wholesale — but its `invalid` flag
+     * (a malformed draft) still gates the save like any field's. */
+    pluginBridgeConsent: SettingsFieldState;
+    deviceToken: SettingsSecretFieldState;
+    /** A restart-required field ({@link RESTART_FIELDS}) has a staged change a
+     * save would actually write: the save will move the row and the host
+     * reloads it, briefly restarting the gateway — the page shows the reload
+     * note while this is true. Since T17b it is not merely "a draft exists":
+     * a draft equal to the displayed effective value is no change at all, an
+     * invalid draft blocks the save instead of saving anything, and an
+     * env-locked field never stages (nor counts if locked after staging). */
+    restartPending: boolean;
+}
+/**
+ * Stages one page's edits over the plugin row's shared form and writes them on
+ * save as one atomic, revision-fenced mutation. Fields whose `admin/status`
+ * source is `env` are locked via {@link setLockedFields}: they cannot be
+ * staged, because a written value would be shadowed by the environment anyway.
+ */
+export declare class ZenRemoteSettingsForm {
+    private readonly listeners;
+    private readonly staged;
+    private readonly lockedFields;
+    /** Fields whose saved row value `admin/status` reported invalid
+     * (savedRowInvalid): those display the RAW stored value instead of the
+     * resolved one, so the user can see (and fix) what they actually wrote. */
+    private readonly rowInvalidFields;
+    private readonly scope;
+    /** Reads the describe view's secrets sidecar for `deviceToken`'s
+     * configured flag; injectable so tests run without a describe mirror. */
+    private readonly secretConfigured;
+    /** Effective values from `admin/status`'s `config.values` — what a field
+     * displays while the row layer does not carry it. Empty until the page's
+     * first status load feeds it via {@link setBaseline}. Consulted only while
+     * the page is NOT a client page (T55): see {@link displayValue}. */
+    private baseline;
+    /** The effective role the page probed from the client-config route (T17):
+     * the fallback for {@link savedRoleIsClient} / {@link statusPoll} when the
+     * row document cannot answer the saved role (role only in
+     * lan-gate.config.json). Undefined until that probe answers. */
+    private probedRole;
+    private saving;
+    private failed;
+    /** Revision the drafts started from; the save's `expectedRevision` fence. */
+    private stagedRevision;
+    private cache;
+    private readonly unsubscribe;
+    /**
+     * @param scope - the shared configuration form for the plugin row entry.
+     * (`scope` and `secretConfigured` are assigned in the body rather than as
+     * parameter properties: scripts/check-settings-form.mjs imports this module
+     * through Node's strip-only type stripping, which rejects that syntax.)
+     * @param secretConfigured - whether the row's device token is set, read
+     * from the describe view's secrets sidecar; defaults to "not set".
+     */
+    constructor(scope: SettingsFormScope, secretConfigured?: () => boolean);
+    /** @returns the current form snapshot (stable reference until the next change). */
+    getSnapshot(): ZenRemoteFormState;
+    /** Observe snapshot replacements (the renderer binds this as its store). */
+    subscribe(listener: () => void): () => void;
+    /** Republish from the current reads (admin/status moved underneath). */
+    refresh(): void;
+    /** Replace the set of environment-locked fields reported by admin/status. */
+    setLockedFields(fields: Iterable<string>): void;
+    /**
+     * Replace the set of fields whose saved row value resolveConfig rejected
+     * (admin/status's savedRowInvalid). Those keep showing the RAW stored
+     * value — the resolved value belongs to another layer and would hide the
+     * mistake the user needs to fix.
+     */
+    setRowInvalidFields(fields: Iterable<string>): void;
+    /**
+     * The entry document's stored value for one field (the shared form
+     * snapshot's `value` — the redacted section: secrets never ride it). What
+     * the client group prefills the server address from, and what the page
+     * reads the SAVED role from (the role field's display text also carries
+     * staged drafts, which must not flip the page's mode).
+     */
+    rowValue(field: string): unknown;
+    /**
+     * The scope sync state as the shared form sees it. The page waits it out
+     * before choosing a status source: a 'loading' snapshot cannot answer the
+     * role yet (T16-fix 3).
+     */
+    scopeStatus(): 'loading' | 'ready' | 'unavailable';
+    /**
+     * Which status source the page should poll right now ({@link settingsPollOf}
+     * over the live snapshot): `none` while the mirror loads — and while a row
+     * without a stored role waits for the client-config probe — `client` for a
+     * client row — never admin there — and `admin` otherwise.
+     */
+    statusPoll(): 'none' | 'admin' | 'client';
+    /**
+     * Feed the fallback role the page probed from the client-config route
+     * (T17). Only consulted when the row document carries no `role` — a stored
+     * row role always wins, so a staged-then-saved switch is never masked by a
+     * stale probe.
+     */
+    setProbedRole(role: 'host' | 'client' | 'peer' | undefined): void;
+    /**
+     * Whether the SAVED row role is client ({@link savedRowRole} over the live
+     * snapshot, falling back to the probed role) — the page mode's single
+     * source of truth.
+     */
+    savedRoleIsClient(): boolean;
+    /**
+     * Whether the SAVED row role is peer (PG-9) — the settings page's signal
+     * for the network-mesh section on top of the PWA half. A row-silent
+     * snapshot falls back to the probed role, exactly like {@link savedRoleIsClient}.
+     */
+    savedRoleIsPeer(): boolean;
+    /**
+     * Whether the row document answers the saved role at all (T17): false when
+     * neither snapshot layer carries one — the page then probes the
+     * client-config route for the effective role instead of assuming host.
+     */
+    rowRoleKnown(): boolean;
+    /**
+     * One direct write for the pairing flow (T16): the normalized server
+     * address, the token just redeemed from the server, and (T60) the name
+     * actually registered with — the SERVER's confirmed echo when the claim
+     * carried one, else the name the claim sent — ride ONE revision-fenced
+     * mutate. The name lands in the row's `serverName` (the role card's 设备
+     * 名称 field), so a pairing that used an UNSAVED draft can never leave the
+     * local row empty while the server records the name. Not a staged edit —
+     * all three fields are volatile row settings and apply immediately. The
+     * caller drops the field's stale draft afterwards (see
+     * {@link discardField}). @returns whether the write landed.
+     */
+    writeClientPairing(serverUrl: string, token: string, deviceName: string): Promise<boolean>;
+    /**
+     * One direct write for unpairing: forget the token, keep the address so
+     * the next pairing only needs a fresh code.
+     */
+    clearDeviceToken(): Promise<boolean>;
+    /**
+     * Drop ONE field's staged draft (T60): after the pairing write landed the
+     * name in the row, the draft that produced it is stale — it now equals the
+     * displayed value, and keeping it would show a phantom "overridden" badge.
+     * The revision fence goes with the last draft (there is nothing staged
+     * left to fence); an in-flight save-failure flag is not touched — that is
+     * the staged-save surface's own story.
+     */
+    discardField(field: string): void;
+    /**
+     * Whether one field currently has a STAGED edit (a typed draft or a staged
+     * clear) — the "the user is mid-edit" fact the T59 server-name follow
+     * reads before it may write. Reads the live draft map, so it answers per
+     * call; the page re-runs its effect on every republished snapshot.
+     */
+    hasDraft(field: string): boolean;
+    /**
+     * The shared write path of the two pairing flows. Deliberately does NOT
+     * touch the frame's `failed` flag — a refused pairing write surfaces in
+     * the client group's own copy, not as a staged-save failure.
+     */
+    private directWrite;
+    /**
+     * Feed the effective values (`admin/status`'s `config.values`) the fields
+     * display while the row layer does not carry them; also the baseline the
+     * "did the user change anything" comparison reads. The page clears it
+     * (`undefined`) whenever the poll source is not the admin one (T55): a
+     * stale host baseline must not survive a role switch on a client page.
+     */
+    setBaseline(values: unknown): void;
+    /** Stage draft text for one row field; ignored for env-locked fields. */
+    stage(field: string, text: string): void;
+    /** Stage a clear so the field re-inherits the composition layer; ignored for env-locked fields. */
+    resetField(field: string): void;
+    /** Drop every staged edit. */
+    discard(): void;
+    /**
+     * The raw user layer as the shared form stores it; a field's presence here
+     * marks a row-layer override, which is what `savedRowInvalid` compares
+     * against.
+     */
+    rowUser(): Record<string, unknown>;
+    /** Whether a save would do anything and is allowed to run right now. */
+    canSave(): boolean;
+    /**
+     * Write every staged edit as one mutation fenced by the revision the drafts
+     * started from. The Host is the only authority on acceptance: a refused
+     * save keeps its drafts for correction.
+     * @returns whether the save landed.
+     */
+    save(): Promise<boolean>;
+    /** Release the scope subscription. */
+    dispose(): void;
+    private noteStage;
+    /** Whether the user layer currently carries an entry for one field. */
+    private stored;
+    /**
+     * The value one field DISPLAYS, which is also the baseline a draft must
+     * differ from to count as a change: an env-locked field shows the effective
+     * value (a written one would be shadowed anyway); a field the row layer
+     * stores shows the RESOLVED value from admin/status — resolveConfig
+     * normalizes stored shapes (a trustedProxies array becomes the comma
+     * string, pushTool 1 becomes true) and the box must match what a save
+     * writes — EXCEPT when the saved row value was rejected (savedRowInvalid):
+     * then the raw stored value shows, so the user sees the mistake; before
+     * the first status load the stored raw value stands in, and otherwise the
+     * shared form's own effective layer does, so drafts behave sensibly even
+     * with no admin/status yet.
+     *
+     * T55: the admin/status baseline counts only while the page is not a CLIENT
+     * page. A role switch leaves the host page's kept status load (and with it
+     * the last-fed baseline) in place forever — a client page never refreshes
+     * admin/status again — so reading the baseline there would pin every field,
+     * the role dropdown included, to the old role. Under a client poll the
+     * fields fall back to the row's stored values (the page stops feeding the
+     * baseline too, {@link setBaseline}).
+     */
+    private displayValue;
+    private anyInvalid;
+    /**
+     * Every staged edit a save would send, in field order, mirroring the
+     * upstream form model's plan: a draft equal to the field's current value is
+     * no change at all; a reset only writes when the user layer actually
+     * carries the field; an invalid draft produces none — the save refuses
+     * rather than dropping the edit; a locked field never produces one.
+     */
+    private plan;
+    private project;
+    private publish;
+}
+export declare function versionDismissKey(kind: 'gateway' | 'plugin', consoleOrigin: string, targetVersion: string): string;
+export interface PeerVersionPromptPlan {
+    showGateway: boolean;
+    showPlugin: boolean;
+    gatewayVersion: string | null;
+    gatewayTarget: string;
+    gatewayDismissKey: string | null;
+    pluginVersion: string;
+    pluginTarget: string | null;
+    pluginDismissKey: string | null;
+    consoleUrl: string | null;
+    inferredLegacyGateway: boolean;
+}
+export declare function shouldShowPeerVersionPrompt(view: PeerStatusView | undefined, isDismissed: (key: string) => boolean): PeerVersionPromptPlan;
+export declare function shouldShowLegacyGatewayModal(view: PeerStatusView | undefined, options: {
+    sessionDismissed: boolean;
+    permanentDismissed: boolean;
+}): boolean;
+//# sourceMappingURL=settings-form.d.ts.map

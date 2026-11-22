@@ -1,0 +1,3594 @@
+/**
+ * Server-side relay routes for the desktop client (T22a routes, T22b
+ * streaming, T32 event forwarding, T41b plain-HTTP passthrough):
+ * authentication, ping, handshake, the single invoke passthrough, the
+ * `relay/v1/http` GET dispatch through the host's shared `/api` fetch
+ * handler, the NDJSON stream subscription route with share-change
+ * synchronization, and the forwarded-event half — the
+ * `$zr/events` subscription over the gateway's `$events` wire stream plus
+ * the `relay/v1/event-result` answer route. Activity stats remain a later
+ * task.
+ *
+ * Why the secret: the desktop client is a Node process on another machine —
+ * it has no DSH login cookie, so the gateway authenticates it with a Bearer
+ * pairing token and marks the forwarded request with `x-zen-remote-*` headers.
+ * But DSH only listens on 127.0.0.1, where any local process could bypass the
+ * gateway and forge those headers. The plugin therefore mints a per-apply
+ * secret, hands it to the gateway child through `LAN_GATE_RELAY_SECRET`, the
+ * gateway stamps every device-authenticated forward with it, and these routes
+ * re-verify it on every request with `timingSafeEqual`.
+ *
+ * Path dispatch never decodes the request path. The gateway only admits relay
+ * paths whose raw and URL-normalized forms are byte-identical, which lets
+ * `/_dsh/zen-remote/relay/..%2f..%2fapi` through — decoding it here before
+ * matching would reopen the traversal the gateway just closed. Every route is
+ * an exact comparison on `new URL(req.url).pathname` as-is; anything else is
+ * a 404.
+ */
+
+import { withPeer } from './owner-peer.js'
+import { controlProjectionFrame } from './merge-streams.js'
+import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { Readable, Transform } from 'node:stream'
+import { createRequire } from 'node:module'
+import { join } from 'node:path'
+import { promisify } from 'node:util'
+import { gzip } from 'node:zlib'
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { ShareStore } from './share-store.js'
+import { ensureServerIdMigrated, readStateFile, STATE_FILE_NAME, writeStateFile } from './state-store.js'
+import { decideHttpRoute, decideInvoke, decideStream, decideUploadQuery, parseEventResultBody } from './relay-access.js'
+import {
+  createForgeStatesState,
+  createWorkspaceFollowState,
+  filterControlFrame,
+  filterJobListFrame,
+  filterModelCatalogResult,
+  filterSessionListResult,
+  filterSessionSearchResult,
+  filterWorkspaceFrame,
+  filterWorkspaceValueResult,
+  type ForgeStatesState,
+} from './relay-filter.js'
+import { SESSION_REFERENCE_URI, collectReferenceTexts, decodeSessionReferenceUri } from './session-reference.js'
+import type { ServerPluginEntry, BridgeRegistry } from './plugin-bridge.js'
+import { routeMethodsOf, routeMaxBodyOf } from './plugin-bridge.js'
+import { createPluginTunnel, validatePluginCall, type PluginTunnelRoutes } from './plugin-tunnel.js'
+import type { PluginLoopback } from './plugin-loopback.js'
+import { isLoopbackAuthError } from './plugin-loopback.js'
+import { INVOKE_BINARY_RESULT_METHODS, markInvokeBinary } from './invoke-binary.js'
+import { MAX_INVOKE_BODY_BYTES, MAX_UPLOAD_BYTES } from './upload-limits.js'
+import type { NormalizedAdapter, AdapterVerdict } from './plugin-adapter-core.js'
+import { matchAdapterRoute, adapterTailShapeViolation, locateAdapterIds, adapterOwnsRegistryEntry, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
+
+/**
+ * Registration prefix on the host webServer. Deliberately WITHOUT the
+ * trailing slash: the webserver matches a prefix route as `pathname === p ||
+ * pathname.startsWith(p + '/')`, so a trailing slash here would match only
+ * `…/relay//…` shapes and never `…/relay/ping`.
+ */
+export const RELAY_PREFIX = '/_dsh/zen-remote/relay'
+
+/** The one protocol version this file speaks; the handshake reports it. */
+const RELAY_PROTOCOL = 1
+
+/** Request body ceiling for the POST routes other than invoke. */
+const MAX_BODY_BYTES = 1024 * 1024
+
+// The binary upload channel's ceiling lives in upload-limits.ts with the
+// plugin's other upload numbers (its full sizing rationale is there too);
+// re-exported here so the established `lib/relay-server.js` import path —
+// the tests, the fetch-route intercept — keeps working.
+export { MAX_UPLOAD_BYTES }
+
+/** The `/api` route the upload channel dispatches into, verbatim from the
+ * host's own registration (RT dsh-client-file-upload lib/index.js:73). */
+export const UPLOAD_HTTP_PATH = '/api/session/uploadFileBinary'
+
+/**
+ * The duplex uplink's buffering ceiling (TA-1): how many bytes of
+ * not-yet-consumed uplink frames one live stream may hold — the same budget
+ * the host's own stream inbox applies (`DEFAULT_STREAM_INBOX_BYTES`), so a
+ * stalled terminal consumer backs up at exactly the point the local session
+ * would have. Past it the `/v1/stream-uplink` route answers 413
+ * `uplink-overflow` and the stream is aborted.
+ */
+export const MAX_STREAM_UPLINK_BYTES = 262_144
+
+/** The per-stream uplink window the client may advertise (TA-1): how many
+ * bytes the host's uplink inbox buffers before it stops draining, and the
+ * per-frame framing overhead it charges against that budget. The relay
+ * forwards it verbatim — only the shape is validated, the numbers are the
+ * host's own contract with itself. */
+export interface RelayUplinkWindow {
+  maxBytes: number
+  frameOverheadBytes: number
+}
+
+/** Error messages forwarded to the client are clipped to this many chars. */
+const MAX_MESSAGE_CHARS = 500
+
+/**
+ * DSH's own error vocabulary is `namespace/name` (`gateway/cancelled`,
+ * `session/unknown-session`, …). Only codes of that exact SHAPE travel to the
+ * client with their message — Node's system errors also carry a string
+ * `code` (`ENOENT`), and their messages quote server-side absolute paths, so
+ * anything not shaped like a DSH code reports `internal` with no message.
+ */
+const DSH_ERROR_CODE = /^[a-z][a-zA-Z-]*\/[a-zA-Z-]+$/
+
+/** Concurrent streams one device may hold open (per `x-zen-remote-device`). */
+const MAX_STREAMS_PER_DEVICE = 32
+
+/**
+ * Concurrent invokes one device may keep in flight (CP4): a runaway or
+ * hostile client must not pin unbounded host work behind this route the way
+ * it must not hold unbounded streams. CP5 raises the cap to 32, the same
+ * budget as the stream cap above: opening one remote session in the UI fires
+ * a burst of concurrent invokes, and under high latency they stay in flight
+ * long enough for the old 8 to refuse real traffic. Past the cap the request
+ * answers 429 `too-many-invokes` and the counter is untouched.
+ */
+const MAX_INVOKES_PER_DEVICE = 32
+
+/**
+ * Concurrent uploads one device may keep in flight (T51-fix): the invoke
+ * twin of the budgets above, at the same 8 that fits a burst of attachments.
+ * Counted only after the query, handler and budget walls passed; a 429 is
+ * answered (after the body is drained) without touching the counter. Without
+ * this, a stalled or hostile client pins unbounded host uploads — each an
+ * in-process dispatch writing to the attachments store — behind this route.
+ */
+const MAX_UPLOADS_PER_DEVICE = 8
+
+/** Concurrent bridged plugin GETs one device may keep in flight (PB-3). */
+const MAX_PLUGIN_REQUESTS_PER_DEVICE = 8
+
+/** Concurrent cold-safe `/v1/session-snapshot` calls allowed per device (T3). */
+const MAX_SNAPSHOTS_PER_DEVICE = 2
+
+/** Cross-device global concurrency cap for `/v1/session-snapshot` (Issue #61):
+ * kept strictly below DSH `SessionObservationReader`'s 5-slot cold cache so
+ * multi-peer reconnect prewarming never thrashes cold session logs. */
+const MAX_SNAPSHOTS_GLOBAL = 3
+
+/** Most recent forwarded waterfall events remembered per `$zr/events`
+ * subscription (T32-fix): the registry is only an ownership record, so this
+ * bounds a pathological burst the same way the job cache does — past the
+ * cap the OLDEST entry is dropped (a forwarded-but-forgotten event answers
+ * `unknown-event`, which the client surfaces as the same silent ok DSH
+ * gives a stale result). */
+const EVENT_REGISTRY_LIMIT = 500
+
+/** Stream heartbeat when the caller does not inject one. */
+const DEFAULT_HEARTBEAT_MS = 15_000
+
+/** How long a stream's finish may wait for a backed-up socket buffer to
+ * drain before the response is destroyed (T43-A). */
+const DEFAULT_END_DRAIN_TIMEOUT_MS = 5_000
+
+/** The upload cap used unless the wiring injects one (tests shrink it). */
+const DEFAULT_UPLOAD_CAP_BYTES = MAX_UPLOAD_BYTES
+
+/**
+ * Decode the gateway's `x-zen-remote-device-name` marking header (T59): the
+ * gateway percent-encodes the device table's current name; `undefined` when
+ * the header is absent, blank, or not valid percent-encoding (an old gateway,
+ * a direct local call). Never throws.
+ */
+function deviceNameHeaderOf(req: IncomingMessage): string | undefined {
+  const raw = headerValue(req, 'x-zen-remote-device-name')
+  if (raw === undefined || raw === '') return undefined
+  try {
+    const decoded = decodeURIComponent(raw)
+    return decoded === '' ? undefined : decoded
+  } catch {
+    return undefined
+  }
+}
+
+/** Most recent jobs remembered per session for ownership checks (4b): the
+ * latest `job/list` frame replaces the whole set, so this only bounds a
+ * pathological single frame. */
+const JOB_CACHE_LIMIT = 1024
+
+/** Shape of the `typertGateway` service this route needs (measured live,
+ * docs/spike-relay.md §2.1: invoke returns the unwrapped business value and
+ * throws errors carrying a string `code`; stream opens one `mode: 'stream'`
+ * method and resolves to an async iterable of its frames). Declared
+ * structurally instead of augmenting `Context`: the providing package is not
+ * a devDependency here, and a local augmentation could collide with its own
+ * once that changes.
+ *
+ * T32 adds the two event surfaces, both OPTIONAL: only `$zr/events` and
+ * `relay/v1/event-result` touch them, so a composition (or test fake) without
+ * them keeps every other route working and the event routes answer
+ * `gateway/service-unavailable`.
+ *
+ * - `wireStream.open('$events', …)` is the ONLY way to the forwarded-event
+ *   stream — `gw.stream({namespace:'$events'})` refuses with
+ *   `gateway/invocation-unavailable` (docs/spike-relay.md §2.1 坑 1). It
+ *   resolves to an async iterable whose first frame is the `ready` frame.
+ * - `dispatchRpc('$events/result', payload, signal, peer)` is the only way to
+ *   answer a forwarded waterfall — the gateway special-cases the endpoint
+ *   before its typert dispatch — and returns the `{ok,…}` envelope itself.
+ */
+export interface RelayGateway {
+  invoke(call: { namespace: string; method: string; args: unknown; signal?: AbortSignal; peer?: unknown }): Promise<unknown>
+  stream(call: {
+    namespace: string
+    method: string
+    args: unknown
+    signal?: AbortSignal
+    peer?: unknown
+    /** TA-1: the duplex uplink queue (a duplex method like `terminal/attach`
+     * reads keystrokes/resize frames from it). Absent on one-direction
+     * streams — the field's presence IS the duplex flag. */
+    uplink?: AsyncIterable<unknown>
+    /** TA-1: the client's advertised uplink window, forwarded verbatim. */
+    uplinkWindow?: RelayUplinkWindow
+  }): Promise<AsyncIterable<unknown>>
+  /** The host's wire adapter, shared by the WebSocket mux and the local
+   * transports. `open` is the async 0.2.0 method. */
+  wireStream?: {
+    open(endpoint: string, payload: unknown, uplink: unknown, peer: unknown, signal: AbortSignal | undefined): unknown
+  }
+  /** The host's `/api` dispatch, owning the `$events/result` special case. */
+  dispatchRpc?(
+    endpoint: string,
+    payload: unknown,
+    signal: AbortSignal | undefined,
+    peer: unknown,
+  ): Promise<unknown>
+}
+
+/** What the handshake reports about this server. `serverName` is a CALLBACK
+ * on purpose: the row value is a volatile (`{ get() }` wrapped) setting that
+ * can change without restarting the plugin row, so it must be recomputed at
+ * handshake time, not snapshotted at registration. `fingerprints` is a
+ * callback too (T42), awaited per handshake so a just-restarted server never
+ * serves a stale map; a THROWN compute degrades to the empty map here so a
+ * broken fingerprint source can never fail the handshake itself — the
+ * client's comparison judges every group `unavailable`, never `different`.
+ * `plugins` is the same discipline for the plugin bridge (PB-2): computed
+ * FRESH per handshake (the local registry and the row's consent map are both
+ * live), a THROWN compute degrades to the empty table — the handshake still
+ * succeeds and the client reads every local plugin `not-on-server`. */
+export interface RelayServerInfo {
+  serverId: string
+  serverName: () => string
+  dshVersion: string
+  fingerprints?: () => Record<string, string> | Promise<Record<string, string>>
+  plugins?: (device?: string) => Record<string, ServerPluginEntry>
+}
+
+export interface RelayHandlerOptions {
+  /** The per-apply shared secret; an empty one refuses every request. */
+  secret: string
+  /** The shared-session table deciding reachability. */
+  store: ShareStore
+  /** The host gateway service invokes and streams go through. */
+  gateway: RelayGateway
+  /** Handshake facts. */
+  serverInfo: RelayServerInfo
+  /** Ancestor lookup for subagent reachability; defaults to "no parent". */
+  parentOf?: (id: string) => string | undefined
+  /** The host's `/api` shared-fetch dispatcher (T41b), probed lazily per
+   * request: `undefined` — no connection service, or no shared handler —
+   * answers 501 `unsupported` instead of touching the network. The wiring
+   * builds it from `connection.createSharedFetchHandler('/api').fetch`
+   * (dsh-client-connection), the in-process entry that dispatches a
+   * synthetic Request to the same exact-fetch route table the browser's
+   * `/api` transport uses — no loopback HTTP, no login state. */
+  getApiFetch?: () => ((request: Request) => Promise<Response>) | undefined
+  /** The owner Peer every gateway call is made as (DSH 0.2.1-alpha.3+
+   * requires one; `$events` and `$events/result` need an owner Peer with
+   * `interactions: 'answer'`, the SAME one for both). Built by
+   * {@link createOwnerPeerSource}; absent or answering undefined keeps the
+   * pre-alpha.3 behavior (the host defaults the Peer). */
+  getPeer?: () => unknown
+  /** Stream heartbeat interval in ms (a `{"type":"ping"}` line that keeps
+   * reverse proxies from timing the idle stream away); defaults to 15000.
+   * Tests inject a small value. */
+  heartbeatMs?: number
+  /** How long a stream's finish may wait for a backed-up write buffer to
+   * drain before the response is destroyed (T43-A: a client that stopped
+   * reading must not pin the viewer count and the device budget forever);
+   * defaults to 5000. Tests inject a small value. */
+  endDrainTimeoutMs?: number
+  /** The binary upload channel's byte cap (T51); defaults to
+   * {@link MAX_UPLOAD_BYTES} (500 MiB). Tests inject a small value so the
+   * Content-Length and streaming-count refusals stay cheap to drive. */
+  uploadCapBytes?: number
+  /** How long an upload refusal's tail drain may run before the socket is
+   * destroyed (the {@link DRAIN_DEADLINE_MS} bound); defaults to 10000.
+   * Tests inject a small value so the deadline path stays cheap to drive. */
+  drainDeadlineMs?: number
+  /** How many extra bytes past `fromBytes` an upload refusal's tail drain
+   * swallows before destroying the socket (the {@link DRAIN_SLACK_BYTES}
+   * bound); defaults to 8 MiB. Tests inject a small value. */
+  drainSlackBytes?: number
+  /** The plugin bridge's server half (PB-3). Absent — a wiring that never
+   * mounted it, old tests — and `POST relay/v1/plugin` answers 501
+   * `unsupported`, exactly like the `/api` passthrough without a dispatcher. */
+  pluginBridge?: {
+    /** THIS process's bridge declaration registry (the `zenRemote` service's
+     * backing table) — the source of truth for "which plugin, which version,
+     * which routes". */
+    registry: BridgeRegistry
+    /** The row's per-plugin whole-machine-data consent, read LIVE per request
+     * (a volatile row field — never snapshotted). */
+    getConsent: (device?: string) => Record<string, boolean>
+    /** The loopback executor performing the actual plugin GET. */
+    loopback: PluginLoopback
+    /** The WebSocket byte tunnel's server half (PB-10). Absent — a wiring
+     * that predates the tunnels — and the three `plugin-tunnel` routes
+     * answer 501 `unsupported` like an unwired bridge. */
+    tunnel?: PluginTunnelRoutes
+    /** The validated adapters (PB-11), as the wiring registered them.
+     * Absent/empty — the pluggable default — and `v1/plugin` serves
+     * cooperative declarations only, exactly as before. */
+    adapters?: readonly NormalizedAdapter[]
+  }
+}
+
+/**
+ * The relay route handler plus its introspection surface. A function WITH
+ * properties on purpose: the webServer registration wants exactly a request
+ * handler, and the "who is looking" badge (a later UI task) wants the
+ * per-session viewer counts — while the row-reload path (T22b-fix) needs to
+ * tear every open stream down with the handler that owns it.
+ */
+export interface RelayHandler {
+  (req: IncomingMessage, res: ServerResponse): Promise<void>
+  /** How many session-scoped relay streams currently reference the session
+   * (across all devices). */
+  viewerCount(sessionId: string): number
+  /** End every currently open stream: each client gets one
+   * `error{code:'server-restart'}` line, then the response ends (a client
+   * that stopped reading is destroyed after {@link RelayHandlerOptions.endDrainTimeoutMs}),
+   * the upstream subscription aborts and every counter/listener cleans up —
+   * including the handler's own share-table subscriptions, so a table change
+   * after the close never reaches this handler again (T43-B). A plugin row
+   * reload builds a new handler and share table; without this the streams of
+   * the OLD handler would keep pushing, unreachable by any unshare. */
+  closeAll(reason: string): void
+}
+
+/** One 8-hex-character short server id: four random bytes, enough to tell a
+ * handful of servers apart in a client's server list without leaking anything
+ * countable about the deployment. */
+const SERVER_ID_PATTERN = /^[0-9a-f]{8}$/
+
+/**
+ * The state file the server identity lives in since MS-1 — the same file the
+ * share table (`sessions`) and the paired-servers list (`servers`) use, so
+ * every writer of one field must preserve the other two. `loadServerId`
+ * reads and writes it only through state-store's merged doors.
+ */
+const SERVER_ID_FILE = STATE_FILE_NAME
+
+/**
+ * Read the persisted server id, creating (and persisting) one on first use.
+ * A pre-multi-server `zen-remote-server.json` identity migrates in first
+ * (and its file is deleted) — an upgraded host keeps its id, so paired
+ * devices never see a stranger. A missing file is the normal first run; an
+ * unreadable or damaged file must never take the host down, so every failure
+ * degrades to a fresh per-process id that simply is not remembered across
+ * restarts.
+ */
+export function loadServerId(home: string): string {
+  const file = join(home, SERVER_ID_FILE)
+  ensureServerIdMigrated(file)
+  try {
+    const state = readStateFile(file)
+    if (state.serverId !== undefined && SERVER_ID_PATTERN.test(state.serverId)) return state.serverId
+  } catch {
+    // Damaged state: mint a new one below (state-store never throws, but the
+    // belt stays on).
+  }
+  const id = randomBytes(4).toString('hex')
+  try {
+    // The merged write: sessions/servers already in the file survive, and the
+    // atomic tmp(0600)+rename dance is state-store's job now.
+    writeStateFile(file, (current) => ({ ...current, version: 1, serverId: id }))
+  } catch {
+    // Unwritable home: the id stays process-local. Nothing may throw here.
+  }
+  return id
+}
+
+/**
+ * The DSH version reported in the handshake: `DSH_CLIENT_VERSION` when the
+ * host sets it, else the version of the `@deepseek-ai/dsh` package resolved
+ * from here (compositions without that package installed — tests, Electron —
+ * report `'unknown'`). Never throws.
+ */
+export function resolveDshVersion(): string {
+  const fromEnv = process.env.DSH_CLIENT_VERSION
+  if (typeof fromEnv === 'string' && fromEnv !== '') return fromEnv
+  try {
+    const require = createRequire(import.meta.url)
+    const pkg = require('@deepseek-ai/dsh/package.json') as { version?: unknown }
+    if (pkg !== null && typeof pkg === 'object' && typeof pkg.version === 'string') return pkg.version
+  } catch {
+    // Not resolvable in this composition — 'unknown' is an honest answer.
+  }
+  return 'unknown'
+}
+
+/** Minimum UTF-8 payload size to consider negotiated gzip compression. */
+const ZR_GZIP_MIN_BYTES = 1024
+const gzipAsync = promisify(gzip)
+
+function responseJsonBytes(res: ServerResponse, status: number, bytes: Buffer): void {
+  res.setHeader('Content-Type', 'application/json; charset=utf-8')
+  res.setHeader('Content-Length', String(bytes.length))
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
+  res.writeHead(status)
+  res.end(bytes)
+}
+
+function responseJson(res: ServerResponse, status: number, body: unknown): void {
+  responseJsonBytes(res, status, Buffer.from(JSON.stringify(body)))
+}
+
+/** Whether the client opted into negotiated `x-zr-content-encoding: gzip`. */
+export function acceptsZrGzip(req: IncomingMessage): boolean {
+  const raw = req.headers['x-zr-accept-encoding']
+  const text = Array.isArray(raw) ? raw.join(',') : raw
+  if (typeof text !== 'string' || text === '') return false
+  return text.split(',').some((part) => {
+    const [encoding, ...params] = part.split(';')
+    if (encoding?.trim().toLowerCase() !== 'gzip') return false
+    return !params.some((p) => /^q=0(?:\.0+)?$/i.test(p.trim()))
+  })
+}
+
+/**
+ * Send JSON, gzipping (level 1) on 200 responses >= 1024 B when the client
+ * negotiated `x-zr-accept-encoding: gzip` and the compressed bytes are strictly
+ * smaller; otherwise delegates to plain {@link responseJsonBytes}.
+ */
+export async function responseCompressedJson(
+  req: IncomingMessage,
+  res: ServerResponse,
+  status: number,
+  payload: unknown,
+): Promise<void> {
+  const raw = Buffer.from(JSON.stringify(payload), 'utf8')
+  if (status !== 200 || !acceptsZrGzip(req) || raw.byteLength < ZR_GZIP_MIN_BYTES) {
+    responseJsonBytes(res, status, raw)
+    return
+  }
+  let compressed: Buffer
+  try {
+    compressed = await gzipAsync(raw, { level: 1 })
+  } catch {
+    if (!res.writableEnded && !res.destroyed && !res.headersSent) responseJsonBytes(res, status, raw)
+    return
+  }
+  if (res.writableEnded || res.destroyed || res.headersSent) return
+  if (compressed.byteLength >= raw.byteLength) {
+    responseJsonBytes(res, status, raw)
+    return
+  }
+  res.setHeader('Content-Type', 'application/octet-stream')
+  res.setHeader('Content-Length', String(compressed.byteLength))
+  res.setHeader('Cache-Control', 'no-store')
+  res.setHeader('X-Content-Type-Options', 'nosniff')
+  res.setHeader('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'")
+  res.setHeader('x-zr-content-encoding', 'gzip')
+  res.writeHead(status)
+  res.end(compressed)
+}
+
+export type KnownCursorEvalResult =
+  | { mode: 'full'; snapshot: Record<string, unknown> }
+  | {
+      mode: 'unchanged'
+      cursor: number
+      header?: unknown
+      hasMore: boolean
+      projections?: unknown
+      assistantStream?: unknown
+    }
+  | {
+      mode: 'delta'
+      baseCursor: number
+      cursor: number
+      header?: unknown
+      records: unknown[]
+      hasMore: boolean
+      projections?: unknown
+      assistantStream?: unknown
+    }
+
+function isValidKnownCursor(value: unknown): value is number {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= -1
+}
+
+function unwrapSnapshotRecordSeq(record: unknown): number | undefined {
+  if (!isPlainObject(record)) return undefined
+  const ev = record.type === 'event' && isPlainObject(record.event) ? record.event : record
+  return typeof ev.seq === 'number' && Number.isSafeInteger(ev.seq) ? ev.seq : undefined
+}
+
+/**
+ * Shared pure evaluator for `knownCursor` incremental snapshot negotiation
+ * across `/v1/session-snapshot` and `/v1/stream` (`session/follow`).
+ */
+export function evaluateKnownCursor(frame: unknown, knownCursor: unknown): KnownCursorEvalResult {
+  if (!isPlainObject(frame) || frame.type !== 'snapshot') {
+    return { mode: 'full', snapshot: isPlainObject(frame) ? frame : {} }
+  }
+  const cursor = frame.cursor
+  const records = frame.records
+  const hasActiveAttempt = isPlainObject(frame.assistantStream) && frame.assistantStream.activeAttempt !== undefined
+  if (
+    !isValidKnownCursor(knownCursor) ||
+    !isValidKnownCursor(cursor) ||
+    !Array.isArray(records) ||
+    hasActiveAttempt
+  ) {
+    return { mode: 'full', snapshot: frame }
+  }
+  if (cursor === knownCursor) {
+    return {
+      mode: 'unchanged',
+      cursor,
+      ...(frame.header !== undefined ? { header: frame.header } : {}),
+      hasMore: Boolean(frame.hasMore),
+      ...(frame.projections !== undefined ? { projections: frame.projections } : {}),
+      ...(frame.assistantStream !== undefined ? { assistantStream: frame.assistantStream } : {}),
+    }
+  }
+  if (cursor > knownCursor) {
+    let expectedSeq = knownCursor + 1
+    const deltaRecords: unknown[] = []
+    let contiguous = true
+    for (const rec of records) {
+      const seq = unwrapSnapshotRecordSeq(rec)
+      if (seq === undefined) {
+        contiguous = false
+        break
+      }
+      if (seq <= knownCursor) continue
+      if (seq === expectedSeq && seq <= cursor) {
+        deltaRecords.push(rec)
+        expectedSeq += 1
+      } else {
+        contiguous = false
+        break
+      }
+    }
+    if (contiguous && expectedSeq === cursor + 1) {
+      return {
+        mode: 'delta',
+        baseCursor: knownCursor,
+        cursor,
+        ...(frame.header !== undefined ? { header: frame.header } : {}),
+        records: deltaRecords,
+        hasMore: Boolean(frame.hasMore),
+        ...(frame.projections !== undefined ? { projections: frame.projections } : {}),
+        ...(frame.assistantStream !== undefined ? { assistantStream: frame.assistantStream } : {}),
+      }
+    }
+  }
+  return { mode: 'full', snapshot: frame }
+}
+
+/**
+ * One plugin-bridge refusal (PB-3): the same JSON envelope as every other
+ * relay refusal, plus the `x-zen-remote-error` marker header — the
+ * sub-client's passthrough layer reads the CODE off a response whose body
+ * it must not have to parse (the success path streams opaque plugin bytes;
+ * keeping the refusal marker a header lets one code path classify both).
+ */
+function relayPluginError(res: ServerResponse, status: number, code: string): void {
+  res.setHeader('x-zen-remote-error', code)
+  responseJson(res, status, { ok: false, error: { code } })
+}
+
+/** First (and in practice only) value of one request header. */
+function headerValue(req: IncomingMessage, name: string): string | undefined {
+  const raw = req.headers[name]
+  const value = Array.isArray(raw) ? raw[0] : raw
+  return typeof value === 'string' ? value : undefined
+}
+
+/** The streaming upload pump behind `v1/upload`: the client's chunks are
+ * re-emitted into a
+ * synthetic body verbatim, counted on the way through, with real
+ * backpressure (the socket pauses whenever the consumer is not pulling).
+ * Past the cap the pump errors — the consumer's reader throws mid-write —
+ * and the route answers its own 413 before draining the tail. Returned as
+ * accessors so the route can judge the cap AFTER the consumer settles. */
+interface PumpedUploadBody {
+  body: ReadableStream<Uint8Array>
+  received: () => number
+  tooLarge: () => boolean
+  /** Detach the socket listeners once the route is done with the body. */
+  detach: () => void
+}
+
+function pumpUploadBody(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cap: number,
+  hangUp: AbortController,
+): PumpedUploadBody {
+  let received = 0
+  let tooLarge = false
+  let ended = false
+  const onClientGone = (): void => {
+    if (!res.writableEnded) hangUp.abort()
+  }
+  res.on('close', onClientGone)
+  const body = new ReadableStream<Uint8Array>({
+    start: (controller) => {
+      req.pause()
+      req.on('data', (chunk: Buffer) => {
+        if (tooLarge) return
+        received += chunk.byteLength
+        if (received > cap) {
+          tooLarge = true
+          req.pause()
+          hangUp.abort()
+          try {
+            controller.error(new Error('payload-too-large'))
+          } catch {
+            // The consumer may have cancelled first.
+          }
+          return
+        }
+        try {
+          controller.enqueue(new Uint8Array(chunk))
+        } catch {
+          req.destroy()
+          return
+        }
+        if (controller.desiredSize !== null && controller.desiredSize <= 0) req.pause()
+      })
+      req.on('end', () => {
+        ended = true
+        if (tooLarge) return
+        try {
+          controller.close()
+        } catch {
+          // Already errored by the consumer's cancel.
+        }
+      })
+      req.on('error', () => {
+        if (tooLarge) return
+        try {
+          controller.error(new Error('upload stream failed'))
+        } catch {
+          // Already errored.
+        }
+      })
+      req.on('close', () => {
+        if (tooLarge || ended) return
+        if (!req.complete) {
+          try {
+            controller.error(new Error('upload stream closed prematurely'))
+          } catch {
+            // Already errored.
+          }
+          return
+        }
+        try {
+          controller.close()
+        } catch {
+          // A hang-up destroy after a clean end — nothing to close.
+        }
+      })
+    },
+    pull: () => {
+      req.resume()
+    },
+    cancel: () => {
+      req.pause()
+    },
+  })
+  return {
+    body,
+    received: () => received,
+    tooLarge: () => tooLarge,
+    detach: () => {
+      res.off('close', onClientGone)
+    },
+  }
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** Non-empty string — the client face's `isRemoteEventId` /
+ * `isRemoteEventAgentId` / `validRemoteEventName` (dsh-api-gateway
+ * lib/client.js). */
+function isEventId(value: unknown): value is string {
+  return typeof value === 'string' && value !== ''
+}
+
+/**
+ * The two `$events` frame shapes a sub-client may be shown, proven
+ * well-formed BEFORE forwarding (T32-fix2). The client face's
+ * `parseRemoteEventFrame` validates every variant with exact keys — one
+ * extra or missing field throws and fails the sub-client's whole `$events`
+ * generation — so the relay only forwards frames that would survive that
+ * parse. A waterfall's `request` must additionally be a plain object
+ * without `agent`/`signal`: the host projection strips those, and the
+ * client face refuses them back.
+ */
+interface ForwardableWaterfallFrame extends Record<string, unknown> {
+  type: 'waterfall'
+  event: string
+  eventId: string
+  agentId: string
+  request: Record<string, unknown>
+}
+
+interface ForwardableCancelFrame extends Record<string, unknown> {
+  type: 'cancel'
+  eventId: string
+}
+
+/**
+ * Session-scoped `$events` emit frames the relay forwards:
+ * - `api-session/status`: `[sessionId, boolean]`
+ * - `api-session/activity`: `[sessionId, updatedAt: number]`
+ * - `api-session/error`: `[sessionId, message: string]`
+ * - `agent-preset/selected`: `[sessionId, agentPreset: string]`
+ * - `goal/activation-changed`: `[{ sessionId, goal? }]`
+ * Every other emit (`api-session/added`, `settings/document-updated`, …)
+ * carries server-wide state and is dropped.
+ */
+interface ForwardableSessionEmit {
+  sessionId: string
+  buildFrame: () => { type: 'emit'; event: string; args: unknown[] }
+}
+
+function parseForwardableSessionEmit(frame: Record<string, unknown>): ForwardableSessionEmit | null {
+  if (
+    Reflect.ownKeys(frame).length !== 3 ||
+    !['type', 'event', 'args'].every((key) => Object.hasOwn(frame, key)) ||
+    !Array.isArray(frame.args)
+  ) {
+    return null
+  }
+  const event = frame.event
+  const args = frame.args
+  if (event === 'goal/activation-changed') {
+    if (args.length !== 1 || !isPlainObject(args[0])) return null
+    const payload = args[0]
+    const sessionId = payload.sessionId
+    if (!isEventId(sessionId)) return null
+    const keys = Reflect.ownKeys(payload)
+    const hasGoal = Object.hasOwn(payload, 'goal')
+    if (keys.length !== (hasGoal ? 2 : 1)) return null
+    if (hasGoal && !isPlainObject(payload.goal)) return null
+    const goal = hasGoal ? { ...(payload.goal as Record<string, unknown>) } : undefined
+    return {
+      sessionId,
+      buildFrame: () => ({
+        type: 'emit',
+        event,
+        args: [hasGoal ? { sessionId, goal } : { sessionId }],
+      }),
+    }
+  }
+  if (args.length !== 2 || !isEventId(args[0])) return null
+  const sessionId = args[0]
+  const value = args[1]
+  const valid =
+    event === 'api-session/status'
+      ? typeof value === 'boolean'
+      : event === 'api-session/activity'
+        ? typeof value === 'number' && Number.isFinite(value)
+        : event === 'api-session/error'
+          ? typeof value === 'string'
+          : event === 'agent-preset/selected'
+            ? isEventId(value)
+            : false
+  if (!valid || typeof event !== 'string') return null
+  return {
+    sessionId,
+    buildFrame: () => ({ type: 'emit', event, args: [sessionId, value] }),
+  }
+}
+
+function isForwardableWaterfall(frame: Record<string, unknown>): frame is ForwardableWaterfallFrame {
+  return (
+    Reflect.ownKeys(frame).length === 5 &&
+    ['type', 'event', 'eventId', 'agentId', 'request'].every((key) => Object.hasOwn(frame, key)) &&
+    isEventId(frame.event) &&
+    isEventId(frame.eventId) &&
+    isEventId(frame.agentId) &&
+    isPlainObject(frame.request) &&
+    !Object.hasOwn(frame.request, 'agent') &&
+    !Object.hasOwn(frame.request, 'signal')
+  )
+}
+
+function isForwardableCancel(frame: Record<string, unknown>): frame is ForwardableCancelFrame {
+  return (
+    Reflect.ownKeys(frame).length === 2 &&
+    Object.hasOwn(frame, 'type') &&
+    Object.hasOwn(frame, 'eventId') &&
+    isEventId(frame.eventId)
+  )
+}
+
+/**
+ * Constant-time secret comparison. Different lengths are trivially unequal
+ * (timingSafeEqual itself throws on that); an empty configured secret refuses
+ * everything, so "the gateway half is off" can never fail open.
+ */
+function secretsMatch(provided: string | undefined, secret: string): boolean {
+  if (secret === '' || provided === undefined) return false
+  const left = Buffer.from(provided, 'utf8')
+  const right = Buffer.from(secret, 'utf8')
+  if (left.length !== right.length) return false
+  return timingSafeEqual(left, right)
+}
+
+/**
+ * Read one JSON object body under the byte cap. The EMPTY body parses as the
+ * empty object (the handshake takes no arguments; invoke then fails its own
+ * field checks). Three outcomes, kept apart: a parsed object (`ok`),
+ * unparsable or non-object JSON (`invalid` → the routes answer 400), and a
+ * body past the cap (`too-large` → the routes answer 413). An oversized body
+ * is DRAINED, not aborted mid-read: destroying the socket before the
+ * response goes out would leave the desktop client with a connection error
+ * instead of the status code explaining the refusal. A `Content-Length`
+ * that already names more than the cap skips the buffering entirely — the
+ * drain still runs to the body's end before the verdict resolves.
+ */
+type JsonBody =
+  | { kind: 'ok'; body: Record<string, unknown> }
+  | { kind: 'invalid' }
+  | { kind: 'too-large' }
+
+const PAYLOAD_TOO_LARGE = Object.freeze({ ok: false, error: { code: 'payload-too-large', details: {} } })
+
+/**
+ * One readJsonObject plus the two failure answers every POST route shares:
+ * an oversized body is 413 `payload-too-large`, unparsable JSON is 400
+ * `bad-request` — the two are distinct answers, not one "bad body" pile.
+ * `undefined` means the response is already written and the caller returns.
+ */
+async function readBodyOrRespond(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cap = MAX_BODY_BYTES,
+): Promise<Record<string, unknown> | undefined> {
+  const read = await readJsonObject(req, cap)
+  if (read.kind === 'too-large') {
+    responseJson(res, 413, PAYLOAD_TOO_LARGE)
+    return undefined
+  }
+  if (read.kind === 'invalid') {
+    responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+    return undefined
+  }
+  return read.body
+}
+
+async function readJsonObject(req: IncomingMessage, cap = MAX_BODY_BYTES): Promise<JsonBody> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = []
+    // `Number(undefined)` is NaN, and `NaN > cap` is false: a chunked body
+    // (no length header) simply falls through to the byte counting below.
+    let tooLarge = Number(req.headers['content-length']) > cap
+    let size = 0
+    let done = false
+    const finish = (value: JsonBody): void => {
+      if (!done) {
+        done = true
+        resolve(value)
+      }
+    }
+    req.on('data', (chunk: Buffer) => {
+      if (done || tooLarge) return
+      size += chunk.length
+      if (size > cap) {
+        tooLarge = true
+        chunks.length = 0
+        return
+      }
+      chunks.push(chunk)
+      // Past the cap: keep consuming without buffering.
+    })
+    req.on('end', () => {
+      if (done) return
+      if (tooLarge) {
+        finish({ kind: 'too-large' })
+        return
+      }
+      if (size === 0) {
+        finish({ kind: 'ok', body: {} })
+        return
+      }
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'))
+      } catch {
+        finish({ kind: 'invalid' })
+        return
+      }
+      finish(
+        parsed !== null && typeof parsed === 'object' && !Array.isArray(parsed)
+          ? { kind: 'ok', body: parsed as Record<string, unknown> }
+          : { kind: 'invalid' },
+      )
+    })
+    req.on('error', () => finish({ kind: 'invalid' }))
+  })
+}
+
+/**
+ * How much MORE of an upload request's body a refusal is willing to swallow
+ * beyond what was already read (`fromBytes` — the cap pump's count carries
+ * over, the drain never gets a fresh allowance), and how long it will wait
+ * for that tail before cutting the socket: the answer goes out BEFORE the
+ * drain (the two 413 paths write it with `connection: close`), so a
+ * still-sending client reads the status code first and its tail is disposed
+ * second. A hostile endless stream costs at most this much for this long —
+ * never the answer, never the process.
+ */
+const DRAIN_SLACK_BYTES = 8 * 1024 * 1024
+const DRAIN_DEADLINE_MS = 10_000
+
+/**
+ * Consume and discard the tail of one upload request, bounded by
+ * {@link DRAIN_SLACK_BYTES} past `fromBytes` and by `deadlineMs`. Resolves on
+ * end, error, close, or either bound (the socket is destroyed on a bound — by
+ * then the caller's answer is already on the wire). Every upload refusal path
+ * runs this; the ones whose answer is NOT yet written (400/403/429/501) await
+ * it before answering, so a client still mid-send reads the status code
+ * rather than a reset.
+ */
+function drainUpload(req: IncomingMessage, fromBytes: number, deadlineMs: number, slackBytes = DRAIN_SLACK_BYTES): Promise<void> {
+  return new Promise((resolve) => {
+    let size = fromBytes
+    let settled = false
+    const timer = setTimeout(() => {
+      req.destroy()
+      finish()
+    }, deadlineMs)
+    if (typeof timer.unref === 'function') timer.unref()
+    const onData = (chunk: Buffer): void => {
+      size += chunk.byteLength
+      if (size - fromBytes > slackBytes) {
+        req.destroy()
+        finish()
+      }
+    }
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      req.off('data', onData)
+      req.off('end', finish)
+      req.off('error', finish)
+      req.off('close', finish)
+      clearTimeout(timer)
+      resolve()
+    }
+    req.on('data', onData)
+    req.once('end', finish)
+    req.once('error', finish)
+    req.once('close', finish)
+    req.resume()
+  })
+}
+
+
+/** The 200 error envelope for a failed gateway call, `details` included when
+ *  the host error carried a sanitized one (see errorOf). */
+function errorEnvelopeOf(error: unknown): { ok: false; error: Record<string, unknown> } {
+  const { code, message, details } = errorOf(error)
+  const inner: Record<string, unknown> = message === undefined ? { code } : { code, message }
+  if (details !== undefined) inner.details = details
+  return { ok: false, error: inner }
+}
+
+/**
+ * What may travel to the client about a failed gateway call. DSH's own errors
+ * always carry a `namespace/name`-shaped string `code` — those pass through
+ * with a clipped message. EVERYTHING else — a plugin bug, or a Node system
+ * error whose `code` (`ENOENT`, …) and message (`… '/Users/x/…'`) quote the
+ * server's filesystem — reports `internal` and NO message at all (T22a-fix).
+ */
+function errorOf(error: unknown): { code: string; message?: string; details?: Record<string, unknown> } {
+  const code =
+    error !== null && typeof error === 'object' && typeof (error as { code?: unknown }).code === 'string'
+      ? (error as { code: string }).code
+      : ''
+  if (!DSH_ERROR_CODE.test(code)) return { code: 'internal' }
+  // CP4: a DSH `*/internal` code (`gateway/internal`, …) is the server saying
+  // "my own failure" — its message quotes server-side facts just like a Node
+  // error would, so only the code travels.
+  if (code.endsWith('/internal')) return { code }
+  const text = error instanceof Error ? error.message : String(error)
+  // The structured `details` beside code/message (2026-10-10): the host
+  // rejects an image-bearing prompt with `session/attachment-invalid` whose
+  // `details.reason` (`MODEL_DOES_NOT_SUPPORT_IMAGES`, …) is what the client
+  // UI maps onto a user-facing line — dropped here, the UI prints
+  // `undefined`. Scalars and clipped strings only, bounded key count;
+  // nested objects/arrays stay out so server internals cannot ride this.
+  const raw = (error as { details?: unknown }).details
+  const details: Record<string, unknown> = {}
+  if (isPlainObject(raw)) {
+    for (const [key, value] of Object.entries(raw).slice(0, 16)) {
+      if (typeof value === 'string') details[key] = value.slice(0, MAX_MESSAGE_CHARS)
+      else if (typeof value === 'number' || typeof value === 'boolean' || value === null) details[key] = value
+    }
+  }
+  const out: { code: string; message?: string; details?: Record<string, unknown> } = { code, message: text.slice(0, MAX_MESSAGE_CHARS) }
+  if (Object.keys(details).length > 0) out.details = details
+  return out
+}
+
+/**
+ * The bounded async queue behind one live duplex stream's uplink half (TA-1).
+ * The `/v1/stream-uplink` route pushes the client's frames in; the gateway's
+ * stream implementation (the host's own uplink consumer) pulls them out.
+ *
+ * Three states beyond "open", each with its own door:
+ * - `ended`: the client half-closed (`end: true`). Queued items still drain;
+ *   the iteration finishes cleanly once the buffer is empty. A push AFTER the
+ *   end is a client bug — it records `failure` and aborts the stream.
+ * - `failure`: a post-end push or a buffer overflow. The recorded error is
+ *   thrown to the consumer, and the stream's abort fires (the route cannot
+ *   push anymore, so the downstream is torn down with it).
+ * - `closed`: the stream is over (its own finally, or closeAll). Everything
+ *   is dropped; further pushes are silently swallowed (`'ok'`) — the route's
+ *   answer for a dead stream is the 404 unknown-stream, so the swallow only
+ *   covers the race between the two.
+ *
+ * The waiter is woken on EVERY state change (item, end, close, failure) so a
+ * parked `next()` never sits on a stale promise: the iteration is the host's
+ * consumer, and a missed wake would hang a terminal that just died.
+ */
+class RelayUplinkQueue {
+  private readonly items: Array<{ value: unknown; bytes: number }> = []
+  private bufferedBytes = 0
+  private ended = false
+  private closed = false
+  private failure: Error | undefined
+  private waiter: (() => void) | undefined
+
+  constructor(
+    private readonly maxBytes: number,
+    private readonly onFail: () => void,
+  ) {}
+
+  /** One frame in. `frameBytes` is the frame's serialized size — the same
+   * accounting the host's inbox charges, so the ceiling here means the same
+   * thing it means locally. */
+  push(value: unknown, frameBytes: number): 'ok' | 'after-end' | 'overflow' {
+    if (this.closed || this.failure !== undefined) return 'ok'
+    if (this.ended) {
+      this.failure = new Error('uplink frame arrived after end')
+      this.wake()
+      this.onFail()
+      return 'after-end'
+    }
+    if (this.bufferedBytes + frameBytes > this.maxBytes) {
+      this.failure = new Error('uplink buffer overflow')
+      this.wake()
+      this.onFail()
+      return 'overflow'
+    }
+    this.items.push({ value, bytes: frameBytes })
+    this.bufferedBytes += frameBytes
+    this.wake()
+    return 'ok'
+  }
+
+  /** The client half-closed: queued items still drain, then the iteration
+   * ends. Idempotent. */
+  end(): void {
+    if (this.ended) return
+    this.ended = true
+    this.wake()
+  }
+
+  /** The whole stream is over: drop everything, finish every parked reader,
+   * swallow all future pushes. Idempotent. */
+  close(): void {
+    if (this.closed) return
+    this.closed = true
+    this.items.length = 0
+    this.bufferedBytes = 0
+    this.wake()
+  }
+
+  private wake(): void {
+    const wake = this.waiter
+    this.waiter = undefined
+    wake?.()
+  }
+
+  [Symbol.asyncIterator](): AsyncIterator<unknown> {
+    return {
+      next: () => this.next(),
+      return: () => {
+        this.close()
+        return Promise.resolve({ value: undefined, done: true })
+      },
+    }
+  }
+
+  private async next(): Promise<IteratorResult<unknown>> {
+    while (true) {
+      if (this.closed) return { value: undefined, done: true }
+      const entry = this.items.shift()
+      if (entry !== undefined) {
+        this.bufferedBytes -= entry.bytes
+        return { value: entry.value, done: false }
+      }
+      if (this.failure !== undefined) throw this.failure
+      if (this.ended) return { value: undefined, done: true }
+      await new Promise<void>((resolve) => {
+        this.waiter = resolve
+      })
+    }
+  }
+}
+
+/**
+ * One live `$zr/events` subscription's forwarding bookkeeping (T32). The
+ * answer route (`relay/v1/event-result`) proves an `eventId` was forwarded
+ * through HERE before it composes the gateway payload, so the registry is
+ * the whole ownership story: event → the agent (session) it belongs to,
+ * judged accessible AT ANSWER TIME, and the subscription's own `clientId`
+ * — the server is ONE client of the host's `$events` stream, and DSH
+ * matches every result against THAT id (`parseRemoteEventResult`), never
+ * the sub-client's local one.
+ *
+ * T32-fix: the events handed to the sub-client are rewritten to
+ * `<token>.<eventId>` so an answer names the subscription it belongs to —
+ * answers are matched against THAT sub only, on THAT sub's device, never
+ * across devices. The registry survives the event's own `cancel` frame
+ * NO LONGER: cancel closes the entry (the client already closed its
+ * prompt; a later answer refuses `unknown-event`, which the client turns
+ * into the same silent ok DSH gives a stale result).
+ */
+interface EventsSubscription {
+  /** The `x-zen-remote-device` the subscription rides on; answers from any
+   * other device are refused before the registry is read. */
+  device: string
+  /** The random token baked into every forwarded eventId. */
+  token: string
+  /** The server's `$events` clientId, taken from the subscription's ready
+   * frame; undefined until it arrived. */
+  clientId: string | undefined
+  /** Forwarded waterfall eventIds (ORIGINAL ids — the token stays in the
+   * wire form) → the `agentId` each belongs to. Capped at
+   * {@link EVENT_REGISTRY_LIMIT}, oldest dropped. */
+  events: Map<string, string>
+}
+
+/**
+ * Build the relay route handler mounted under {@link RELAY_PREFIX}. Exported
+ * as a factory so the route tests can drive it against a plain node:http
+ * server with a fake gateway and a real share store — no harness required.
+ *
+ * Every request passes the same gate first: gateway secret, then the two
+ * marking headers. Failures answer a uniform 401 that does not say WHICH
+ * check failed — the difference would only help someone probing the wall.
+ * After the gate, `x-zen-remote-device` is the caller's device id (the
+ * per-device stream budget hangs off it).
+ *
+ * @param options - secret, share store, gateway service and server facts.
+ * @returns the handler owning the full response lifecycle of one request,
+ *   with `viewerCount` alongside for the "who is looking" surface.
+ */
+export function createRelayHandler(options: RelayHandlerOptions): RelayHandler {
+  const { secret, store, gateway, serverInfo } = options
+  const heartbeatMs = options.heartbeatMs ?? DEFAULT_HEARTBEAT_MS
+  const endDrainTimeoutMs = options.endDrainTimeoutMs ?? DEFAULT_END_DRAIN_TIMEOUT_MS
+  const uploadCapBytes = options.uploadCapBytes ?? DEFAULT_UPLOAD_CAP_BYTES
+  const drainDeadlineMs = options.drainDeadlineMs ?? DRAIN_DEADLINE_MS
+  const drainSlackBytes = options.drainSlackBytes ?? DRAIN_SLACK_BYTES
+  const parentOf = options.parentOf ?? (() => undefined)
+  const isAccessible = (sessionId: string): boolean => store.isAccessible(sessionId, parentOf)
+
+  /**
+   * The server display name as of the last second (T59-fix): every stream's
+   * heartbeat reads it per ping, and a deployment whose `serverName()`
+   * callback re-reads the row's configuration would otherwise do so per
+   * STREAM per tick — all streams share this one value instead, refreshed
+   * at most once a second (a 15s heartbeat still reads a fresh name every
+   * round; the handshake route keeps reading the callback directly).
+   */
+  let cachedServerName: string | undefined
+  let cachedServerNameAt = 0
+  const currentServerName = (): string => {
+    const now = Date.now()
+    if (cachedServerName === undefined || now - cachedServerNameAt >= 1_000) {
+      cachedServerName = serverInfo.serverName()
+      cachedServerNameAt = now
+    }
+    return cachedServerName
+  }
+
+  /** Session-scoped streams currently open, per session (cross-device). */
+  const viewers = new Map<string, number>()
+
+  /** Open streams per device id, for the per-device budget. */
+  const streamsByDevice = new Map<string, number>()
+
+  /** Invokes currently in flight per device id, for the invoke budget. */
+  const invokesByDevice = new Map<string, number>()
+
+  /** Uploads currently in flight per device id, for the upload budget (T51-fix). */
+  const uploadsByDevice = new Map<string, number>()
+
+  /**
+   * Bridged plugin GETs currently in flight per device id (PB-3): the same
+   * per-device budget discipline as the invoke and upload counters above.
+   * The cap is 8 — the upload budget's number — because a bridged call is
+   * one panel's data fetch, a burst of a handful per session view; the slot
+   * stays taken for the WHOLE stream (a slow plugin response pins one slot
+   * until its last byte), which is exactly what the budget bounds. Past the
+   * cap the request answers 429 `busy` without touching the counter.
+   */
+  const pluginsByDevice = new Map<string, number>()
+
+  /** Cold-safe `/v1/session-snapshot` calls currently in flight per device. */
+  const snapshotsByDevice = new Map<string, number>()
+
+  /** Total cold-safe `/v1/session-snapshot` calls currently in flight across all devices. */
+  let activeSnapshotsTotal = 0
+
+  /**
+   * The device NAME this process last saw per device id (T59): every relay
+   * request rides the gateway's fresh `x-zen-remote-device-name` marking
+   * header, so the map learns a rename as soon as that device sends anything
+   * at all — and the NDJSON heartbeat reads the LATEST known name per ping,
+   * which is how a server-side rename reaches a connected client without a
+   * reconnect. Tiny by construction (paired device ids only).
+   */
+  const deviceNames = new Map<string, string>()
+
+  /** The `$zr/events` subscriptions currently open — the event-result
+   * route searches these for every incoming eventId. A closed
+   * subscription removes itself; closeAll empties the set. */
+  const liveEventSubscriptions = new Set<EventsSubscription>()
+
+  /**
+   * The live duplex streams' uplink halves (TA-1), keyed by the `streamId`
+   * the handshake line handed the client. The `/v1/stream-uplink` route
+   * resolves every post through THIS table, which is the whole ownership
+   * story: the id is a 16-byte random value only the opening device ever
+   * learned, the device check binds it to that one pairing, the session
+   * list is re-judged against the share table at post time, and the seq
+   * counter keeps replays and reordered posts out. A stream's own finally
+   * removes its entry; closeAll closes every queue first so no consumer
+   * parks on a dead stream.
+   */
+  interface ActiveUplinkStream {
+    streamId: string
+    device: string
+    sessionIds: readonly string[]
+    nextSeq: number
+    queue: RelayUplinkQueue
+    abort: () => void
+  }
+  const liveUplinkStreams = new Map<string, ActiveUplinkStream>()
+
+  /** Latest `job/list` rows seen per session — the recent-state half of the
+   * job ownership check (the other half is a one-shot list on a cache miss).
+   * An unshared session's rows are forgotten (T22b-fix): its jobs are none of
+   * this client's business anymore. */
+  const recentJobs = new Map<string, Map<string, string | undefined>>()
+  /**
+   * Every share-table listener this handler registered — the ownership
+   * cache's unshare sweeper below, plus one per open stream. closeAll
+   * detaches them ALL (T43-B): after the handler closed, a share/unshare on
+   * the table must never re-enter the dead handler, not even through a
+   * stream whose pump is still parked on a full socket buffer.
+   */
+  const tableUnsubscribers = new Set<() => void>()
+  tableUnsubscribers.add(
+    store.subscribe((event) => {
+      if (event.type === 'unshared') recentJobs.delete(event.sessionId)
+    }),
+  )
+
+  /** Kill switches of the streams currently open on THIS handler, and the
+   * reason recorded by closeAll — a request that was mid-ownership-probe
+   * when closeAll ran reads it just before it would open its upstream. */
+  const openStreamKills = new Set<() => void>()
+  let serverClosedReason: string | null = null
+
+  /** Record one raw `job/list` frame into the ownership cache (unfiltered:
+   * ownerless entries are remembered too, as "not owned by anyone"). */
+  const rememberJobs = (sessionId: string, frame: unknown): void => {
+    if (!isPlainObject(frame) || frame.type !== 'rows' || !Array.isArray(frame.jobs)) return
+    const jobs = new Map<string, string | undefined>()
+    for (const job of frame.jobs) {
+      if (jobs.size >= JOB_CACHE_LIMIT) break
+      if (isPlainObject(job) && typeof job.id === 'string' && job.id !== '') {
+        jobs.set(job.id, typeof job.owner === 'string' ? job.owner : undefined)
+      }
+    }
+    recentJobs.set(sessionId, jobs)
+  }
+
+  /**
+   * Whether `jobId` belongs to `sessionId` — the relay-side ownership check
+   * for `job/follow` / `job/kill`. DSH opens ownerless jobs to every session,
+   * so without this a shared session would be a window onto server-wide
+   * processes. The answer comes from the most recent `job/list` rows; on a
+   * cache miss, one throwaway `job/list` stream is opened and abandoned. A
+   * job the list does not mention is REFUSED: no answer is treated as no
+   * permission, never the reverse.
+   */
+  const ownsJob = async (sessionId: string, jobId: string, signal: AbortSignal): Promise<boolean> => {
+    const cached = recentJobs.get(sessionId)
+    if (cached !== undefined && cached.has(jobId)) return cached.get(jobId) === sessionId
+    try {
+      const iterable = await gateway.stream(withPeer({
+        namespace: 'job',
+        method: 'list',
+        args: { request: { sessionId } },
+        signal,
+      }, options.getPeer))
+      for await (const frame of iterable) {
+        rememberJobs(sessionId, frame)
+        const jobs = recentJobs.get(sessionId)
+        // The first frame is the whole recent set; anything the client could
+        // have seen lives in it or nowhere.
+        return jobs !== undefined && jobs.has(jobId) && jobs.get(jobId) === sessionId
+      }
+      return false
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Whether `workspaceId` names a workspace the server currently has, answered
+   * from a one-shot `workspace/follow` baseline (T31 — the only workspace read
+   * the gateway exposes; the stream is abandoned after its first frame). Any
+   * failure — transport, unexpected first frame, missing entry — is `false`:
+   * no answer is not permission. The create route pins the call to the
+   * workspace rather than to a path on purpose: with `workspaceId` attached,
+   * DSH takes `workspace.path` as the session cwd itself and attaches the new
+   * session to the workspace (the group the client created it from).
+   */
+  const workspaceExists = async (workspaceId: string, signal: AbortSignal): Promise<boolean> => {
+    try {
+      const iterable = await gateway.stream(withPeer({ namespace: 'workspace', method: 'follow', args: {}, signal }, options.getPeer))
+      for await (const frame of iterable) {
+        if (!isPlainObject(frame) || frame.type !== 'baseline') return false
+        const value = isPlainObject(frame.value) ? frame.value : undefined
+        const items = value !== undefined && Array.isArray(value.items) ? value.items : []
+        return items.some((item) => isPlainObject(item) && item.workspaceId === workspaceId)
+      }
+      return false
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Open THIS server's own `$events` subscription (T32) — through the
+   * host's wire adapter, the only door (docs/spike-relay.md §2.1 坑 1:
+   * `gw.stream({namespace:'$events'})` refuses with
+   * `gateway/invocation-unavailable`). The payload must be exactly
+   * `{args:{}}` (gateway `openRemoteEvents`); the uplink is undefined —
+   * the endpoint takes none and the host half-closes whatever arrives.
+   */
+  const openEventsStream = async (signal: AbortSignal): Promise<AsyncIterable<unknown>> => {
+    const open = gateway.wireStream?.open
+    if (typeof open !== 'function') {
+      throw Object.assign(new Error('forwarded Remote event source is unavailable'), {
+        code: 'gateway/service-unavailable',
+      })
+    }
+    const opened = (await (open as (this: unknown, ...openArgs: unknown[]) => unknown).call(
+      gateway.wireStream,
+      '$events',
+      { args: {} },
+      undefined,
+      options.getPeer?.(),
+      signal,
+    )) as unknown
+    if (
+      opened === null ||
+      typeof opened !== 'object' ||
+      typeof (opened as Record<symbol, unknown>)[Symbol.asyncIterator] !== 'function'
+    ) {
+      throw Object.assign(new Error('forwarded Remote event stream did not open'), {
+        code: 'gateway/service-unavailable',
+      })
+    }
+    return opened as AsyncIterable<unknown>
+  }
+
+  /** Record one forwarded waterfall in the subscription's registry (oldest
+   * dropped past the cap), under its ORIGINAL id. */
+  const rememberEvent = (sub: EventsSubscription, eventId: string, agentId: string): void => {
+    if (sub.events.size >= EVENT_REGISTRY_LIMIT) {
+      const oldest = sub.events.keys().next().value
+      if (oldest !== undefined) sub.events.delete(oldest)
+    }
+    sub.events.set(eventId, agentId)
+  }
+
+  /**
+   * The `$zr/events` frame discipline (T32, reworked in T32-fix2), one
+   * function for the pump:
+   *
+   * - READY is recorded (the subscription's clientId, for the answer route)
+   *   and forwarded SCRUBBED — the client learns "ready", never the host
+   *   facts (`clientId`, `home`) that would let it speak to the gateway
+   *   around this relay.
+   * - WATERFALL frames whose `agentId` is not reachable right now are
+   *   dropped — NOT answered on the sub-client's behalf (see DROPPED
+   *   DELIVERIES below). Forwarded ones are registered and rewritten to
+   *   `<token>.<eventId>`: the answer route resolves the subscription (and
+   *   its device) from the token, so ids never cross subscriptions.
+   *   Rewriting to virtual ids for the UI stays the CLIENT's job — it
+   *   prefixes the whole thing with `zr~<serverId>~`.
+   * - CANCEL frames are forwarded only for events this subscription
+   *   forwarded (an unshared session's activity timeline must not leak
+   *   through cancels), and the entry goes with the forward.
+   * - EMIT frames are dropped, with ONE exception (T75): a
+   *   `api-session/status` emit whose `args[0]` names an accessible session
+   *   crosses as a fresh `{type, event, args:[id, running]}` — it is the
+   *   only share-SCOPED emit the host produces (one session's running flip,
+   *   judged per frame by `isAccessible` like a waterfall's `agentId`).
+   *   Every other emit is server-wide state (`api-session/added` summaries
+   *   and titles, account expirations, cordis chatter) that is not
+   *   share-scoped: forwarding it would leak unshared sessions and feed the
+   *   sub-client ids it would treat as local. Everything else a sub-client
+   *   needs about a session's state travels the workspace/control streams,
+   *   which ARE share-filtered.
+   * - Anything not shaped exactly like a forwardable waterfall, cancel, or
+   *   status emit (T32-fix2, mirroring the client face's
+   *   `parseRemoteEventFrame` exact-keys validation) is dropped too: a frame
+   *   that slipped through would fail the sub-client's whole `$events`
+   *   generation and leave it failing and reconnecting in a loop.
+   *
+   * DROPPED DELIVERIES STAY PENDING (T32-fix2): a dropped waterfall used to
+   * be abstained `next` on behalf. That is gone on purpose. DSH's `next`
+   * only retracts the answering client's OWN delivery, and the event
+   * settles `next` — falling through to the host's fallback, where
+   * `approval/request` resolves `unavailable` (which dsh-user-approval
+   * treats as a rejection) and `user-questions/request` throws NO_PROVIDER
+   * — only when NO delivery remains (RT dsh-api-gateway
+   * `receiveRemoteEventResult`). With the desktop window closed and the
+   * phone asleep, the relay IS the only delivery: one abstention would fail
+   * every pending approval of the dropped session at once and break the
+   * push → wake → approve flow. The price: a waterfall dropped here keeps
+   * the relay's delivery pending, so an event the server UI answered `next`
+   * waits until the next `$events` client connects — the gateway
+   * re-delivers still-pending events to a fresh subscription
+   * (`openRemoteEvents`). A wait, never a rejection.
+   *
+   * KNOWN LIMITATION: an event that arrives while its session is still
+   * unshared is dropped; sharing the session later does NOT resurrect it
+   * for the sub-client — it only sees such events from the next reconnect
+   * onward, when the gateway re-delivers still-pending events to the fresh
+   * subscription.
+   */
+  const filterEventsFrame = (sub: EventsSubscription, frame: unknown): unknown => {
+    if (!isPlainObject(frame)) return null
+    if (frame.type === 'ready') {
+      if (typeof frame.clientId === 'string' && frame.clientId !== '') sub.clientId = frame.clientId
+      return { type: 'ready' }
+    }
+    if (frame.type === 'waterfall') {
+      if (!isForwardableWaterfall(frame) || !isAccessible(frame.agentId)) return null
+      rememberEvent(sub, frame.eventId, frame.agentId)
+      return { ...frame, eventId: `${sub.token}.${frame.eventId}` }
+    }
+    if (frame.type === 'cancel') {
+      if (!isForwardableCancel(frame) || !sub.events.has(frame.eventId)) return null
+      sub.events.delete(frame.eventId)
+      return { ...frame, eventId: `${sub.token}.${frame.eventId}` }
+    }
+    if (frame.type === 'emit') {
+      // Session-scoped emits pass strictly through the exact-keys gate and are
+      // checked against the share table; fresh objects/arrays leave.
+      const parsed = parseForwardableSessionEmit(frame)
+      if (parsed === null || !isAccessible(parsed.sessionId)) return null
+      return parsed.buildFrame()
+    }
+    return null
+  }
+
+  const handle: RelayHandler = async function handleRelay(req, res) {
+    if (
+      !secretsMatch(headerValue(req, 'x-zen-remote-secret'), secret) ||
+      headerValue(req, 'x-zen-remote-via') !== 'gateway' ||
+      headerValue(req, 'x-zen-remote-role') !== 'desktop-client'
+    ) {
+      responseJson(res, 401, { ok: false, error: { code: 'relay-unauthorized' } })
+      return
+    }
+    // The stream route below budgets concurrent streams per device; other
+    // routes do not need the id beyond the gate itself.
+    // T59: every authenticated request teaches the name cache — the gateway
+    // stamps the device table's CURRENT name on every forward, so this line
+    // is where a rename (admin edit, or the device's own push) lands.
+    const deviceNameHeader = deviceNameHeaderOf(req)
+    const gateDeviceId = headerValue(req, 'x-zen-remote-device')
+    if (gateDeviceId !== undefined && gateDeviceId !== '' && deviceNameHeader !== undefined) {
+      deviceNames.set(gateDeviceId, deviceNameHeader)
+    }
+
+    // The pathname EXACTLY as the webserver saw it — never decoded before
+    // matching (see the module comment): a decoded match would turn the
+    // gateway-admitted `…%2f…` shapes back into a traversal.
+    let pathname = ''
+    try {
+      pathname = new URL(req.url ?? '/', 'http://dsh.internal').pathname
+    } catch {
+      responseJson(res, 404, { ok: false, error: { code: 'not-found' } })
+      return
+    }
+
+    if (req.method === 'GET' && pathname === `${RELAY_PREFIX}/ping`) {
+      responseJson(res, 200, { ok: true })
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/handshake`) {
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      // The compute rides its own guard (T42-fix): a throwing fingerprint
+      // source answers an empty map and the handshake still succeeds.
+      let fingerprints: Record<string, string> = {}
+      try {
+        fingerprints = (await serverInfo.fingerprints?.()) ?? {}
+      } catch {
+        fingerprints = {}
+      }
+      // PB-2: the plugin bridge table, computed FRESH per handshake (the
+      // registry and the row's consent map are both live state), with the
+      // SAME guard: a throwing source answers the empty table — the field
+      // still travels, so the client reads "no plugins on this server"
+      // (not-on-server), never a failed handshake. The field is ALWAYS
+      // present in the reply: only its ABSENCE (an older server) can ever
+      // mean server-too-old on the client.
+      const deviceHeader = headerValue(req, 'x-zen-remote-device') ?? ''
+      let plugins: Record<string, ServerPluginEntry> = {}
+      try {
+        plugins = serverInfo.plugins?.(deviceHeader) ?? {}
+      } catch {
+        plugins = {}
+      }
+      responseJson(res, 200, {
+        ok: true,
+        relayProtocol: RELAY_PROTOCOL,
+        serverId: serverInfo.serverId,
+        serverName: serverInfo.serverName(),
+        dshVersion: serverInfo.dshVersion,
+        // T42: the server's own interface fingerprints (empty when the wiring
+        // had nothing to compute — the client judges group by group).
+        fingerprints,
+        // PB-2: the plugin bridge table (empty when the wiring had nothing to
+        // register — the client judges plugin by plugin).
+        plugins,
+        // T59: the CALLING device's name, as the gateway's device table holds
+        // it at this moment (the header is written fresh per forward, so a
+        // just-renamed device reads its new name here). Undefined without the
+        // header — an old gateway or a direct call — and the field then rides
+        // no further: the client keeps what it has.
+        ...(deviceNameHeaderOf(req) !== undefined ? { deviceName: deviceNameHeaderOf(req) } : {}),
+      })
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/unshare`) {
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const sessionId = body.sessionId
+      if (typeof sessionId !== 'string' || sessionId === '') {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      // The TABLE only — isShared, not isAccessible: a subagent or fork
+      // session never entered the table, so it cannot be closed alone; it
+      // leaves remote access together with its family or not at all.
+      if (!store.isShared(sessionId)) {
+        responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        return
+      }
+      store.unshare(sessionId, 'client')
+      responseJson(res, 200, { ok: true })
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/event-result`) {
+      // The answer half of `$zr/events` (T32): `{eventId, result}`, where
+      // `eventId` is the OPAQUE `<token>.<eventId>` string this relay handed
+      // the sub-client (wrapped in `zr~<serverId>~` by the client), and
+      // `result` is the Remote event OUTCOME, forwarded verbatim.
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const parsed = parseEventResultBody(body)
+      if (parsed === undefined) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      // Ownership (T32-fix): the token locates the ONE subscription the
+      // event was forwarded on — the answer is matched against that sub
+      // only, and only from the device that holds it. An unknown token, a
+      // foreign device, or an eventId that subscription did not forward is
+      // the same refusal (no oracle about which half missed).
+      const separator = parsed.eventId.indexOf('.')
+      const token = separator === -1 ? '' : parsed.eventId.slice(0, separator)
+      const originalEventId = separator === -1 ? '' : parsed.eventId.slice(separator + 1)
+      let owner: { clientId: string; agentId: string } | undefined
+      if (token !== '' && originalEventId !== '') {
+        const device = headerValue(req, 'x-zen-remote-device') ?? ''
+        for (const sub of liveEventSubscriptions) {
+          if (sub.token !== token) continue
+          if (sub.device !== device) break
+          const agentId = sub.events.get(originalEventId)
+          if (agentId !== undefined && sub.clientId !== undefined) {
+            owner = { clientId: sub.clientId, agentId }
+          }
+          break
+        }
+      }
+      if (owner === undefined) {
+        responseJson(res, 403, { ok: false, error: { code: 'unknown-event' } })
+        return
+      }
+      if (!isAccessible(owner.agentId)) {
+        responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        return
+      }
+      const dispatch = gateway.dispatchRpc
+      if (typeof dispatch !== 'function') {
+        responseJson(res, 200, {
+          ok: false,
+          error: { code: 'gateway/service-unavailable', message: 'forwarded Remote event source is unavailable' },
+        })
+        return
+      }
+      // A hang-up cancels the answer mid-flight, like invoke's.
+      const hangUp = new AbortController()
+      const onClientGone = (): void => {
+        if (!res.writableEnded) hangUp.abort()
+      }
+      res.on('close', onClientGone)
+      try {
+        // Exactly the gateway's payload contract (parseRemoteEventResult):
+        // one `args` field holding `{clientId, eventId, outcome}` — the
+        // subscription's OWN clientId (the gateway matches results against
+        // the client the event was delivered to) and the ORIGINAL eventId
+        // with the token stripped back off; the outcome untouched. The
+        // envelope — including the gateway's own
+        // `{ok:false, error:{code:'gateway/internal',…}}` for a malformed
+        // outcome — rides back as the 200 body.
+        const envelope = (await dispatch.call(
+          gateway,
+          '$events/result',
+          { args: { clientId: owner.clientId, eventId: originalEventId, outcome: parsed.result } },
+          hangUp.signal,
+          options.getPeer?.(),
+        )) as unknown
+        responseJson(res, 200, isPlainObject(envelope) ? envelope : { ok: false, error: { code: 'internal' } })
+      } catch (error) {
+        responseJson(res, 200, errorEnvelopeOf(error))
+      } finally {
+        res.off('close', onClientGone)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/invoke`) {
+      // The prompt-sized cap: a registered invoke may carry inline images in
+      // its content blocks (see MAX_INVOKE_BODY_BYTES).
+      const body = await readBodyOrRespond(req, res, MAX_INVOKE_BODY_BYTES)
+      if (body === undefined) return
+      const namespace = body.namespace
+      const method = body.method
+      const args = body.args
+      if (
+        typeof namespace !== 'string' ||
+        namespace === '' ||
+        typeof method !== 'string' ||
+        method === '' ||
+        args === null ||
+        typeof args !== 'object' ||
+        Array.isArray(args)
+      ) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const decision = decideInvoke(namespace, method, args, isAccessible)
+      if (!decision.allow) {
+        responseJson(res, 403, { ok: false, error: { code: decision.reason } })
+        return
+      }
+      // CP4: per-device in-flight budget — the invoke twin of the stream
+      // budget below. Counted only from here (every earlier refusal is
+      // answered before this line) and released in the route's finally,
+      // which every path through the try reaches.
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((invokesByDevice.get(device) ?? 0) >= MAX_INVOKES_PER_DEVICE) {
+        responseJson(res, 429, { ok: false, error: { code: 'too-many-invokes' } })
+        return
+      }
+      invokesByDevice.set(device, (invokesByDevice.get(device) ?? 0) + 1)
+      // A client hanging up must not leave the host running the call to
+      // completion behind a dead socket: the connection's close (arriving
+      // before the response ends) cancels the AbortController whose signal
+      // rides into gateway.invoke. 'close' also fires AFTER a normal end,
+      // so only an unfinished response counts as a hang-up.
+      const hangUp = new AbortController()
+      const onClientGone = (): void => {
+        if (!res.writableEnded) hangUp.abort()
+      }
+      res.on('close', onClientGone)
+      try {
+        // `job/kill` additionally proves the target job belongs to the
+        // claimed session (4b): DSH opens ownerless jobs to everyone, so the
+        // share-table check alone would let one shared session kill
+        // server-wide background jobs.
+        if (namespace === 'job' && method === 'kill') {
+          const request = isPlainObject(args) ? args.request : undefined
+          const jobId =
+            isPlainObject(request) && typeof request.jobId === 'string' && request.jobId !== ''
+              ? request.jobId
+              : undefined
+          const sessionId = isPlainObject(request) && typeof request.sessionId === 'string' ? request.sessionId : ''
+          if (jobId === undefined || sessionId === '' || !(await ownsJob(sessionId, jobId, hangUp.signal))) {
+            responseJson(res, 403, { ok: false, error: { code: 'forbidden' } })
+            return
+          }
+          // The ownership probe can take a round trip — remote may have been
+          // closed while it ran (T22b-fix). The decision above is stale the
+          // moment an await happened; re-run the share-table check before
+          // anything is forwarded.
+          if (!isAccessible(sessionId)) {
+            responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+            return
+          }
+        }
+        // Zero-shared-session privacy gate for agent presets: an unshared server
+        // must not leak custom preset rosters or system-prompt markdown. The
+        // gate is all-or-nothing and one-directional: once ANY session is
+        // shared, list/read pass through UNFILTERED — the paired client can
+        // read the machine-wide roster and any preset's YAML document
+        // (system prompt and sub-plugin manifests included). There is no
+        // per-preset or per-shared-session filtering beyond this gate.
+        if (namespace === 'agentPresets' && (method === 'list' || method === 'read')) {
+          if (store.list().length === 0) {
+            if (method === 'list') {
+              responseJson(res, 200, { ok: true, value: { presets: [] } })
+            } else {
+              responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+            }
+            return
+          }
+        }
+        // Check target workspace existence (never share-checked) and re-run
+        // session ownership after awaiting the probe.
+        if (namespace === 'workspace' && method === 'insertSessionBefore') {
+          const request = isPlainObject(args) ? args.request : undefined
+          const workspaceId =
+            isPlainObject(request) && typeof request.workspaceId === 'string' && request.workspaceId !== ''
+              ? request.workspaceId
+              : undefined
+          if (workspaceId === undefined || !(await workspaceExists(workspaceId, hangUp.signal))) {
+            responseJson(res, 403, { ok: false, error: { code: 'workspace/not-found' } })
+            return
+          }
+          if (!decideInvoke(namespace, method, args, isAccessible).allow) {
+            responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+            return
+          }
+        }
+        // T31-fix: the forwarded create is REBUILT as a whitelist, not
+        // trimmed by deletion — exactly `{workspaceId, agentPreset?}` and
+        // nothing else, so a hostile or buggy client cannot smuggle extra
+        // fields (env, permissionMode, a caller-chosen sessionId, a decoy
+        // cwd) through to DSH. The workspace was probed above; the new
+        // session's id and cwd are DSH's own business (it mints the id and
+        // takes `workspace.path`; a create naming BOTH workspaceId and cwd
+        // would be a `gateway/bad-request`).
+        if (namespace === 'session' && method === 'create') {
+          const request = isPlainObject(args) ? args.request : undefined
+          const workspaceId =
+            isPlainObject(request) && typeof request.workspaceId === 'string' && request.workspaceId !== ''
+              ? request.workspaceId
+              : undefined
+          if (workspaceId === undefined || !(await workspaceExists(workspaceId, hangUp.signal))) {
+            responseJson(res, 403, { ok: false, error: { code: 'workspace/not-found' } })
+            return
+          }
+          ;(args as Record<string, unknown>).request = {
+            workspaceId,
+            ...(isPlainObject(request) && typeof request.agentPreset === 'string'
+              ? { agentPreset: request.agentPreset }
+              : {}),
+          }
+        }
+        // T41a-fix: a canonical `dsh-session:` address in an injectable text
+        // makes DSH inject the referenced session's content with no access
+        // check of its own (dsh-session-reference prepareDirectMessages →
+        // readSurface). Every referenced session must pass the share table
+        // before the call is forwarded — the prompt-text sibling of the
+        // job/kill ownership probe above. T41a-fix2 closed the two bypasses
+        // the prompt-only scan left: a queue EDIT replaces a queued USER
+        // message's content verbatim (RT dsh-api-session-controller
+        // updateQueue), and a slash command's raw input is steered in as a
+        // USER message by its handler (`/plan <text>` does exactly that, RT
+        // dsh-plan-mode) — both are parsed at the next turn start, exactly
+        // like prompt text. WHERE the injectable texts live is the shared
+        // rule (session-reference.ts), the same one the sub-client rewrites
+        // by; everything else in the arguments is not parsed by the host.
+        if (referencedSessionIds(namespace, method, args).some((id) => !isAccessible(id))) {
+          responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+          return
+        }
+        const value = await gateway.invoke(withPeer({ namespace, method, args, signal: hangUp.signal }, options.getPeer))
+        // T31: a session created or forked THROUGH the relay is shared
+        // automatically — the client only ever sees shared sessions, so an
+        // unshared result would be born unreachable. Re-sharing (a fork the
+        // new-session listener already caught) is a table no-op.
+        if (namespace === 'session' && (method === 'create' || method === 'fork')) {
+          const created = isPlainObject(value) && typeof value.sessionId === 'string' ? value.sessionId : undefined
+          if (created !== undefined) store.share(created)
+        }
+        // T41a-fix: the @ resolver names EVERY server session in its answer —
+        // a row the share table cannot reach never travels (the session/list
+        // discipline). T52-fix: the model catalog's answer leaves with its
+        // `failures` emptied — the host's per-group error texts may carry
+        // endpoint or credential details (relay-filter.ts
+        // filterModelCatalogResult).
+        const travels =
+          decision.filter === 'session-list'
+            ? filterSessionListResult(value, isAccessible)
+            : decision.filter === 'session-reference-candidates'
+              ? filterAccessibleCandidateRows(value, isAccessible)
+              : decision.filter === 'model-catalog'
+                ? filterModelCatalogResult(value)
+                : decision.filter === 'workspace-value'
+                  ? filterWorkspaceValueResult(value, isAccessible)
+                  : decision.filter === 'session-search'
+                    ? filterSessionSearchResult(value, isAccessible)
+                    : value
+        // 2026-10-14: a binary-result method (workspaceFiles/readBytes) cannot
+        // ride JSON.stringify — typed arrays collapse into plain objects and
+        // the sub-client's own zod validation rejects the answer (remote image
+        // preview: "expected Uint8Array"). The marker round-trip
+        // (invoke-binary.ts) is restored on the client half (intercept.ts).
+        const wire =
+          INVOKE_BINARY_RESULT_METHODS.has(`${namespace}/${method}`) ? markInvokeBinary(travels) : travels
+        await responseCompressedJson(req, res, 200, { ok: true, value: wire })
+      } catch (error) {
+        // The gateway's own failures (unknown namespace, absent service) are
+        // business answers, not transport errors: they ride a 200 envelope
+        // like every other result, with the gateway's string code preserved.
+        await responseCompressedJson(req, res, 200, errorEnvelopeOf(error))
+      } finally {
+        res.off('close', onClientGone)
+        // The invoke is over — answered, refused mid-flight, or its client
+        // gone: the budget slot goes back.
+        const remaining = (invokesByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) invokesByDevice.delete(device)
+        else invokesByDevice.set(device, remaining)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/http`) {
+      // The plain-HTTP panel long tail (T41b): `{route, query}` names one
+      // GET the sub-client's `/api/...` fetch wrapper intercepted. GET
+      // semantics ONLY — the body carries the coordinates of the request to
+      // dispatch, never a request body to forward, so a `body` field is a
+      // protocol violation rather than data.
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      if (body.body !== undefined) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const route = body.route
+      const query = body.query
+      if (typeof route !== 'string' || typeof query !== 'string') {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const decision = decideHttpRoute(route, query, isAccessible)
+      if (!decision.allow) {
+        const status =
+          decision.reason === 'unknown-route'
+            ? 404
+            : decision.reason === 'not-shared'
+              ? 403
+              : 400 // no-session / bad-query — malformed coordinates
+        responseJson(res, status, { ok: false, error: { code: decision.reason } })
+        return
+      }
+      const dispatch = options.getApiFetch?.()
+      if (dispatch === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      let request: Request
+      try {
+        // The URL is composed from the DECISION's normalized query alone —
+        // never the raw wire string. The two parsers disagree about control
+        // characters (URLSearchParams keeps them in key names, the URL
+        // constructor strips them), and that differential was an
+        // authorization bypass (T41b-fix): decideHttpRoute now rebuilds the
+        // whitelisted parameters itself, so what was checked is exactly what
+        // is dispatched.
+        request = new Request(`http://relay.local/api/${route}?${decision.query}`, {
+          method: 'GET',
+          signal: hangUpOf(res),
+        })
+      } catch {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      try {
+        // In-process dispatch through the shared `/api` handler — the same
+        // exact-fetch route table the browser's transport uses, no loopback
+        // HTTP, no login state. Both registered routes answer buffered JSON,
+        // so the whole response is read and re-wrapped as the envelope value.
+        const upstream = await dispatch(request)
+        const bodyText = await upstream.text()
+        const contentType = upstream.headers.get('content-type') ?? undefined
+        responseJson(res, 200, {
+          ok: true,
+          value: { status: upstream.status, ...(contentType !== undefined ? { contentType } : {}), body: bodyText },
+        })
+      } catch {
+        // A dispatch failure is this server's fault, not a business answer —
+        // and errorOf keeps any message off the wire.
+        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/plugin`) {
+      // The plugin bridge's forwarding route (PB-3, write requests since
+      // PB-9): the sub-client hands over one call against a BRIDGED plugin's
+      // route (coordinates in the x-zr-* headers), and this server re-issues
+      // it against its OWN plugin over loopback HTTP (docs/adr/0001),
+      // streaming the answer back. The METHOD rides `x-zr-method` (PB-9,
+      // default GET); a body rides as the raw byte stream, forwarded
+      // verbatim.
+      const bridge = options.pluginBridge
+      if (bridge === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      // The method, before anything else — it decides whether a body is
+      // even legal. GET/HEAD stay bodyless by protocol: the coordinates
+      // ride the headers, so anything at all in the body is a shape
+      // violation. One byte settles it; a real body is drained (bounded,
+      // timed — the upload route's discipline) AFTER the answer, like every
+      // oversized read here.
+      const pluginMethod = headerValue(req, 'x-zr-method') ?? 'GET'
+      const bodylessMethod = pluginMethod === 'GET' || pluginMethod === 'HEAD'
+      let bodyBytes = 0
+      if (bodylessMethod) {
+        for await (const chunk of req) {
+          bodyBytes += (chunk as Buffer).length
+          break
+        }
+        if (bodyBytes > 0) {
+          relayPluginError(res, 400, 'bad-request')
+          await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+          return
+        }
+      }
+      // The coordinates, verbatim off the wire — `x-zr-path` is matched
+      // UNDECODED (the module-wide no-decode discipline), the query parsed
+      // exactly once below.
+      const pluginName = headerValue(req, 'x-zr-plugin')
+      const pluginVersion = headerValue(req, 'x-zr-plugin-version')
+      const pluginDigest = headerValue(req, 'x-zr-plugin-digest')
+      const routePath = headerValue(req, 'x-zr-path')
+      const rawQuery = headerValue(req, 'x-zr-query') ?? ''
+      if (
+        pluginName === undefined || pluginName === '' ||
+        pluginVersion === undefined || pluginVersion === '' ||
+        pluginDigest === undefined || pluginDigest === '' ||
+        routePath === undefined || !routePath.startsWith('/')
+      ) {
+        relayPluginError(res, 400, 'bad-request')
+        return
+      }
+      // ---- PB-11: the adapter routes claim the request BEFORE the
+      // cooperative chain. An adapter route matches by equality or one
+      // segment deeper (not the cooperative exact equality), its ids live
+      // wherever ITS locator says (query, path segment, JSON body), and the
+      // loopback receives the coordinates VERBATIM — the sub-client has
+      // already rewritten every virtual id to its real half, so what gets
+      // validated here is exactly what the local plugin will see. A YIELDED
+      // adapter (the plugin registered its own declaration) falls through to
+      // the cooperative chain below, whose digest check refuses the stale
+      // adapter coordinates with `plugin-mismatch`.
+      const adapterHit = matchAdapterRoute(options.pluginBridge?.adapters, routePath)
+      if (adapterHit !== undefined) {
+        const { adapter, route: adapterRoute } = adapterHit
+        if (adapterOwnsRegistryEntry(adapter, bridge.registry.get(adapter.plugin))) {
+          // Coordinates first: the forwarded version/digest must be the
+          // adapter's registered pair.
+          if (pluginVersion !== adapter.declaration.version || pluginDigest !== adapter.digest) {
+            relayPluginError(res, 409, 'plugin-mismatch')
+            return
+          }
+          // PB-23b: the prefix tail's shape red line — the SAME shared rule
+          // the cooperative chain applies inside validatePluginCall (400
+          // `bad-request`), so an illegal tail (`?`, `#`, `..` in any
+          // encoding, whitespace) never reaches the loopback through either
+          // half.
+          if (adapterTailShapeViolation(adapterRoute, routePath)) {
+            relayPluginError(res, 400, 'bad-request')
+            return
+          }
+          // Whole-machine data by definition: the live consent wall, the
+          // same knob the cooperative server-scope routes read.
+          let adapterConsent: Record<string, boolean> = {}
+          try {
+            adapterConsent = bridge.getConsent(headerValue(req, 'x-zen-remote-device') ?? '')
+          } catch {
+            adapterConsent = {}
+          }
+          if (adapterConsent[adapter.plugin] !== true) {
+            relayPluginError(res, 403, 'consent-off')
+            return
+          }
+          if (!adapterRoute.methods.includes(pluginMethod)) {
+            relayPluginError(res, 405, 'method-undeclared')
+            return
+          }
+          // The per-device budget — the SAME table the cooperative forwards
+          // share, held for the whole response stream.
+          const adapterDevice = headerValue(req, 'x-zen-remote-device') ?? ''
+          if ((pluginsByDevice.get(adapterDevice) ?? 0) >= MAX_PLUGIN_REQUESTS_PER_DEVICE) {
+            relayPluginError(res, 429, 'busy')
+            return
+          }
+          pluginsByDevice.set(adapterDevice, (pluginsByDevice.get(adapterDevice) ?? 0) + 1)
+          let adapterGone = false
+          let multiValueRefusal = false
+          let adapterQueryOverride: string | undefined
+          const adapterHangUp = new AbortController()
+          const onAdapterGone = (): void => {
+            adapterGone = true
+            if (!res.writableEnded) adapterHangUp.abort()
+          }
+          res.on('close', onAdapterGone)
+          res.on('error', onAdapterGone)
+          try {
+            // Locate ONCE, over the same routing rule the sub-client used:
+            // the query parses once, the path segments decode off the
+            // rewritten pathname, and a body-locating route buffers its
+            // (bounded) JSON body. A duplicated query id throws — the
+            // cooperative shape violation (PB-12 review).
+            const adapterSearch = new URLSearchParams(rawQuery)
+            let parsedBody: unknown
+            let bodyGiven = false
+            let bufferedBody: Buffer | undefined
+            if (!bodylessMethod && adapterRoute.locator.in === 'json-body') {
+              const chunks: Buffer[] = []
+              let size = 0
+              let over = false
+              for await (const chunk of req) {
+                size += (chunk as Buffer).length
+                if (size > adapterRoute.maxBody) {
+                  over = true
+                  break
+                }
+                chunks.push(Buffer.from(chunk as Uint8Array))
+              }
+              if (over) {
+                relayPluginError(res, 413, 'body-too-large')
+                void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+                return
+              }
+              bufferedBody = Buffer.concat(chunks)
+              if (bufferedBody.length > 0) {
+                try {
+                  parsedBody = JSON.parse(bufferedBody.toString('utf8'))
+                  bodyGiven = true
+                } catch {
+                  relayPluginError(res, 400, 'bad-request')
+                  return
+                }
+              }
+            }
+            const hits = (() => {
+              try {
+                return locateAdapterIds(adapterRoute, routePath, adapterSearch, bodyGiven ? parsedBody : undefined)
+              } catch (error) {
+                if (error instanceof AdapterMultiValueQueryError) {
+                  multiValueRefusal = true
+                  return []
+                }
+                throw error
+              }
+            })()
+            if (multiValueRefusal) {
+              relayPluginError(res, 400, 'bad-query')
+              return
+            }
+            // The sub-client only forwards a classified-remote request, so
+            // an adapter request that locates NOTHING is malformed here.
+            if (hits.length === 0) {
+              relayPluginError(res, 400, 'bad-request')
+              return
+            }
+            // EVERY located id must be a shared session — one unshared id
+            // among several refuses the whole request.
+            for (const hit of hits) {
+              if (!isAccessible(hit.value)) {
+                relayPluginError(res, 403, 'not-shared')
+                return
+              }
+            }
+            // The server hook: refuse, or replace the parsed body (strip a
+            // `cwd`, pin a field…). The loopback coordinates stay verbatim.
+            let loopbackBody: Buffer | undefined
+            if (bodyGiven) loopbackBody = Buffer.from(JSON.stringify(parsedBody), 'utf8')
+            const serverHook = adapter.hooks.server?.request
+            if (serverHook !== undefined) {
+              let verdict: AdapterVerdict
+              try {
+                verdict = serverHook({ method: pluginMethod, pathname: routePath, route: adapterRoute, query: adapterSearch, body: bodyGiven ? parsedBody : undefined })
+              } catch {
+                relayPluginError(res, 403, 'internal')
+                return
+              }
+              if (!verdict.allow) {
+                relayPluginError(res, 403, verdict.reason)
+                return
+              }
+              if (bodyGiven && verdict.body !== undefined) {
+                loopbackBody = Buffer.from(JSON.stringify(verdict.body), 'utf8')
+              }
+              // A hook may also rewrite the query (the file/upload routes'
+              // `cwd` strip rides this) — the loopback then sends the
+              // hook's serialization instead of the verbatim rawQuery.
+              adapterQueryOverride = verdict.query !== undefined ? verdict.query.toString() : undefined
+            }
+            // The loopback body: a body-locating route sends its (possibly
+            // hook-rewritten) buffer; any other body rides the cooperative
+            // counting gate.
+            const adapterAccept = headerValue(req, 'accept')
+            const adapterRange = headerValue(req, 'range')
+            const adapterContentType = headerValue(req, 'content-type')
+            let adapterBodyStream: import('node:stream').Readable | null = null
+            let adapterBodyGateError: Error | undefined
+            if (!bodylessMethod && adapterRoute.locator.in === 'json-body') {
+              adapterBodyStream = Readable.from(loopbackBody ?? Buffer.alloc(0))
+            } else if (!bodylessMethod) {
+              let pumped = 0
+              const gate = new Transform({
+                transform(chunk: Buffer, _encoding, callback) {
+                  pumped += chunk.length
+                  if (pumped > adapterRoute.maxBody) {
+                    callback(new Error('body-too-large'))
+                    return
+                  }
+                  callback(null, chunk)
+                },
+              })
+              gate.on('error', (error) => {
+                adapterBodyGateError = error
+                adapterHangUp.abort()
+              })
+              req.pipe(gate)
+              adapterBodyStream = gate
+            }
+            // The loopback: the coordinates travel VERBATIM, on purpose —
+            // the sub-client has already rewritten every located virtual id
+            // to its real half (query re-serialized, path segment
+            // re-encoded, JSON body re-serialized), so what the server
+            // validated (the share check below ran over the SAME locate)
+            // is byte-for-byte what the local plugin will see. Re-locating
+            // here would only risk divergence. The ONE exception is an
+            // explicit hook verdict (`query` above): the better-sidebar
+            // adapter strips the file/upload routes' `cwd` so the backend
+            // resolves it from the session.
+            const outbound = await bridge.loopback.request(
+              pluginMethod,
+              routePath,
+              adapterQueryOverride ?? rawQuery,
+              {
+                ...(adapterAccept !== undefined ? { accept: adapterAccept } : {}),
+                ...(adapterRange !== undefined ? { range: adapterRange } : {}),
+                ...(adapterContentType !== undefined ? { contentType: adapterContentType } : {}),
+              },
+              adapterBodyStream,
+              adapterHangUp.signal,
+            )
+            if (adapterBodyGateError !== undefined && !res.headersSent) {
+              relayPluginError(res, 413, 'body-too-large')
+              void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+              return
+            }
+            // The adapter header allowlist (PB-12): the HTML preview's CSP
+            // sandbox and download dispositions ride through to the phone.
+            // The loopback collected them into `extraHeaders`.
+            res.writeHead(outbound.status, {
+              ...(outbound.contentType !== undefined ? { 'Content-Type': outbound.contentType } : {}),
+              ...(outbound.contentLength !== undefined ? { 'Content-Length': outbound.contentLength } : {}),
+              ...(outbound.cacheControl !== undefined ? { 'Cache-Control': outbound.cacheControl } : {}),
+              ...outbound.extraHeaders,
+            })
+            await new Promise<void>((resolve, reject) => {
+              const upstream = outbound.stream
+              upstream.on('data', (chunk: Buffer) => {
+                if (adapterGone || res.destroyed || res.writableEnded) {
+                  upstream.destroy()
+                  return
+                }
+                if (!res.write(chunk)) {
+                  upstream.pause()
+                  res.once('drain', () => upstream.resume())
+                }
+              })
+              upstream.on('end', () => resolve())
+              upstream.on('error', reject)
+            })
+            await new Promise<void>((resolve) => {
+              if (res.writableEnded || res.destroyed) {
+                resolve()
+                return
+              }
+              const watchdog = setTimeout(() => {
+                try {
+                  res.destroy()
+                } catch {
+                  // Already gone.
+                }
+              }, endDrainTimeoutMs)
+              if (typeof watchdog.unref === 'function') watchdog.unref()
+              const settled = (): void => {
+                clearTimeout(watchdog)
+                resolve()
+              }
+              res.once('finish', settled)
+              res.once('close', settled)
+              res.end()
+            })
+          } catch (error) {
+            if (adapterHangUp.signal.aborted) {
+              try {
+                res.destroy()
+              } catch {
+                // Already gone.
+              }
+            } else if (isLoopbackAuthError(error)) {
+              relayPluginError(res, 502, 'loopback-auth')
+            } else if (!res.headersSent) {
+              relayPluginError(res, 502, 'internal')
+            } else {
+              try {
+                res.destroy()
+              } catch {
+                // Already gone.
+              }
+            }
+          } finally {
+            res.off('close', onAdapterGone)
+            res.off('error', onAdapterGone)
+            const remaining = (pluginsByDevice.get(adapterDevice) ?? 1) - 1
+            if (remaining <= 0) pluginsByDevice.delete(adapterDevice)
+            else pluginsByDevice.set(adapterDevice, remaining)
+          }
+          return
+        }
+        // A yielded adapter falls through: the cooperative chain's digest
+        // check refuses these stale coordinates below.
+      }
+      // ---- the validation chain, in order, first failure answers --------
+      // Steps 1/2/3 and 4-6 (registry, version+digest, the declared-route
+      // match — exact, or a prefix route's deeper RAW paths — the parse-once
+      // query, the share table, the consent wall) are SHARED with the tunnel
+      // open route — see validatePluginCall. This route's own extras are the
+      // method check (3b) and the body gate (3c) below. PB-24: a json-body
+      // route's body is consumed BY validating (the share wall reads the
+      // located id), bounded by the route's maxBody — the loopback then
+      // sends exactly that share-checked buffer, never a re-read.
+      const validation = await validatePluginCall(
+        bridge,
+        { pluginName, pluginVersion, pluginDigest, routePath, rawQuery },
+        isAccessible,
+        async (maxBody) => {
+          const chunks: Buffer[] = []
+          let size = 0
+          try {
+            for await (const chunk of req) {
+              size += (chunk as Buffer).length
+              if (size > maxBody) return { kind: 'over' as const }
+              chunks.push(Buffer.from(chunk as Uint8Array))
+            }
+          } catch {
+            // A read error (the client hung up mid-body) folds into the
+            // corrupt verdict — readJsonObject's `error` fold — never a
+            // throw into the host webserver's outer catch.
+            return { kind: 'corrupt' as const }
+          }
+          const buffered = Buffer.concat(chunks)
+          if (buffered.length === 0) return { kind: 'body' as const, buffered }
+          try {
+            return { kind: 'body' as const, buffered, parsed: JSON.parse(buffered.toString('utf8')) }
+          } catch {
+            return { kind: 'corrupt' as const }
+          }
+        },
+        headerValue(req, 'x-zen-remote-device') ?? '',
+      )
+      if (!validation.ok) {
+        relayPluginError(res, validation.status, validation.code)
+        // The reader's over-limit stop leaves the request half-read — the
+        // tail drains after the answer (the T51 discipline; only the reader
+        // can produce this code on this path).
+        if (validation.code === 'body-too-large') void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+        return
+      }
+      const route = validation.route
+      // 3b. (PB-9) the METHOD must be one the route declared — the write
+      //     surface is exactly as explicit as the read one was in 2.1: a
+      //     route that declared no `methods` forwards GET only, and an
+      //     undeclared method answers 405 rather than reaching the plugin.
+      if (!routeMethodsOf(route).includes(pluginMethod)) {
+        relayPluginError(res, 405, 'method-undeclared')
+        return
+      }
+      // 3c. (PB-9) the body gate: a declared Content-Length over the route's
+      //     `maxBody` refuses BEFORE a byte moves (the T51 pre-check
+      //     discipline — the tail is drained after the answer); a chunked
+      //     body carries no length header and is counted while it streams,
+      //     in the pump below. A json-body route skips this gate: its body
+      //     was already consumed and bounded by validating.
+      const maxBody = routeMaxBodyOf(route)
+      const declaredLength = Number(headerValue(req, 'content-length'))
+      if (!bodylessMethod && validation.bufferedBody === undefined && Number.isFinite(declaredLength) && declaredLength > maxBody) {
+        relayPluginError(res, 413, 'body-too-large')
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+        return
+      }
+      const params = validation.params
+      const normalizedQuery = validation.normalizedQuery
+      // 7. the per-device budget — taken only after every wall above, held
+      //    for the whole response stream, released in the finally.
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((pluginsByDevice.get(device) ?? 0) >= MAX_PLUGIN_REQUESTS_PER_DEVICE) {
+        relayPluginError(res, 429, 'busy')
+        return
+      }
+      pluginsByDevice.set(device, (pluginsByDevice.get(device) ?? 0) + 1)
+      // A sub-client hang-up cancels the loopback request mid-stream, like
+      // the invoke route's wiring; the pump below reads the same flag (and
+      // 'error' rides along, v1/stream's discipline).
+      let clientGone = false
+      // The counting gate's recorded failure (PB-9), read by the catch —
+      // declared here because the gate itself lives inside the try.
+      let bodyGateError: Error | undefined
+      const hangUp = new AbortController()
+      const onClientGone = (): void => {
+        clientGone = true
+        if (!res.writableEnded) hangUp.abort()
+      }
+      res.on('close', onClientGone)
+      res.on('error', onClientGone)
+      try {
+        const accept = headerValue(req, 'accept')
+        const range = headerValue(req, 'range')
+        const contentType = headerValue(req, 'content-type')
+        // The forwarded body (PB-9): the relay request's body streamed
+        // through a counting gate — node's pipe owns the backpressure, and
+        // the route's `maxBody` is enforced ON THE STREAM (a chunked body
+        // carries no length header, so the declared-length pre-check above
+        // could not see it). Past the cap the gate errors, which tears the
+        // loopback request down mid-write and lands as 413 below (headers
+        // not yet sent — the plugin's response cannot have arrived while we
+        // are still sending its request body).
+        let bodyStream: import('node:http').IncomingMessage | import('node:stream').Readable | null = null
+        // The gate's own failure must REACH the loopback request (tearing it
+        // down mid-write) and this route's catch — an unhandled Transform
+        // 'error' would crash the process instead. The dedicated abort
+        // signal does both: the loopback dials hang on it, and the catch
+        // reads the recorded error first.
+        const bodyAbort = new AbortController()
+        const bodySignal = AbortSignal.any([hangUp.signal, bodyAbort.signal])
+        if (validation.bufferedBody !== undefined) {
+          // PB-24: the json-body route's bytes were consumed by validating —
+          // the loopback sends exactly the share-checked buffer.
+          bodyStream = Readable.from(validation.bufferedBody)
+        } else if (!bodylessMethod) {
+          let pumped = 0
+          const gate = new Transform({
+            transform(chunk: Buffer, _encoding, callback) {
+              pumped += chunk.length
+              if (pumped > maxBody) {
+                req.pause()
+                callback(new Error('body-too-large'))
+                return
+              }
+              callback(null, chunk)
+            },
+          })
+          gate.on('error', (error) => {
+            if (bodyGateError === undefined) bodyGateError = error
+            bodyAbort.abort()
+          })
+          req.on('error', (error) => {
+            if (bodyGateError === undefined) bodyGateError = error
+            gate.destroy(error)
+          })
+          gate.on('close', () => { if (!res.writableEnded) req.pause() })
+          bodyStream = gate
+          req.pipe(gate)
+        }
+        const outbound = await bridge.loopback.request(
+          pluginMethod,
+          routePath,
+          normalizedQuery,
+          {
+            ...(accept !== undefined ? { accept } : {}),
+            ...(range !== undefined ? { range } : {}),
+            ...(contentType !== undefined ? { contentType } : {}),
+          },
+          bodyStream,
+          bodySignal,
+        )
+        // Success: status plus the three whitelisted headers travel, the
+        // body streams — and NO x-zen-remote-error (the marker is refusal-
+        // only, so the client can classify with one header read).
+        res.writeHead(outbound.status, {
+          ...(outbound.contentType !== undefined ? { 'Content-Type': outbound.contentType } : {}),
+          ...(outbound.contentLength !== undefined ? { 'Content-Length': outbound.contentLength } : {}),
+          ...(outbound.cacheControl !== undefined ? { 'Cache-Control': outbound.cacheControl } : {}),
+        })
+        // The pump: chunk-for-chunk with real backpressure — a full socket
+        // pauses the plugin's response instead of buffering it here, so a
+        // slow phone reads a big file without this process ever holding
+        // more than a socket buffer of it. Every chunk re-checks the
+        // response's liveness first (the v1/stream write discipline): a
+        // client that died mid-stream stops the pump on its next chunk
+        // instead of racing one more write into a dead socket, and a
+        // response 'error' (a write racing a destroyed socket surfaces
+        // there) reacts exactly like the hang-up.
+        let clientGoneSeen = false
+        await new Promise<void>((resolve, reject) => {
+          const upstream = outbound.stream
+          upstream.on('data', (chunk: Buffer) => {
+            if (clientGone || res.destroyed || res.writableEnded) {
+              upstream.destroy()
+              return
+            }
+            if (!res.write(chunk)) {
+              upstream.pause()
+              res.once('drain', () => upstream.resume())
+            }
+          })
+          upstream.on('end', () => resolve())
+          upstream.on('error', reject)
+        })
+        // The v1/stream finish discipline (T43-A): the tail is in the
+        // kernel's hands now, and a client that stopped reading must not
+        // pin this device slot forever — one watchdog, disarmed by `finish`
+        // (the honest drained signal) or `close`, destroys otherwise.
+        await new Promise<void>((resolve) => {
+          if (res.writableEnded || res.destroyed) {
+            resolve()
+            return
+          }
+          const watchdog = setTimeout(() => {
+            try {
+              res.destroy()
+            } catch {
+              // Already gone.
+            }
+          }, endDrainTimeoutMs)
+          if (typeof watchdog.unref === 'function') watchdog.unref()
+          const settled = (): void => {
+            clearTimeout(watchdog)
+            resolve()
+          }
+          res.once('finish', settled)
+          res.once('close', settled)
+          res.end()
+        })
+      } catch (error) {
+        if (!res.headersSent && bodyGateError !== undefined && bodyGateError.message === 'body-too-large') {
+          // The counting gate tripped mid-forward (PB-9): a chunked body
+          // past the route's `maxBody`. The plugin's answer cannot have
+          // started while we were still writing its request body, so the
+          // honest 413 still fits on the wire; the relay body's tail is
+          // drained after the answer, bounded and timed like every
+          // oversized read here.
+          relayPluginError(res, 413, 'body-too-large')
+          void drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+        } else if (hangUp.signal.aborted) {
+          // The sub-client is gone mid-stream: its socket is dead, and the
+          // abort already tore the loopback request down.
+          try {
+            res.destroy()
+          } catch {
+            // Already gone.
+          }
+        } else if (isLoopbackAuthError(error)) {
+          // The cookie could not be obtained (no token URL on this host, a
+          // failed exchange) — the relay's own wall, not a business answer.
+          relayPluginError(res, 502, 'loopback-auth')
+        } else if (!res.headersSent) {
+          // Any other loopback failure before the answer started (the web
+          // server moved, the plugin route crashed early) is this server's
+          // fault: the bare internal code, no message.
+          relayPluginError(res, 502, 'internal')
+        } else {
+          // Mid-stream failure with headers already on the wire: the status
+          // cannot be changed, so the response is cut — the client sees a
+          // truncated body, the honest shape of a broken stream.
+          try {
+            res.destroy()
+          } catch {
+            // Already gone.
+          }
+        }
+      } finally {
+        res.off('close', onClientGone)
+        res.off('error', onClientGone)
+        const remaining = (pluginsByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) pluginsByDevice.delete(device)
+        else pluginsByDevice.set(device, remaining)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/plugin-tunnel/open`) {
+      const tunnel = options.pluginBridge?.tunnel
+      if (tunnel === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      await tunnel.open(req, res)
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/plugin-tunnel/send`) {
+      const tunnel = options.pluginBridge?.tunnel
+      if (tunnel === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      await tunnel.send(req, res)
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/plugin-tunnel/close`) {
+      const tunnel = options.pluginBridge?.tunnel
+      if (tunnel === undefined) {
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      await tunnel.close(req, res)
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/upload`) {
+      // The binary upload channel (T51): the sub-client's wrapped
+      // `/api/session/uploadFileBinary` forwards a remote session's raw
+      // attachment bytes here, and this route dispatches them through the
+      // host's shared `/api` handler IN PROCESS — the same exact-fetch route
+      // entry the local upload would have reached, so the staged receipt
+      // lands under the same session the later `session/prompt` resolves it
+      // against. The body is a STREAM, not JSON: nothing here buffers it
+      // beyond the cap verdict, and the host's own upload route has no cap
+      // to inherit (see MAX_UPLOAD_BYTES), so this relay brings its own —
+      // Content-Length first, a counting pump as the chunked-body fallback.
+      //
+      // Refusal discipline (T51-fix): the two 413 paths answer FIRST — the
+      // status code plus `connection: close` are on the wire before a single
+      // tail byte is drained, so a client still pumping a huge body reads
+      // the refusal instead of a reset — and only then swallow a bounded,
+      // timed tail (drainUpload). The small-body refusals (query, access,
+      // budget, no dispatcher) keep the drain-first order: their clients are
+      // ordinary requests, and draining keeps the answer off a reset.
+      if (Number(req.headers['content-length']) > uploadCapBytes) {
+        res.setHeader('Connection', 'close')
+        responseJson(res, 413, PAYLOAD_TOO_LARGE)
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+        return
+      }
+      // The query is parsed ONCE (decideUploadQuery, the T41b-fix
+      // discipline): what was share-checked is exactly the normalized query
+      // the synthetic URL below is composed from — a duplicate sessionId, a
+      // tab-carrying key name, or a smuggled second coordinate can never
+      // re-enter between the check and the dispatch.
+      const decision = decideUploadQuery(new URL(req.url ?? '/', 'http://dsh.internal').search, isAccessible)
+      if (!decision.allow) {
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+        responseJson(res, decision.reason === 'not-shared' ? 403 : 400, { ok: false, error: { code: decision.reason } })
+        return
+      }
+      const dispatch = options.getApiFetch?.()
+      if (dispatch === undefined) {
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+        responseJson(res, 501, { ok: false, error: { code: 'unsupported' } })
+        return
+      }
+      // The per-device upload budget (T51-fix), checked after every wall
+      // above and released in the route's finally — one stalled client must
+      // not pin unbounded host uploads behind this route. An over-budget
+      // request is drained and refused without touching the counter. The
+      // slot itself is TAKEN only after the synthetic request below built
+      // (T5x): that construction is the one step between the check and the
+      // dispatch that can fail and return outside the finally, and a taken-
+      // then-abandoned slot would quietly shrink this device's budget.
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((uploadsByDevice.get(device) ?? 0) >= MAX_UPLOADS_PER_DEVICE) {
+        await drainUpload(req, 0, drainDeadlineMs, drainSlackBytes)
+        responseJson(res, 429, { ok: false, error: { code: 'too-many-uploads' } })
+        return
+      }
+      // A hang-up cancels the forward mid-stream, like invoke's — and the
+      // cap pump (pumpUploadBody) aborts the SAME controller when it trips,
+      // so an oversized upload dies at the host side the moment it is judged.
+      const hangUp = new AbortController()
+      const pump = pumpUploadBody(req, res, uploadCapBytes, hangUp)
+      let request: Request
+      try {
+        // The URL is composed from the DECISION's normalized query alone,
+        // and the content type is the one fact the host route mandates
+        // (RT dsh-client-file-upload lib/index.js:18) — set here, never
+        // copied from the wire.
+        const init: RequestInit = {
+          method: 'POST',
+          headers: { 'content-type': 'application/octet-stream' },
+          body: pump.body,
+          signal: hangUp.signal,
+        }
+        // `duplex: 'half'` is mandatory for a streaming request body; the
+        // resolved RequestInit type hides the field (the DOM-vs-undici
+        // conditional in @types/node), so the assignment carries its own
+        // cast.
+        ;(init as { duplex?: string }).duplex = 'half'
+        request = new Request(`http://relay.local${UPLOAD_HTTP_PATH}?${decision.query}`, init)
+      } catch {
+        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+        return
+      }
+      // Construction succeeded — from here every exit runs the finally, so
+      // the slot is safe to take (T5x).
+      uploadsByDevice.set(device, (uploadsByDevice.get(device) ?? 0) + 1)
+      try {
+        const upstream = await dispatch(request)
+        // The host's upload route answers buffered JSON in every branch (RT
+        // dsh-client-file-upload lib/index.js:49-55), so the receipt reads
+        // out in full. The status + content type + body ride back VERBATIM
+        // inside the success envelope — the same wrapper the
+        // `relay/v1/http` route uses — so a 200-with-failure-envelope
+        // business answer keeps its code AND its structured details on this
+        // wire, and the sub-client reconstructs the exact Response its UI
+        // would have seen locally.
+        const bodyText = await upstream.text()
+        if (pump.tooLarge()) {
+          res.setHeader('Connection', 'close')
+          responseJson(res, 413, PAYLOAD_TOO_LARGE)
+          await drainUpload(req, pump.received(), drainDeadlineMs, drainSlackBytes)
+          return
+        }
+        const contentType = upstream.headers.get('content-type') ?? undefined
+        responseJson(res, 200, {
+          ok: true,
+          value: { status: upstream.status, ...(contentType !== undefined ? { contentType } : {}), body: bodyText },
+        })
+      } catch {
+        // A dispatch failure is this server's fault (or the hang-up's), not
+        // a business answer — errorOf keeps any message off the wire. The
+        // cap verdict outranks it: the abort the pump sent INTO the dispatch
+        // surfaces here as a throw, and the client still gets its 413
+        // (before the tail drain, like every oversize answer).
+        if (pump.tooLarge()) {
+          res.setHeader('Connection', 'close')
+          responseJson(res, 413, PAYLOAD_TOO_LARGE)
+          await drainUpload(req, pump.received(), drainDeadlineMs, drainSlackBytes)
+          return
+        }
+        responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+      } finally {
+        pump.detach()
+        // The upload is over — answered, refused mid-flight, or its client
+        // gone: the budget slot goes back (T51-fix).
+        const remaining = (uploadsByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) uploadsByDevice.delete(device)
+        else uploadsByDevice.set(device, remaining)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/stream-uplink`) {
+      // The duplex uplink's post route (TA-1): one JSON body of frames for a
+      // stream opened with `uplink: true`, resolved against the live-uplink
+      // table. Four walls in order, each with its own status: the shape
+      // (400), the stream id and its owning device (404 — unknown-stream,
+      // deliberately indistinguishable between "no such stream" and "not
+      // yours", so a foreign device learns nothing), the share table at post
+      // time (403 — an unshared session's keystrokes must die with the
+      // share), and the sequence counter (409 — replays and reordered posts
+      // would corrupt the host's own input sequencing).
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const streamId = body.streamId
+      const seq = body.seq
+      const items = body.items
+      const end = body.end
+      if (
+        typeof streamId !== 'string' ||
+        streamId === '' ||
+        typeof seq !== 'number' ||
+        !Number.isSafeInteger(seq) ||
+        seq < 1 ||
+        (items !== undefined && !Array.isArray(items)) ||
+        (end !== undefined && typeof end !== 'boolean') ||
+        !((Array.isArray(items) && items.length > 0) || end === true)
+      ) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      const entry = liveUplinkStreams.get(streamId)
+      if (entry === undefined || entry.device !== device) {
+        responseJson(res, 404, { ok: false, error: { code: 'unknown-stream' } })
+        return
+      }
+      if (!entry.sessionIds.every((id) => isAccessible(id))) {
+        responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        return
+      }
+      if (seq !== entry.nextSeq) {
+        responseJson(res, 409, { ok: false, error: { code: 'out-of-order' } })
+        return
+      }
+      entry.nextSeq += 1
+      if (Array.isArray(items)) {
+        for (const item of items) {
+          const itemBytes = Buffer.byteLength(JSON.stringify(item) ?? '', 'utf8')
+          const status = entry.queue.push(item, itemBytes)
+          if (status === 'after-end') {
+            responseJson(res, 400, { ok: false, error: { code: 'uplink-after-end' } })
+            return
+          }
+          if (status === 'overflow') {
+            responseJson(res, 413, { ok: false, error: { code: 'uplink-overflow' } })
+            return
+          }
+        }
+      }
+      if (end === true) entry.queue.end()
+      responseJson(res, 200, { ok: true })
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/session-snapshot`) {
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const reqObj = isPlainObject(body.request) ? body.request : body
+      let knownCursor: number | undefined
+      if (body.knownCursor !== undefined) {
+        if (!isValidKnownCursor(body.knownCursor)) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        knownCursor = body.knownCursor
+      }
+      const cleanRequest: Record<string, unknown> = {
+        address: reqObj.address,
+      }
+      if (reqObj.maxMessages !== undefined) {
+        if (typeof reqObj.maxMessages !== 'number' || !Number.isSafeInteger(reqObj.maxMessages) || reqObj.maxMessages < 1) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        cleanRequest.maxMessages = reqObj.maxMessages
+      }
+      if (reqObj.turnWindow !== undefined) {
+        if (!isPlainObject(reqObj.turnWindow)) {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        const tw: Record<string, unknown> = {}
+        if (reqObj.turnWindow.minMessages !== undefined) {
+          if (
+            typeof reqObj.turnWindow.minMessages !== 'number' ||
+            !Number.isSafeInteger(reqObj.turnWindow.minMessages) ||
+            reqObj.turnWindow.minMessages < 0
+          ) {
+            responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+            return
+          }
+          tw.minMessages = reqObj.turnWindow.minMessages
+        }
+        if (reqObj.turnWindow.minTurns !== undefined) {
+          if (
+            typeof reqObj.turnWindow.minTurns !== 'number' ||
+            !Number.isSafeInteger(reqObj.turnWindow.minTurns) ||
+            reqObj.turnWindow.minTurns < 0
+          ) {
+            responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+            return
+          }
+          tw.minTurns = reqObj.turnWindow.minTurns
+        }
+        cleanRequest.turnWindow = tw
+      }
+      if (reqObj.assistantStream !== undefined) {
+        if (typeof reqObj.assistantStream !== 'boolean') {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+          return
+        }
+        cleanRequest.assistantStream = reqObj.assistantStream
+      } else {
+        cleanRequest.assistantStream = true
+      }
+
+      const decision = decideStream('session', 'follow', { request: cleanRequest }, isAccessible)
+      if (!decision.allow) {
+        if (decision.reason === 'not-shared') {
+          responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+        } else {
+          responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        }
+        return
+      }
+
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((snapshotsByDevice.get(device) ?? 0) >= MAX_SNAPSHOTS_PER_DEVICE || activeSnapshotsTotal >= MAX_SNAPSHOTS_GLOBAL) {
+        responseJson(res, 429, { ok: false, error: { code: 'too-many-snapshots' } })
+        return
+      }
+      snapshotsByDevice.set(device, (snapshotsByDevice.get(device) ?? 0) + 1)
+      activeSnapshotsTotal += 1
+
+      const hangUp = new AbortController()
+      const onClientGone = (): void => {
+        if (!res.writableEnded) hangUp.abort()
+      }
+      res.on('close', onClientGone)
+      res.on('error', onClientGone)
+      const killSnapshot = (): void => {
+        hangUp.abort()
+      }
+      openStreamKills.add(killSnapshot)
+
+      let iterator: AsyncIterator<unknown> | undefined
+      try {
+        if (serverClosedReason !== null) {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+          return
+        }
+        const iterable = await gateway.stream(
+          withPeer(
+            {
+              namespace: 'session',
+              method: 'follow',
+              args: { request: cleanRequest },
+              signal: hangUp.signal,
+            },
+            options.getPeer,
+          ),
+        )
+        iterator = iterable[Symbol.asyncIterator]()
+        // Pull ONLY the opening snapshot frame and return immediately so
+        // SessionHistoryController.follow pauses before promote().
+        const first = await iterator.next()
+        await Promise.resolve(iterator.return?.()).catch(() => {})
+        iterator = undefined
+
+        if (hangUp.signal.aborted || res.writableEnded || res.destroyed) return
+        if (serverClosedReason !== null) {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+          return
+        }
+        if (!decision.sessionIds.every((id) => isAccessible(id))) {
+          responseJson(res, 403, { ok: false, error: { code: 'not-shared' } })
+          return
+        }
+        if (first.done || !isPlainObject(first.value) || first.value.type !== 'snapshot') {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+          return
+        }
+        const evaluated = evaluateKnownCursor(first.value, knownCursor)
+        const value = evaluated.mode === 'full' ? { mode: 'full', snapshot: evaluated.snapshot } : evaluated
+        await responseCompressedJson(req, res, 200, { ok: true, value })
+      } catch {
+        if (!hangUp.signal.aborted && !res.writableEnded && !res.destroyed && !res.headersSent) {
+          responseJson(res, 502, { ok: false, error: { code: 'internal' } })
+        }
+      } finally {
+        if (iterator !== undefined) {
+          await Promise.resolve(iterator.return?.()).catch(() => {})
+        }
+        openStreamKills.delete(killSnapshot)
+        res.off('close', onClientGone)
+        res.off('error', onClientGone)
+        const remaining = (snapshotsByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) snapshotsByDevice.delete(device)
+        else snapshotsByDevice.set(device, remaining)
+        activeSnapshotsTotal = Math.max(0, activeSnapshotsTotal - 1)
+      }
+      return
+    }
+
+    if (req.method === 'POST' && pathname === `${RELAY_PREFIX}/v1/stream`) {
+      // Body validation identical to invoke: one JSON object naming the
+      // method and carrying object args.
+      const body = await readBodyOrRespond(req, res)
+      if (body === undefined) return
+      const namespace = body.namespace
+      const method = body.method
+      const args = body.args
+      if (
+        typeof namespace !== 'string' ||
+        namespace === '' ||
+        typeof method !== 'string' ||
+        method === '' ||
+        args === null ||
+        typeof args !== 'object' ||
+        Array.isArray(args)
+      ) {
+        responseJson(res, 400, { ok: false, error: { code: 'bad-request' } })
+        return
+      }
+      const decision = decideStream(namespace, method, args, isAccessible)
+      const streamKnownCursor =
+        namespace === 'session' && method === 'follow' && isValidKnownCursor(body.knownCursor)
+          ? body.knownCursor
+          : undefined
+      if (!decision.allow) {
+        // Refusals are plain JSON: the NDJSON protocol only starts once the
+        // stream is allowed, so a 403 here is the same shape invoke answers.
+        responseJson(res, 403, { ok: false, error: { code: decision.reason } })
+        return
+      }
+      // TA-1: the client's advertised uplink window, shape-checked ONCE here —
+      // only a well-formed window travels to the gateway; garbage (a zero or
+      // negative budget, a fractional value) is dropped, never refused: the
+      // numbers are the host's own contract with itself, and a missing one
+      // just means the host default applies.
+      let uplinkWindow: RelayUplinkWindow | undefined
+      if (isPlainObject(body.uplinkWindow)) {
+        const candidate = body.uplinkWindow
+        if (
+          typeof candidate.maxBytes === 'number' &&
+          Number.isSafeInteger(candidate.maxBytes) &&
+          candidate.maxBytes > 0 &&
+          typeof candidate.frameOverheadBytes === 'number' &&
+          Number.isSafeInteger(candidate.frameOverheadBytes) &&
+          candidate.frameOverheadBytes >= 0
+        ) {
+          uplinkWindow = { maxBytes: candidate.maxBytes, frameOverheadBytes: candidate.frameOverheadBytes }
+        }
+      }
+      const device = headerValue(req, 'x-zen-remote-device') ?? ''
+      if ((streamsByDevice.get(device) ?? 0) >= MAX_STREAMS_PER_DEVICE) {
+        responseJson(res, 429, { ok: false, error: { code: 'too-many-streams' } })
+        return
+      }
+      streamsByDevice.set(device, (streamsByDevice.get(device) ?? 0) + 1)
+      try {
+        // `job/follow` proves job ownership before anything is streamed (4b) —
+        // same check, same refusal as `job/kill` on the invoke route.
+        if (namespace === 'job' && method === 'follow') {
+          const request = isPlainObject(args) ? args.request : undefined
+          const jobId =
+            isPlainObject(request) && typeof request.jobId === 'string' && request.jobId !== ''
+              ? request.jobId
+              : undefined
+          const sessionId = decision.sessionIds[0] ?? ''
+          if (jobId === undefined || sessionId === '' || !(await ownsJob(sessionId, jobId, hangUpOf(res)))) {
+            responseJson(res, 403, { ok: false, error: { code: 'forbidden' } })
+            return
+          }
+        }
+
+        // Headers that keep every intermediary from buffering the line
+        // stream: DSH's web server runs a compression middleware that would
+        // hold the response until it is complete (it skips responses marked
+        // `no-transform`), and nginx keeps buffering unless told otherwise.
+        // Flushed immediately, so the client sees 200 + content type before
+        // the first upstream frame exists.
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8')
+        res.setHeader('Cache-Control', 'no-store, no-transform')
+        res.setHeader('X-Accel-Buffering', 'no')
+        res.setHeader('X-Content-Type-Options', 'nosniff')
+        res.flushHeaders()
+
+        let clientGone = false
+        let finished = false
+        const hangUp = new AbortController()
+        const onClientGone = (): void => {
+          if (!res.writableEnded) {
+            clientGone = true
+            hangUp.abort()
+          }
+        }
+        // 'error' rides along because a write racing a destroyed socket
+        // surfaces there first; the reaction is the same as a hang-up.
+        res.on('close', onClientGone)
+        res.on('error', onClientGone)
+
+        const heartbeat = setInterval(() => {
+          if (!finished && !clientGone) {
+            // T59: a PER-STREAM ping carrying the names as of NOW. The
+            // server's display name is re-read live per tick (a host rename
+            // reaches every connected client within one heartbeat), and the
+            // device name comes from the learned cache (updated by that
+            // device's every request) — the old shared PING_LINE constant
+            // could carry neither.
+            const deviceName = deviceNames.get(device)
+            const line = JSON.stringify({
+              type: 'ping',
+              serverName: currentServerName(),
+              ...(deviceName !== undefined ? { deviceName } : {}),
+            })
+            res.write(Buffer.from(`${line}\n`, 'utf8'))
+          }
+        }, heartbeatMs)
+        // The host process must never be kept alive by a heartbeat alone.
+        if (typeof heartbeat.unref === 'function') heartbeat.unref()
+
+        /**
+         * One NDJSON line, honoring backpressure: when the socket buffer is
+         * full the write returns false and the caller waits for `drain`
+         * before the next write runs. A line racing a disconnect resolves
+         * without writing (the 'close' leg of the wait). `tail` exempts the
+         * line closeWith is writing from its own finished gate — without it
+         * the end/error line would silence itself.
+         *
+         * Every write goes through ONE promise chain (T22b-fix): share-change
+         * frames are enqueued behind whatever the pump is draining instead of
+         * `void`-ing into the socket buffer in parallel, so a burst of
+         * synthesized frames neither interleaves the pump's write/drain
+         * cycles nor grows the buffer unboundedly.
+         */
+        const clientAcceptsGzip = acceptsZrGzip(req)
+        let writeChain: Promise<void> = Promise.resolve()
+        const writeLine = (value: unknown, tail = false): Promise<void> => {
+          const run = writeChain.then(async () => {
+            if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
+            const lineText = JSON.stringify(value)
+            let outBytes = Buffer.from(`${lineText}\n`, 'utf8')
+            // Compression MUST run serially inside writeChain so a slow gzip
+            // of a large snapshot never gets overtaken by a small event or end tail.
+            if (
+              clientAcceptsGzip &&
+              !tail &&
+              outBytes.byteLength - 1 >= ZR_GZIP_MIN_BYTES &&
+              isPlainObject(value) &&
+              value.type === 'frame'
+            ) {
+              try {
+                const gzBuf = await gzipAsync(outBytes.subarray(0, outBytes.byteLength - 1), { level: 1 })
+                const wrapped = `${JSON.stringify({ type: 'gz', b64: gzBuf.toString('base64') })}\n`
+                if (wrapped.length < outBytes.byteLength) {
+                  outBytes = Buffer.from(wrapped, 'utf8')
+                }
+              } catch {
+                // Fall back to uncompressed line on unexpected zlib failure.
+              }
+            }
+            if ((!tail && finished) || clientGone || res.destroyed || res.writableEnded) return
+            return new Promise<void>((resolve) => {
+              if (res.write(outBytes)) {
+                resolve()
+                return
+              }
+              let settle = (): void => {}
+              const onDrain = (): void => settle()
+              const onClose = (): void => settle()
+              settle = (): void => {
+                res.off('drain', onDrain)
+                res.off('close', onClose)
+                resolve()
+              }
+              res.on('drain', onDrain)
+              res.on('close', onClose)
+            })
+          })
+          writeChain = run.then(
+            () => undefined,
+            () => undefined,
+          )
+          return run
+        }
+
+        /**
+         * The one transition into "response over": idempotent, clears the
+         * heartbeat, writes the optional tail line, then ends the response.
+         *
+         * T43-A/fix: a client that stopped reading must not pin the stream —
+         * with it the viewer count and the device budget — forever. The
+         * watchdog starts UNCONDITIONALLY and owns the whole finish: the
+         * response either FINISHES (tail line and end-of-body handed to the
+         * socket — the `finish` event disarms the timer) or is gone
+         * (`close`), or it is destroyed after `endDrainTimeoutMs`. No
+         * branching on `writableNeedDrain`: a write that returned true can
+         * still be sitting in front of a full kernel buffer, and `finish`
+         * is the only honest "it drained" signal.
+         */
+        const closeWith = (line: Record<string, unknown> | null): void => {
+          if (finished) return
+          finished = true
+          clearInterval(heartbeat)
+          let watchdog: ReturnType<typeof setTimeout> | undefined
+          const stopWatchdog = (): void => {
+            res.off('finish', onSettled)
+            res.off('close', onSettled)
+            if (watchdog !== undefined) {
+              clearTimeout(watchdog)
+              watchdog = undefined
+            }
+          }
+          const onSettled = (): void => {
+            stopWatchdog()
+          }
+          if (!clientGone && !res.destroyed && !res.writableEnded) {
+            res.once('finish', onSettled)
+            res.once('close', onSettled)
+            watchdog = setTimeout(() => {
+              watchdog = undefined
+              res.off('finish', onSettled)
+              res.off('close', onSettled)
+              // The tail is somewhere in the buffers but the client never
+              // reads: destroying is the only way this response (and its
+              // counters) ever finishes.
+              try {
+                res.destroy()
+              } catch {
+                // Already gone.
+              }
+            }, endDrainTimeoutMs)
+            // The host process must never be kept alive by a finish alone.
+            if (typeof watchdog.unref === 'function') watchdog.unref()
+          }
+          const tailLine = line === null ? Promise.resolve() : writeLine(line, true)
+          void tailLine.then(() => {
+            if (!clientGone && !res.destroyed && !res.writableEnded) res.end()
+          })
+        }
+
+        // ---- TA-1: the duplex uplink -------------------------------------
+        // A duplex decision the client took up: build the bounded queue the
+        // gateway will read keystrokes from, register it for the
+        // /v1/stream-uplink route, and send the handshake line FIRST —
+        // before the upstream is even open — so the client may start posting
+        // the moment it sees the id. The write chain serializes the line
+        // ahead of any frame; registration precedes the open so a post that
+        // races the handshake still finds the entry (its seq order and the
+        // share table keep it honest either way).
+        let uplinkStreamId: string | undefined
+        let uplinkQueue: RelayUplinkQueue | undefined
+        if (decision.uplink === true && body.uplink === true) {
+          uplinkStreamId = randomBytes(16).toString('hex')
+          uplinkQueue = new RelayUplinkQueue(MAX_STREAM_UPLINK_BYTES, () => hangUp.abort())
+          liveUplinkStreams.set(uplinkStreamId, {
+            streamId: uplinkStreamId,
+            device,
+            sessionIds: decision.sessionIds,
+            nextSeq: 1,
+            queue: uplinkQueue,
+            abort: () => hangUp.abort(),
+          })
+          void writeLine({ type: 'uplink', streamId: uplinkStreamId })
+        }
+
+        // ---- share-change synchronization (T22b §4) --------------------
+
+        // The `$zr/events` forwarding bookkeeping (T32): registered for the
+        // answer route the moment this stream starts being served, removed
+        // in the pump's finally. The token is baked into every forwarded
+        // eventId and binds the answers to THIS subscription; the device
+        // binds them to THIS connection's pairing.
+        const eventsSub: EventsSubscription | undefined =
+          decision.events === true
+            ? { device, token: randomBytes(8).toString('hex'), clientId: undefined, events: new Map() }
+            : undefined
+        if (eventsSub !== undefined) liveEventSubscriptions.add(eventsSub)
+
+        let unsubscribe = (): void => {}
+        let applyToState: ((frame: unknown) => void) | undefined
+        let forgeState: ForgeStatesState | undefined
+        let companionAbort: AbortController | undefined
+
+        if (decision.filter === 'workspace') {
+          // Keep the UNFILTERED latest workspace state so share changes can
+          // synthesize exactly the frames the client is now allowed to see.
+          const state = createWorkspaceFollowState()
+          applyToState = (frame) => state.apply(frame)
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'shared' && event.type !== 'unshared') return
+            if (finished || clientGone) return
+            for (const frame of state.onShareChange(event.sessionId, isAccessible)) {
+              void writeLine({ type: 'frame', frame })
+            }
+          })
+        } else if (decision.filter === 'control') {
+          // A newly shared session needs its current projections: fetch
+          // them once and emit one synthesized `projection` frame per key in
+          // the dual shape both DSH generations read (per-key key/value for
+          // ≤ 0.2.2-alpha.2, a one-entry `changes` list for ≥ alpha.3). An unshared session
+          // synthesizes nothing — the client drops it via the workspace
+          // stream's re-filtered upserts.
+          const syncProjections = async (sessionId: string): Promise<void> => {
+            let result: unknown
+            try {
+              result = await gateway.invoke(withPeer({
+                namespace: 'session',
+                method: 'projections',
+                args: { request: { sessionId } },
+                signal: hangUp.signal,
+              }, options.getPeer))
+            } catch {
+              return // projections unavailable — the next live projection frame will flow anyway
+            }
+            if (!isPlainObject(result) || finished || clientGone || !isAccessible(sessionId)) return
+            if (typeof result.asOfSeq !== 'number' || !Number.isSafeInteger(result.asOfSeq) || result.asOfSeq < 0) return
+            const values = isPlainObject(result.values) ? result.values : {}
+            const seq = result.asOfSeq
+            for (const key of Object.keys(values)) {
+              void writeLine({ type: 'frame', frame: controlProjectionFrame(sessionId, key, values[key], seq) })
+            }
+          }
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'shared' || finished || clientGone) return
+            void syncProjections(event.sessionId)
+          })
+        } else if (decision.filter === 'forge-states') {
+          const state = createForgeStatesState()
+          forgeState = state
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'shared' && event.type !== 'unshared') return
+            if (finished || clientGone) return
+            for (const frame of state.onShareChange(isAccessible)) {
+              void writeLine({ type: 'frame', frame })
+            }
+          })
+        } else if (eventsSub !== undefined) {
+          // `$zr/events` (T32-fix): the share table closing a session must
+          // also close the prompts this subscription is showing for it —
+          // synthesize the same cancel frame the gateway would have sent
+          // and drop the registry entry, so the sub-client closes the
+          // prompt and a late answer refuses unknown-event (which the
+          // client turns into the same silent ok DSH gives a stale
+          // result). The relay's OWN delivery is deliberately NOT abstained
+          // away (T32-fix2, see filterEventsFrame's DROPPED DELIVERIES): it
+          // stays pending at the gateway, still answerable by the server
+          // UI or a future subscriber. Events of still-reachable sessions
+          // are untouched; nothing is synthesized on a share (the known
+          // limitation in filterEventsFrame's comment).
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'unshared' || finished || clientGone) return
+            for (const [eventId, agentId] of [...eventsSub.events]) {
+              if (isAccessible(agentId)) continue
+              eventsSub.events.delete(eventId)
+              void writeLine({
+                type: 'frame',
+                frame: { type: 'cancel', eventId: `${eventsSub.token}.${eventId}` },
+              })
+            }
+          })
+        } else {
+          // Session-scoped stream: count its viewers, and die loudly when
+          // a dependency stops being shared — silence would leave the
+          // client reading a session it can no longer reach.
+          for (const id of decision.sessionIds) viewers.set(id, (viewers.get(id) ?? 0) + 1)
+          unsubscribe = store.subscribe((event) => {
+            if (event.type !== 'unshared' || finished || clientGone) return
+            if (decision.sessionIds.every((id) => isAccessible(id))) return
+            closeWith({
+              type: 'error',
+              error: {
+                code: 'unshared',
+                message: `shared session ${event.sessionId} was unshared (${event.reason})`,
+                // T34: the structured close reason beside the message string —
+                // the sub-client's closed-session display keys on this field.
+                reason: event.reason,
+              },
+            })
+            hangUp.abort()
+          })
+        }
+
+        const filterFrame: (frame: unknown) => unknown =
+          eventsSub !== undefined
+            ? (frame) => filterEventsFrame(eventsSub, frame)
+            : decision.filter === 'workspace'
+              ? (frame) => filterWorkspaceFrame(frame, isAccessible)
+              : decision.filter === 'control'
+                ? (frame) => filterControlFrame(frame, isAccessible)
+                : decision.filter === 'forge-states'
+                  ? (frame) => forgeState!.filterUpstreamFrame(frame, isAccessible)
+                  : namespace === 'job' && method === 'list'
+                    // 4b: ownerless and foreign jobs stay server-side.
+                    ? (frame) => filterJobListFrame(frame, ownerSessionIdOf(args))
+                    : (frame) => frame
+
+        // closeAll's kill switch for THIS stream: idempotent, safe to call on
+        // an already-finished stream. Registered only while the response is
+        // being served; the pump's finally unregisters it.
+        const killThisStream = (): void => {
+          hangUp.abort()
+          const reason = serverClosedReason
+          closeWith(
+            reason === null || reason === ''
+              ? { type: 'error', error: { code: 'server-restart' } }
+              : { type: 'error', error: { code: 'server-restart', message: reason } },
+          )
+        }
+        openStreamKills.add(killThisStream)
+        // Registered beside the kill switch: closeAll detaches the stream's
+        // share-table listener synchronously, before the pump's own teardown
+        // gets a turn (T43-B).
+        tableUnsubscribers.add(unsubscribe)
+
+        // Last gate before anything is opened (T22b-fix): both checks cover
+        // the window the ownership probe (or any earlier await) opened — an
+        // unshare or a closeAll during that window fires no event this stream
+        // could have observed, so the CURRENT state decides.
+        const firstInaccessible = decision.sessionIds.find((id) => !isAccessible(id))
+        const restartReason = serverClosedReason
+
+        try {
+          if (restartReason !== null) {
+            // The handler was closed while this request was still deciding —
+            // nothing may open anymore.
+            killThisStream()
+          } else if (firstInaccessible !== undefined) {
+            hangUp.abort()
+            closeWith({
+              type: 'error',
+              // No share-table event was observed on this stream (the session
+              // was already unshared while the request was deciding — e.g.
+              // inside the job ownership probe): the close reason degrades to
+              // the manual close, the only fact that is certain here.
+              error: { code: 'unshared', reason: 'manual', message: `shared session ${firstInaccessible} is no longer shared` },
+            })
+          } else {
+            // `$zr/events` opens through the wire adapter (the ONLY door to
+            // the forwarded-event stream); every other route is a typert
+            // stream method. TA-1: a duplex stream rides with its uplink
+            // queue (the field's PRESENCE is the duplex flag the gateway
+            // reads) and the shape-checked window, both optional.
+            if (forgeState !== undefined) {
+              companionAbort = new AbortController()
+              if (hangUp.signal.aborted) companionAbort.abort()
+              else hangUp.signal.addEventListener('abort', () => companionAbort?.abort(), { once: true })
+              try {
+                const listValue = await gateway.invoke(withPeer({
+                  namespace: 'session',
+                  method: 'list',
+                  args: { _request: {} },
+                  signal: companionAbort.signal,
+                }, options.getPeer))
+                forgeState.seedFromSessionList(listValue)
+              } catch {
+                // Best-effort seed; companion session/control below also streams baseline.
+              }
+              void (async () => {
+                try {
+                  const ctrl = await gateway.stream(withPeer({
+                    namespace: 'session',
+                    method: 'control',
+                    args: {},
+                    signal: companionAbort!.signal,
+                  }, options.getPeer))
+                  for await (const cf of ctrl) {
+                    if (finished || clientGone || companionAbort!.signal.aborted) break
+                    for (const out of forgeState!.applyControlFrame(cf, isAccessible)) {
+                      void writeLine({ type: 'frame', frame: out })
+                    }
+                  }
+                } catch {
+                  // Companion control stream is best-effort for live binding updates.
+                }
+              })()
+            }
+            const iterable =
+              eventsSub !== undefined
+                ? await openEventsStream(hangUp.signal)
+                : await gateway.stream(
+                    withPeer(
+                      {
+                        namespace,
+                        method,
+                        args,
+                        signal: hangUp.signal,
+                        ...(uplinkQueue !== undefined ? { uplink: uplinkQueue } : {}),
+                        ...(uplinkWindow !== undefined ? { uplinkWindow } : {}),
+                      },
+                      options.getPeer,
+                    ),
+                  )
+            let isFirstFrame = true
+            for await (const frame of iterable) {
+              if (finished || clientGone) break
+              if (namespace === 'job' && method === 'list') rememberJobs(ownerSessionIdOf(args), frame)
+              applyToState?.(frame)
+              const filtered = filterFrame(frame)
+              if (filtered === null) continue
+              let outFrame = filtered
+              if (isFirstFrame) {
+                isFirstFrame = false
+                if (streamKnownCursor !== undefined) {
+                  const evaluated = evaluateKnownCursor(filtered, streamKnownCursor)
+                  if (evaluated.mode !== 'full') {
+                    outFrame = { type: 'snapshot-sync', ...evaluated }
+                  }
+                }
+              }
+              await writeLine({ type: 'frame', frame: outFrame })
+            }
+            closeWith({ type: 'end' })
+          }
+        } catch (error) {
+          if (hangUp.signal.aborted || clientGone) {
+            // The abort a hang-up (or an unshare kill) sends into the
+            // iterator surfaces as gateway/cancelled — that is the stream's
+            // DOCUMENTED normal end, swallowed whole.
+            closeWith(null)
+          } else {
+            closeWith({ type: 'error', error: errorEnvelopeOf(error).error })
+          }
+        } finally {
+          companionAbort?.abort()
+          openStreamKills.delete(killThisStream)
+          clearInterval(heartbeat)
+          unsubscribe()
+          tableUnsubscribers.delete(unsubscribe)
+          // TA-1: the uplink half dies with the stream — deregistered BEFORE
+          // the queue closes, so a post racing the teardown answers
+          // unknown-stream instead of feeding a dead queue, and the gateway's
+          // consumer is finished instead of parked forever.
+          if (uplinkStreamId !== undefined) liveUplinkStreams.delete(uplinkStreamId)
+          uplinkQueue?.close()
+          if (eventsSub !== undefined) {
+            liveEventSubscriptions.delete(eventsSub)
+            eventsSub.events.clear()
+          }
+          res.off('close', onClientGone)
+          res.off('error', onClientGone)
+          if (decision.filter === undefined) {
+            for (const id of decision.sessionIds) {
+              const remaining = (viewers.get(id) ?? 1) - 1
+              if (remaining <= 0) viewers.delete(id)
+              else viewers.set(id, remaining)
+            }
+          }
+        }
+      } finally {
+        const remaining = (streamsByDevice.get(device) ?? 1) - 1
+        if (remaining <= 0) streamsByDevice.delete(device)
+        else streamsByDevice.set(device, remaining)
+      }
+      return
+    }
+
+    responseJson(res, 404, { ok: false, error: { code: 'not-found' } })
+  }
+
+  handle.viewerCount = (sessionId: string): number => viewers.get(sessionId) ?? 0
+  handle.closeAll = (reason: string): void => {
+    // Detach EVERY share-table listener first (T43-B): after this point the
+    // dead handler must not be reached by any share/unshare — not even by a
+    // stream whose pump is parked on a full socket buffer and whose own
+    // teardown still awaits the 'close' the kills below cause. Calling an
+    // unsubscribe twice is a no-op, so the pumps' finallys stay honest.
+    for (const detach of [...tableUnsubscribers]) detach()
+    tableUnsubscribers.clear()
+    // The event-forwarding registries go with them (T32): after closeAll no
+    // answer may still compose a payload for a dead handler's clientId —
+    // the streams' own finallys would clear theirs, but only after their
+    // teardown unwinds, and an answer could slip into that window.
+    for (const sub of liveEventSubscriptions) {
+      sub.clientId = undefined
+      sub.events.clear()
+    }
+    liveEventSubscriptions.clear()
+    // TA-1: the duplex uplinks die with the handler — close() finishes every
+    // parked gateway consumer (a terminal read must not hang on a reload)
+    // and later posts answer unknown-stream; the streams' own finallys then
+    // find their entries already gone and delete nothing.
+    for (const entry of liveUplinkStreams.values()) entry.queue.close()
+    liveUplinkStreams.clear()
+    // Remember the reason for requests still inside their ownership probe —
+    // they read it at the pre-open gate. Killing the open streams runs their
+    // normal teardown (error line, res.end, abort), whose finally releases
+    // the viewer/device counters and the share-table listeners.
+    serverClosedReason = typeof reason === 'string' ? reason : ''
+    for (const kill of [...openStreamKills]) kill()
+    openStreamKills.clear()
+  }
+  return handle
+}
+
+/** The claimed session of a `job/list` subscription — decideStream has
+ * already verified it is a non-empty shared id; anything else is '' and the
+ * job filter then keeps nothing. */
+function ownerSessionIdOf(args: unknown): string {
+  const request = isPlainObject(args) ? args.request : undefined
+  return isPlainObject(request) && typeof request.sessionId === 'string' ? request.sessionId : ''
+}
+
+// The `dsh-session:` codec and the shared scan rule live in ONE module the
+// sub-client's interceptor imports too (session-reference.ts, T41a-fix2) —
+// re-exported here so the server's public surface keeps carrying them.
+export {
+  SESSION_REFERENCE_URI,
+  collectReferenceTexts,
+  decodeSessionReferenceUri,
+  encodeSessionReferenceUri,
+  mapReferenceTexts,
+} from './session-reference.js'
+
+/**
+ * Every session id one call's injectable texts reference through canonical
+ * `dsh-session:` addresses. WHERE those texts live is the shared scan rule
+ * (session-reference.ts: prompt content, a queue EDIT's replacement content,
+ * every string of a commands/execute call). Non-canonical candidates are
+ * skipped: DSH answers them with its own business error, and the relay must
+ * not crash on them.
+ */
+function referencedSessionIds(namespace: string, method: string, args: unknown): string[] {
+  const ids: string[] = []
+  for (const text of collectReferenceTexts(namespace, method, args)) {
+    for (const match of text.matchAll(SESSION_REFERENCE_URI)) {
+      const id = decodeSessionReferenceUri(match[1] ?? match[2])
+      if (id !== undefined) ids.push(id)
+    }
+  }
+  return ids
+}
+
+/**
+ * Filter one `sessionReferenceResolver/candidates` result: keep only rows
+ * whose `sessionId` passes the share table. The host lists EVERY server
+ * session with title, cwd and a ready-made mention, so an unfiltered row
+ * leaks metadata and hands the client a one-keystroke path into an unshared
+ * session's content. Rows that cannot locate a session (malformed) are
+ * dropped — nothing untrusted travels. A non-array result (a shape this
+ * build does not know — a newer host's evolution) yields `[]`: 宁可不给,
+ * never an unfiltered answer.
+ *
+ * Known limitation: the host caps a candidates page at `candidateLimit`
+ * rows (default 50, RT dsh-session-reference config) BEFORE this filter
+ * runs — on a server with many sessions the accessible rows past the cap
+ * are cut off with the inaccessible ones, and the client just sees fewer
+ * @ candidates. The @ resolver stays a convenience surface; the prompt-text
+ * scan below is the access boundary, and it is not affected.
+ */
+function filterAccessibleCandidateRows(value: unknown, isAccessible: (sessionId: string) => boolean): unknown {
+  if (!Array.isArray(value)) return []
+  return value.filter((row) => isPlainObject(row) && typeof row.sessionId === 'string' && isAccessible(row.sessionId))
+}
+
+/**
+ * A throwaway abort signal for checks that run before the stream's own
+ * controller exists (the job ownership probe). Tied to the response: once the
+ * client is gone there is no point fetching anything for it.
+ */
+function hangUpOf(res: ServerResponse): AbortSignal {
+  const controller = new AbortController()
+  res.once('close', () => {
+    if (!res.writableEnded) controller.abort()
+  })
+  return controller.signal
+}

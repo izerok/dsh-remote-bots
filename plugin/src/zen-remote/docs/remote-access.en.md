@@ -1,0 +1,626 @@
+<h1 align="center">Remote access (gateway half)</h1>
+<p align="center">Turn DeepSeek Harness into a mobile PWA you can safely reach from the public internet: pairing-code auth + token identity + real Web Push, with your own reverse proxy terminating TLS — plus device roles and the remote relay that serves paired desktop clients.</p>
+
+> Full documentation for the gateway half of `dsh-zen-remote`: reverse proxy, device roles and pairing, environment variables, admin API, the remote relay, peer virtual networking, push, security boundary.
+> Installation and quick start live in the [root README](../README.md); interface-side detail in [interface.md](interface.md) (Chinese).
+
+Built on the MIT [dsh-mobile-gate](https://github.com/Bernardxu123/dsh-mobile-gate) secure-gateway base, with PWA differentiation.
+
+---
+
+## Features
+
+| Module | What |
+| --- | --- |
+| 🔑 **Public-internet identity** | The gateway listens on `127.0.0.1` only, sitting behind your own reverse proxy. New devices trade a pairing code for a long-lived device token (cookie `lg_device` for web devices, a JSON token for desktop clients) — identity follows the token, not the source IP |
+| 👥 **Device roles** | A pairing code is minted for one role: **web app device** (phones/tablets/browsers through the gateway, see all sessions) or **desktop app device** (another DSH desktop running this plugin as the client role — relay prefix only, shared sessions only). A code offered to the wrong channel is refused with a clear message, not consumed |
+| 📡 **Remote relay** | Desktop clients talk to the host over zen-remote's own relay protocol (HTTP invokes + NDJSON stream subscriptions); the server re-verifies session ownership per request against a per-method allowlist — data of an unshared session never leaves the box |
+| 🕸️ **Peer networking** | `role: peer`: join a self-hosted virtual network with one `zr-net://` invite link — machines in the network discover each other in both directions and mount each other's remote-enabled sessions into their sidebars; LAN / UDP hole-punch direct paths first, a 1-second seamless fallback to the gateway's end-to-end-encrypted relay; details in [Peer nodes & virtual networking](#peer-nodes--virtual-networking) below |
+| 📱 **Real PWA** | `manifest.json` + service worker: once the proxy provides HTTPS, "Add to Home Screen" actually works — standalone full-screen app with icon, splash, theme-color, maskable assets; cold start paints the phone home screen's frame before the JS bundle exists instead of a blank page |
+| 🌐 **Offline** | SW v4: the true static shell AND every content-addressed URL (Vite filename hashes, DSH's `?rev=<build revision>` plugin batches (a sha1 slice over mtime/ctime/size)) are cache-first; everything else (unhashed JS/CSS, API, page HTML) stays network-first — a new deploy changes the URL instead of the bytes behind one, so the phone is both fast and never stale |
+| ⚡ **Instant first paint** | The gateway inlines an app-shaped skeleton (top bar / session cards / new-session pill) into the first HTML byte and removes it the moment DSH renders into `#root`; explicit "desktop" devices are never injected and ≥1024px hides it in CSS, so desktop stays pixel-identical |
+| 👆 **Touch gestures** | Pinch-to-resize font (resettable); edge-swipe-back has been handed off to the interface half (see "Division of labor" below), pull-to-refresh has been removed entirely (an accidental overscroll used to fire a full reload mid-conversation) |
+| 🔔 **Push when you're actually needed** | Real Web Push (VAPID-signed, aes128gcm-encrypted). By default it fires only when something is genuinely waiting on you: a tool needs authorization, or the model asked you a question. Plain turn-end is opt-in (`DSH_PUSH_TURN_END=1`). The notification carries no conversation content unless you ask for it |
+| 🛎️ **`push_notify` tool** | A model-callable push tool (registered by the push half): the model can decide mid-task that the user needs a decision, that a key milestone was reached, or that an error needs a human — and push straight to the lock screen instead of waiting for the turn to end. Usage discipline (don't call this often) is spelled out in the tool description; the host also enforces it with rate limits (max 1 per 60s per session, 20/hour globally) — over the limit, the call is silently dropped, never an error. Same aes128gcm end-to-end encryption, same lock-screen-only exposure. Turn it off entirely with `pushTool: false` (or `DSH_PUSH_TOOL=0`); it's also skipped automatically on hosts without a tool registry (`ctx.tools`), with no effect on the rest of the plugin |
+| 📐 **Touch layout** | This repo now only keeps shell-level rules (iOS input-zoom fix, safe-area scroll padding, horizontal-scrolling code) — layout rules (44px targets, dialogs, composer chrome) moved to the interface half, see "Division of labor" below — desktop never affected |
+| 🔒 **Desktop unaffected** | Every rule is rooted at `html:not([data-lan-device="desktop"])` (or an `@media(max-width:820px)` with the same exclusion) — an explicit "desktop" kind opts out, everything else (including a real phone's default "auto" kind) opts in |
+| 🛡️ **Admin surface is local-only** | Generating pairing codes, managing devices, triggering pushes — these endpoints only accept direct local connections; anything arriving through the proxy gets 403. Since 2.0.0 they are driven from the dsh-zen-remote settings block in the DSH Plugins page (the plugin backend calls them as the local machine); the `/lan-gate/admin` page is now just a notice pointing there |
+
+---
+
+## Architecture
+
+```
+Public device (phone/laptop) --HTTPS--> your own reverse proxy (nginx/Caddy, terminates TLS)
+                                                │  HTTP + X-Forwarded-For/Proto
+                                                ▼
+                            gateway (isolated Node child · listens on 127.0.0.1:3088 by default)
+                                                │
+              ┌───────────────────┬─────────────┴────────────┬──────────────────────────────┐
+              │                   │                           │                              │
+       unpaired device      web app device (paired)     desktop app device (paired)     direct-local request
+       → any path redirects   → forwarded to DSH (auto-    → relay prefix only            (no X-Forwarded-*)
+         to the pairing page    discovered real port)      /_dsh/zen-remote/relay/*      → admin API / push trigger
+         POST code -> token     with device marker headers  with marker headers +        /lan-gate/status /action /pair
+                              + bearer shared secret;       the shared secret             /pwa/push/send
+                                any other path 403s
+```
+
+- The gateway is an isolated child process: if it crashes, DSH's main service is unaffected; it's torn down automatically when the plugin stops. If the main process itself dies without a normal shutdown (crash, `kill -9`), the child checks the parent's liveness every 5 seconds and exits on its own once it is gone, instead of squatting on the port.
+- DSH's own web server still binds `127.0.0.1` only. The gateway never touches DSH's config or its `/api` trust fence; the forward target port is discovered from the host's real listening port (desktop builds use a configurable one).
+- The one IP-based trust left: a request is treated as the local user sitting at this machine — the only path into the admin surface — only when the socket is loopback, **no** `X-Forwarded-*` header is present, **and** the `Host` header, with the port stripped, is exactly `127.0.0.1` / `localhost` / `[::1]`. Requests that came through the proxy always carry forwarded headers, so they can never look local. The Host check is what blocks DNS rebinding: when an attacker's own domain resolves to 127.0.0.1, the request may still arrive over loopback, but its Host is not a loopback name and it never reaches the admin surface. **Mind the flip side**: in same-machine testing the client must reach the gateway over a LAN IP — a loopback address is treated as local-direct and skips token checks entirely.
+
+---
+
+## Division of labor with the interface half
+
+Inside this single plugin, the boundary between the two halves is: **this repo only owns the shell and the channel** (pairing auth, tokens, rate limiting, the PWA install manifest, the service worker, first-frame safe-area injection); **all layout — typography, dialogs, composer chrome, bubble styling — belongs to the interface half**.
+
+`pwa/app.css` was trimmed from 163 lines down to 95, keeping only shell-level rules. A stale inline `DEVICE_CSS` copy left inside the gateway (`lib/lan-gate-server.cjs`) went further than that — one of its rules stretched *any* `role="dialog" aria-modal="true"` overlay to fill the viewport, including the interface half's own session-info card, which is why it used to overflow the screen only when accessed through the gateway. That dead copy has been removed entirely. Pull-to-refresh and edge-swipe-back have also been removed from this repo's `touch-gestures.js`: the former kept firing full-page reloads on an accidental overscroll, and the latter's `history.back()` was always a no-op against DSH's own client-side routing — the interface half's own left-edge swipe gesture now owns that 24px hot zone instead. Pinch-to-resize stays here.
+
+---
+
+## Cold start: paint the shell, then load
+
+DSH's web shell is an empty `<div id="root">`; it only fills once the app and plugin JavaScript (~1.7 MB shell + ~12 MB plugin graph, ~5 MB gzipped) has downloaded and executed. Behind a reverse proxy on a phone, that is a blank page for seconds. The gateway now inlines the phone home screen's frame — top bar, two session cards, the new-session pill — into the first HTML byte, and removes it synchronously when DSH first renders into `#root` (its own boot screen). No extra request, no session data read, no touch blocked; an explicit "desktop" device never gets it and ≥1024px hides it in CSS, so desktop stays pixel-identical.
+
+After the first visit, a repeat cold start no longer re-downloads the build output: DSH's static server sends no cache headers for `/assets/`, so the gateway adds `Cache-Control: immutable` to hash-shaped files (8+ characters containing a digit or both letter cases) that are not HTML, and service worker v4 only cache-firsts those content-addressed URLs (plus plugin batches carrying `?rev=<hex build revision>`). The worker refuses to store an HTML login/error page as an asset (a stored response must have the Content-Type its URL claims). The hash follows the bytes, so a new deploy is a new URL — no "new DOM + old CSS". The first visit still downloads the full JS (that layer can only be fixed upstream in DSH), but the user sees a shaped interface from the first frame instead of a white screen.
+
+## Quick start
+
+### 1. Install the plugin
+
+In the desktop app or the web UI: **Plugins** page in the sidebar → **Add plugin** → type `dsh-zen-remote` → **Enable now**. A headless web service can also use the command line:
+
+```bash
+dsh plugin --profile web add dsh-zen-remote
+```
+
+The package declares a `dsh.bundle` manifest with a single row; restart DSH (the desktop app, or `dsh web`) after installing. The CLI refuses `--profile desktop` (the desktop app manages that profile itself); manual install steps live in the [root README](../README.md#install).
+
+### 2. Put your own reverse proxy in front
+
+The gateway listens on `127.0.0.1:3088` only by default — it will not expose itself to the public internet on its own. To reach it from a phone or another computer, run a reverse proxy somewhere that can see the gateway, have it terminate HTTPS, and forward to the gateway. Both configs below are meant to be copy-pasted as-is.
+
+#### nginx
+
+```nginx
+# Put this once inside the http {} block; every server{} below can reuse it
+map $http_upgrade $connection_upgrade {
+    default upgrade;
+    ''      close;
+}
+
+server {
+    listen 80;
+    server_name dsh.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    server_name dsh.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/dsh.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/dsh.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:3088;
+        proxy_http_version 1.1;
+
+        # WebSocket upgrade — required by the DSH Web UI
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+
+        # The gateway relies on these two headers to identify the real client
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Recommended for long-lived/streaming responses so nothing gets buffered away
+        proxy_buffering off;
+        proxy_read_timeout 3600s;
+    }
+}
+```
+
+#### Caddy
+
+Caddy handles HTTPS certificate issuance, WebSocket forwarding, and forwarded headers automatically — one `reverse_proxy` line is enough:
+
+```
+dsh.example.com {
+    reverse_proxy 127.0.0.1:3088
+}
+```
+
+> Proxy and gateway not on the same host (e.g. the proxy runs in another container/server)? The gateway only trusts `X-Forwarded-For` coming from a loopback socket by default — add the proxy's egress IP to `LAN_GATE_TRUSTED_PROXIES` (see the env var table below).
+
+#### Lucky
+
+[Lucky](https://github.com/gdy666/lucky) is a popular all-in-one public-access toolbox on Chinese routers/NAS boxes (DDNS + ACME certs + reverse proxy; admin UI defaults to `http://<device-ip>:16601`). Prerequisite: set up your domain's DDNS and certificate in Lucky's DDNS and security-certificate modules first (ACME auto-renews). Then:
+
+1. **Web Service → add a web-service rule**: listen on `443`, enable TLS and attach your domain's certificate.
+2. **Add a sub-rule** under it: service type "reverse proxy", frontend address = your domain (e.g. `dsh.example.com`), backend address depending on your layout:
+   - Lucky and DSH on the **same machine**: `127.0.0.1:3088`, zero gateway-side config.
+   - Lucky on a **router/NAS** (the common case): use `<DSH-machine-LAN-IP>:3088`, and set two env vars on the gateway — `LAN_GATE_HOST=0.0.0.0` (so Lucky can reach it; other LAN devices still only ever see the pairing page) and `LAN_GATE_TRUSTED_PROXIES=<Lucky-device-LAN-IP>` (so the gateway trusts its forwarded headers).
+3. **Turn on the sub-rule's 万事大吉 ("all is well") switch** — it auto-adds the common request headers including `X-Forwarded-For`. **On a same-machine deployment this switch is part of the security boundary**: without it, requests arriving through Lucky come from loopback with no forwarded headers and get treated as the local user — exposing the admin surface to the internet. With it on, the problem doesn't exist.
+4. WebSocket passes through automatically, no extra setting; if the conversation stream stalls, upgrade Lucky first.
+
+> Exact toggle names may vary slightly across Lucky versions — the three things that matter: HTTPS cert, reverse proxy to 3088, forwarded headers (万事大吉).
+
+#### Cloudflare Tunnel — getting in without a public IP
+
+When your ISP won't hand you a public IP, or you'd rather not open a port on the router, use a Cloudflare Tunnel: `cloudflared` opens a long-lived connection **outbound** from your machine, Cloudflare handles DNS, the TLS certificate and the public entry point, and requests come back down that connection to `127.0.0.1:3088` on your box. Not a single router port is opened and your home IP is never exposed. The free tier is enough.
+
+There is exactly one prerequisite: the domain is hosted on Cloudflare (nameservers pointed at it).
+
+**Zero gateway-side changes**: leave `LAN_GATE_HOST` at its `127.0.0.1` default — `cloudflared` runs on the same machine.
+
+##### Option A: the Zero Trust dashboard token flow (recommended)
+
+The tunnel config lives on Cloudflare's side and the machine only stores a token, so you never have to touch the machine to change it.
+
+1. Open the [Zero Trust dashboard](https://one.dash.cloudflare.com/) → **Networks → Tunnels → Create a tunnel** → pick **Cloudflared** and name it.
+2. Once created, the page hands you an install command with a token. Run it on the machine running DSH:
+
+   ```sh
+   cloudflared service install eyJhIjoi...your-token
+   ```
+
+   That installs `cloudflared` as a service that starts at boot. On macOS, `brew install cloudflared` first; on Debian/Ubuntu use the official `.deb`.
+
+3. Back on the tunnel's detail page → **Public Hostname** → **Add a public hostname**:
+
+   | Field | Value |
+   | --- | --- |
+   | Subdomain | `dsh` |
+   | Domain | `example.com` |
+   | Path | leave empty |
+   | Service Type | `HTTP` |
+   | URL | `127.0.0.1:3088` |
+
+   It takes effect on save; Cloudflare creates the DNS record and issues the certificate for you.
+
+4. Skip straight to the next section and do the 403 self-check.
+
+##### Option B: CLI plus config.yml (advanced)
+
+Use this when you want the tunnel config in version control too, or when one tunnel fronts several services:
+
+```sh
+cloudflared tunnel login                      # authorize the domain in a browser; certs land in ~/.cloudflared/
+cloudflared tunnel create dsh                 # note the <TUNNEL-ID> in the output
+cloudflared tunnel route dns dsh dsh.example.com
+```
+
+`~/.cloudflared/config.yml`:
+
+```yaml
+tunnel: <TUNNEL-ID>
+credentials-file: /home/you/.cloudflared/<TUNNEL-ID>.json
+
+ingress:
+  - hostname: dsh.example.com
+    service: http://127.0.0.1:3088
+  - service: http_status:404          # catch-all, must be last
+```
+
+```sh
+cloudflared tunnel run dsh            # prove it works in the foreground first
+sudo cloudflared service install      # then install it as a service
+```
+
+##### Why the self-check matters even more with a tunnel
+
+`cloudflared` connects to the gateway over **local loopback**, which means the socket the gateway sees always originates at `127.0.0.1`. What separates "a visitor from the internet" from "the person sitting at this computer" is whether the request carries `X-Forwarded-*` headers (see `isLocalDirect` in `lib/lan-gate-server.cjs`: any forwarded header at all means this is definitely not the local user). `cloudflared` sends `X-Forwarded-For` and `X-Forwarded-Proto` by default, so the pairing wall works — but **if your version or one of your ingress rules strips them, public requests get treated as the local admin and the admin page is served straight to the internet**. The same risk exists for a same-machine nginx/Caddy deployment (Lucky's 万事大吉 switch is exactly this), it's just easier to miss with a tunnel because you never hand-wrote a single line of forwarded-header config.
+
+**You do not need `LAN_GATE_TRUSTED_PROXIES=127.0.0.1`**: the gateway's `resolveClient()` already treats a loopback connection as a trusted proxy (`isLoopbackIp(sockIp) || TRUSTED_PROXIES.indexOf(sockIp) >= 0`), so setting it to `127.0.0.1` is a no-op — it neither errors nor changes any behaviour, and more importantly it is **not** a substitute for the self-check below. This semantic is pinned by tests (the two `same-host tunnel:` cases in `test/auth.test.cjs` — identical results with and without it). There is exactly one situation that calls for `LAN_GATE_TRUSTED_PROXIES`: the proxy or tunnel process is **not** on this machine (a router, another server), where the source IP isn't loopback and the gateway needs it listed before it will trust the forwarded headers it brings.
+
+##### Common traps
+
+- **`Error 1033` / tunnel offline**: `cloudflared` isn't running, or the token expired. `cloudflared tunnel info <name>` shows the connection count; `sudo launchctl list | grep cloudflared` (macOS) or `systemctl status cloudflared` (Linux) shows the service.
+- **502 Bad Gateway**: the tunnel is up but the origin isn't reachable — either the gateway isn't running, or the Public Hostname URL says `3080` (DSH itself) instead of `3088` (the gateway). Pointing it at 3080 bypasses the entire pairing wall, i.e. **puts DSH bare on the internet**; make sure it says 3088.
+- **The conversation stream stalls / messages never appear**: WebSockets aren't getting through. Cloudflare's free tier supports them, so usually there's an Access policy on that hostname in Zero Trust blocking the upgrade request, or `disableChunkedEncoding` in the ingress rule.
+- **Large uploads fail**: the relay channel's attachment upload cap is 500 MiB, which is past Cloudflare's free-tier per-request body limit of 100MB — through a CF Tunnel, uploads over 100MB hit Cloudflare's wall first (HTTP 413), no matter how the plugin is configured; raise the Cloudflare plan or route large uploads around CF.
+- **Want one more layer**: you can add an Access policy for this hostname in Zero Trust → Access (email OTP or similar) stacked in front of the pairing code. Not required — the pairing wall is already an authentication step.
+
+#### Post-setup self-check (do this for any proxy)
+
+From **cellular data** (not your home Wi-Fi), open `https://your-domain/lan-gate/admin` — the correct result is **403**. If you can see the admin page, your proxy is not sending `X-Forwarded-*` headers and the gateway mistook a public request for the local user — **go fix the header config immediately** (nginx: the two `proxy_set_header` lines; Lucky: the 万事大吉 switch; Cloudflare Tunnel: see the previous section). Only start pairing devices after this check passes.
+
+### 3. Generate a pairing code and pair devices
+
+Since 2.0.0 pairing codes are minted from the dsh-zen-remote settings block in the DSH Plugins page (the old `/lan-gate/admin` page is just a notice pointing there, still local-direct-only):
+
+1. With the proxy in place, open the DSH Plugins page **on the host machine** and expand the dsh-zen-remote settings block.
+2. Pick the device role (web app device / desktop app device) and click generate — an 8-character code, valid for 10 minutes, single-use. **The code is bound to the role**: a web-device code offered to the desktop channel is refused and vice versa; a wrong-channel code is neither consumed nor counted toward the lockout.
+3. Web app device: on the phone or another computer, open your proxy's HTTPS domain in a browser — you'll land on the pairing page. Enter the code (device name is optional).
+4. Desktop app device: in the other computer's DSH desktop app, open the plugin settings block, switch the role to **client**, and enter the server URL plus the code. The URL must be `https://` unless it is a private-network host — LAN ranges (`192.168.x`, `10.x`, `172.16–31.x`), Tailscale/CGNAT (`100.64.x`), loopback, `localhost` / `*.local`, or IPv6 `::1` / `fc00::/7` / `fe80::/10`. One sub-client can stay paired with up to **8 main servers** at once: each successful pairing lands in the paired-server list, and the plugin settings block (or the plugin page's top-bar wizard) then adds, reconnects or removes servers one at a time. When several paired servers report the same name, the sidebar's remote groups are numbered `-1`, `-2` in pairing order — the suffixes disappear automatically once a rename removes the collision.
+5. On success a web device is dropped straight into the DSH Web UI (PWA-injected); identity is stored in a long-lived cookie, so switching Wi-Fi/IP never logs you out.
+6. On the phone, use the browser menu's "Add to Home Screen" to get a standalone app.
+7. The page will prompt you to enable "agent-done push" — grant notification permission and you'll get a system notification when the agent finishes, even from another app.
+
+The settings block can also rename devices, change a device's role (`set-role`), and revoke one or all. Revocation is immediate: the device's open connections and push subscription die with it. Desktop-client devices can never reach any admin endpoint — the gateway only ever forwards them into the relay prefix; every other path (including DSH pages and `/api`) gets 403 (`reason: 'relay-only'`).
+
+---
+
+## Environment variables
+
+| Variable | Default | What |
+| --- | --- | --- |
+| `LAN_GATE_PORT` | `3088` | Gateway listen port; on `EADDRINUSE` it retries up the port range (up to +20) |
+| `LAN_GATE_HOST` | `127.0.0.1` | Gateway listen address. Leaving the default in place plus a reverse proxy is the recommended setup — only change this if you know exactly what you're doing |
+| `LAN_GATE_TARGET_PORT` | `3080` | Local DSH Web UI port the gateway reverse-proxies to |
+| `LAN_GATE_RATE_LIMIT` | `120` | Per-real-client-IP per-minute cap **for unpaired/unauthenticated requests only** (protects the pairing surface). Local users and paired devices are exempt — their guardrail is the token + revocation |
+| `LAN_GATE_TRUSTED_PROXIES` | empty | Comma-separated IP list. When the proxy and gateway aren't on the same host (i.e. not a loopback socket), list the proxy's egress IP here so the gateway trusts the `X-Forwarded-For`/`X-Forwarded-Proto` it sends |
+| `LAN_GATE_VAPID_SUBJECT` | `mailto:admin@localhost` | VAPID contact for Web Push. **Set this to a real mailto: address or https:// URL**: Apple rejects placeholder subjects with `403 BadJwtToken`, silently killing push to every iOS device (Google/Mozilla do not check). The gateway warns at startup if it looks invalid |
+| `LAN_GATE_LANG` | `auto` | Language of the pages the gateway serves itself (pairing, rate-limit, admin) and of the push opt-in card it injects into the app. `auto` follows the request's `Accept-Language` — the only language signal a pairing visitor ever volunteers; with no such header it falls back to Chinese. `zh`/`en` pin it and ignore the browser |
+| `LAN_GATE_LOG_LEVEL` | `info` | Logging threshold for `ctx.logger` and the diagnostic log ring: `info` / `debug` / `warn`; `debug` additionally records per-request detail lines. Read live — no plugin-row reload needed |
+| `LAN_GATE_RELAY_SECRET` | *(auto-generated)* | The relay shared secret: since 2.0.0 it is how a desktop client's forwarded request proves to the host's relay routes that the marker headers were written by this gateway. **Minted fresh by the plugin on every load** of the main entry (32 random bytes handed to the gateway child through the environment, unconditionally overwriting) and **not externally settable** — a value hand-placed in the host environment is overwritten or deleted at child startup; when the plugin doesn't supply one (client role, standalone load) the header feature is off and the gateway stamps nothing |
+| `DSH_PUSH_LANG` | `zh` | Language of the notification copy itself (approval pending / question pending / turn finished). Since 2.0.0 it is an env override over the settings `lang`; with neither set the copy is Chinese. Deliberately **not** autodetected: a notification is produced host-side, where there is no request header and launchd hands the process no `LANG` (`Intl` reports `en-US` even on a Chinese user's machine). Set `en` explicitly for English |
+
+Besides env vars, **the recommended surface is the dsh-zen-remote settings block in the DSH Plugins page** (the full field table lives in the root README); the legacy `~/.dsh/lan-gate.config.json` keeps working. Per field the first legal value wins in this order: **environment variable > plugin row settings > `lan-gate.config.json` > default** — a value that fails its field's check makes that layer transparent (a hand-edited `port: "abc"` surfaces the file's port, not an error). File keys = env var names minus the prefix, camelCased:
+
+```json
+{
+  "host": "0.0.0.0",
+  "trustedProxies": "192.168.1.2",
+  "rateLimit": 600,
+  "pushSummary": true
+}
+```
+
+The push half adds `pushTurnEnd` / `pushEvents` / `pushDebounceMs` / `pushSummary` / `pushTool`. Language is a single shared key, `lang`: the gateway understands `auto` (follow the browser) / `zh` / `en`, the push half understands only `en` and treats everything else as Chinese — so `"lang": "auto"` means "pages follow the browser, notifications stay Chinese". Two more keys live outside the settings surface: `pushApprovalGraceMs` (env `DSH_PUSH_APPROVAL_GRACE_MS`). The 2.0 fields `role` (`host`/`client` — the one 2.0 field the file layer also reads), `serverName`, `idleHours`, `autoShareNewSessions`, `serverUrl` and `deviceToken` come from the settings page or the plugin row, not this file.
+
+Saving a field that needs a gateway/push restart (`role`, `port`, `host`, `targetPort`, `rateLimit`, `trustedProxies`, `vapidSubject`, `lang`, and the push fields) makes the plugin detect the change and reload its own row — the gateway child restarts with it, no app restart needed.
+
+Since 2.0.0 the gateway and the push half **no longer take one row each**: the package's own `cordis.patch.yml` mounts a single `dsh-zen-remote` row, and the main entry loads the two sub-plugins itself with `ctx.plugin()`, per `role`, handing them the merged effective config. Stale `dsh-zen-remote-gateway` / `dsh-zen-remote-push` rows left in a profile patch are warned about and skipped by the loader — delete them; re-adding a gateway row by hand would spawn a second gateway process fighting over the port.
+
+---
+
+## Admin API
+
+All of the following endpoints are **local-direct-connection only**: the request's socket must be a loopback address, carry no `X-Forwarded-*` headers at all, and name a loopback host (see Architecture). On top of that judgment sit two more gates aimed at browsers (a cross-site POST from a web page needs no preflight, so the socket/Host judgment alone cannot stop one): any request carrying an `Origin` header gets 403, and any request with a body whose `Content-Type` is not `application/json` gets 415 — the plugin backend's proxied calls and a scripted `curl` (JSON header, no Origin) are unaffected. Anything that came through the proxy (which always carries forwarded headers) gets 403 — the public internet can never reach these. Since 2.0.0 the caller is the plugin backend, not a browser admin page: requests from the settings page arrive on the same-origin routes `/_dsh/zen-remote/admin/*` and the host process calls the gateway below **as** the local machine (forwarded requests wearing the `x-zen-remote-via` marker may read status but mutations are refused — the one exception is toggling a session's remote access on `/_dsh/zen-remote/admin/shares`, which a web app device (a phone) may do; the phone session info card's remote access switch uses it). For `GET /_dsh/zen-remote/admin/shares`, session titles are fetched summary-first via a single cold-safe `session/list` (`{ _request: {} }`) call, preserving explicit `title: null` for unnamed sessions without falling back; only missing entries (or legacy host degradation) fall back to `session/projections` through handler-scoped two-level request coalescing and a FIFO semaphore capped at **3** concurrent lookups (using internal timeout signals isolated from individual caller disconnects), while `POST /_dsh/zen-remote/admin/shares` immediately invalidates any in-flight `session/list` slot and `busy`/`remainingMs`/`viewers` stay computed live per request.
+
+| Endpoint | Method | What | Params |
+| --- | --- | --- | --- |
+| `/lan-gate/pair` | POST | Generate a new one-time pairing code (valid 10 minutes). **The code is role-bound** | `role` (optional): `desktop-client` mints a desktop-app-device code; absent/unparsable means a web-device code. The response carries `role` |
+| `/lan-gate/status` | GET | Read running state, the current pairing code, the list of paired devices (each with its `role`) | none |
+| `/lan-gate/action` | POST | Manage a device | `action`: `set-role` / `set-kind` / `rename` / `revoke` / `revoke-all`; `id`: device id (not needed for `revoke-all`); `set-role` also needs `role` (`web`/`desktop-client` — switching to `desktop-client` deletes the device's push subscription); `set-kind` also needs `kind` (`phone`/`desktop`/`auto`); `rename` also needs `name` |
+| `/pwa/push/send` | POST | Send one push to every subscribed device | `title`, `body` (plain text, no conversation content) |
+
+The redemption endpoints are the exception reachable from anywhere, protected by the code itself (single-use, 10-minute TTL) and a failure lockout (5 wrong codes locks that IP for 15 minutes) — each channel accepting only its own role:
+
+- `/lan-gate/pair/claim` (POST) — the browser pairing page, **web-device** codes only, issues a cookie on success;
+- `/lan-gate/pair/claim-desktop` (POST) — desktop-client pairing, **desktop-device** codes only, the token travels in the JSON body (`{ok, id, name, token}`), never as a cookie.
+
+A role mismatch answers 403 `role-mismatch` with a localized message; the wrong-channel code is not consumed and does not count toward the lockout.
+
+---
+
+## The remote relay (desktop clients' data channel)
+
+A desktop client has no DSH login cookie, and the relay deliberately does not forward DSH's native `/api` or WebSocket connections. Instead the client and the host speak zen-remote's own relay protocol: **every single call is a plain HTTP POST, every streaming subscription is an HTTP streaming response**, all under the host plugin's dedicated prefix `/_dsh/zen-remote/relay/`, entering and leaving through the gateway. No hand-rolled WebSocket; the client aborts the request to cancel a subscription.
+
+**Three gates, re-checked per request:**
+
+1. **Gateway device auth** — the request must carry a valid desktop-client device token (Bearer), and the gateway forwards desktop-client traffic into the relay prefix only;
+2. **Marker headers + shared secret** — the gateway stamps every admitted forward with `x-zen-remote-via: gateway`, `x-zen-remote-role`, `x-zen-remote-device` and `x-zen-remote-secret` (the shared secret); client-forged copies of that namespace are stripped at the gateway's entrance. The relay routes re-verify the secret and the marker headers on every request — any mismatch is 401. Without the secret, any local process could hit `127.0.0.1` directly and forge the markers;
+3. **A per-method allowlist** — every allowed method is registered with EXACTLY the argument fields that locate its session; authorization looks at those fields and nothing else, and any method not in the table is refused. This is deliberately **not** "scan the arguments for session ids": DSH's parameter validation silently drops unknown names, so a hostile client could pad a decoy shared id into a call whose real ownership field goes unchecked.
+
+**Routes** (prefix `/_dsh/zen-remote/relay`):
+
+| Route | Method | What |
+| --- | --- | --- |
+| `/ping` | GET | Liveness probe, `{ok:true}` |
+| `/v1/handshake` | POST | Handshake: exchanges the relay protocol version, server id / display name, DSH version, and the 13+1 grouped interface fingerprint tables (`session`, `workspace`, `job`, `files`, `subagent`, `goal`, `terminal`, `officeKit`, `agentTeam`, `userQuestions`, `actionCards`, `trajectory`, `forge`, plus the forwarded-event group `events`). A relay-protocol-version mismatch refuses the connection; the answer carries `serverName` (the server's display name) and `deviceName` (this device's name in the server's records) |
+| `/v1/device/name` | POST | Device rename: **handled by the gateway itself, never forwarded to DSH** — open to paired desktop app devices only, and it renames only the CALLING device's own record; body `{"name":"…"}` (1–40 chars). Renames reach the other side through the stream heartbeat (~15s) and the handshake refresh (~30s) |
+| `/v1/invoke` | POST | One DSH remote call on a shared session (single-shot, JSON in and out; request body capped at 72 MiB to carry 50 MiB base64 inline images; binary results such as `workspaceFiles/readBytes` travel as `{"$zr-u8": <base64>}` markers and are restored to `Uint8Array` on the sub-client — see `src/invoke-binary.ts`) |
+| `/v1/stream` | POST | Opens one DSH stream subscription. **NDJSON format**: one JSON value per line; `{"type":"ping"}` heartbeat lines (every 15s by default) keep reverse proxies from timing idle streams away, and each one carries the current `serverName` / `deviceName` (a server rename reaches every connected client within one heartbeat); when a share closes or a subscription loses its session the server writes `{"type":"error","error":{"code":"unshared"}}` and ends the response. **Delta resume**: for `session/follow`, accepts an optional `knownCursor` field and emits a leading `{"type":"snapshot-sync","mode":"unchanged"|"delta",...}` frame when cached history is current or incrementally catchable (older servers ignore the field and return a full `snapshot`). **Duplex streams**: when the method declares an uplink and the request body carries `uplink: true`, the server writes a `{"type":"uplink","streamId":"<32-hex>"}` handshake line FIRST, before any frame, and from then on the client may push frames up through `/v1/stream-uplink`; an older client that doesn't know the line ignores it, and a one-directional stream (no `uplink: true`) behaves byte-for-byte as before |
+| `/v1/session-snapshot` | POST | Cold-safe single-frame pull of a shared session's opening snapshot (also accepts `knownCursor` for `full` / `unchanged` / `delta` answers). The server opens `session/follow` via the gateway, calls `next()` **at most once**, and immediately calls `return()` in `finally` — so it never runs `promote()`, never wakes the remote `Agent`, does not bump `viewers`, and does not refresh idle-sleep activity. Capped at **2** concurrent requests per device and **3** globally across all devices (kept below DSH's 5-slot cold observation cache; 429 `too-many-snapshots` past either limit); if an older server answers 404, the sub-client disables proactive background prewarm for that connection and falls back cleanly to on-demand caching |
+| `/v1/stream-uplink` | POST | The duplex stream's uplink channel: body `{streamId, seq, items?, end?}` — `items` is the batch of uplink frames (several can share one round trip), `end: true` half-closes the uplink. The server resolves the live stream by `streamId` through four walls — device ownership (cross-device answers 404 `unknown-stream`), the session still shared (403 `not-shared`), a strictly increasing transport sequence (out of order 409 `out-of-order`), and unconsumed buffered bytes within 256 KiB (past it 413 `uplink-overflow` and the stream aborts). The client side is a **single-in-flight batching pump**: at most one uplink POST on the wire at a time per stream, frames read while it flies accumulate into the next batch — strictly ordered by construction (concurrent requests could arrive reordered and trip the host's `Terminal input sequence has a gap`), and fast typing costs the fewest round trips |
+| `/v1/event-result` | POST | The answer half for approval/question events (`{eventId, result}`); the server matches it against what it forwarded, per device, before handing it over |
+| `/v1/http` | POST | The plain-HTTP long tail of the changes summary / diff panels: the `{route, query}` body admits only `changes.summary` / `changes.diff` and forwards GETs only (the query string is this call's coordinate, never a request body to forward); the query is **normalized and rebuilt** along an allowlist — only `sessionId` (exactly once, share-checked) and `seq` / `index` (at most once each, decimal non-negative integers) survive, unknown parameters are dropped, and the synthetic URL is composed from the normalized result alone (a control-character parsing differential between the two URL parsers was once an authorization bypass) — then dispatched **in-process** through the host's shared `/api` fetch handler, no loopback HTTP |
+| `/v1/upload` | POST | The **non-image attachment** upload of a remote session: the request body is a raw byte stream (not JSON); the query string is normalized and rebuilt along an allowlist — only `sessionId` (exactly once, share-checked, 403 when not shared) and `name` (at most once) survive; the cap is 500 MiB, enforced twice (a `Content-Length` pre-check plus a counting pump over the stream), over-limit answers 413 (the refusal is written before the tail bytes are drained); at most 8 concurrent uploads per device (429 past that); then, like `/v1/http`, dispatched **in-process** through the host's shared `/api` handler — the staged receipt lands under the same session the later `session/prompt` resolves the attachment against |
+| `/v1/unshare` | POST | The client closes a session's remote access itself (table members only) |
+
+**Negotiated transport compression, in-memory history cache, and background prewarm**:
+
+- **Negotiated gzip compression**: the client sends `x-zr-accept-encoding: gzip` on `/v1/invoke`, `/v1/session-snapshot`, and `/v1/stream` (deliberately avoiding standard `Content-Encoding: gzip` so PeerMux's raw stream bodies and reverse proxies do not double-buffer). On status `200` JSON responses ≥ 1024 UTF-8 bytes where gzip is strictly smaller, the server replies with `x-zr-content-encoding: gzip` (`application/octet-stream` + `nosniff`); on `/v1/stream`, large non-tail JSON frames (≥ 1024 bytes when smaller) are gzipped serially inside `writeChain` as `{"type":"gz","b64":"…"}` lines to preserve strict FIFO ordering. The client enforces a `64 MiB` gunzip bomb limit (`maxOutputLength`) and a `64 MiB` single-line limit in `streamLines`.
+- **In-memory cache and two-tier LRU**: sub-clients and peers keep a pure in-memory session history cache (never written to disk) under four budgets — **`64 MiB`** process total (with **`16 MiB` / `128` pages** dedicated to immutable `session/page` results), **`24 MiB` / `32` sessions** per connected server, **`8 MiB`** admission cap per snapshot (oversized sessions bypass directly), and `600` records per session trimmed on `turn/start` / `sourceEventSeqs` boundaries. Eviction drops `prewarmed` LRU entries before `visited` entries; reopening a cached session yields the cached snapshot in 0ms and reconciles in the background using `knownCursor` (`unchanged`, contiguous `delta`, or a `2,000 ms` one-shot atomic handoff slot) with `assistantStream.revision` translation.
+- **Cold-safe background prewarm and immediate purge**: when an online server has no foreground RPC/stream activity, the scheduler prewarms its **Top `16`** root sessions by `updatedAt` descending (`concurrency = 1` per server, skipping `subagent` children); any foreground call immediately `abort()`s an in-flight prewarm and resumes `300 ms` after foreground goes idle, while `session/control` watermarks and `api-session/status` `running: true → false` schedule incremental refreshes. Cached data is purged immediately on `unshared`/`not-shared`, workspace disappearance, `unpaired`/`revoked`, peer removal, or `uninstall()`, and after `30 minutes` offline.
+
+**The allowlist** (everything else is `forbidden-method`): session reads and writes (`session/follow`, `session/page`, `session/prompt`, `session/cancel`, `session/rename`, `session/selectModel`, `session/updateQueue`, `session/attachment`, `session/projections`), creation and forking (`session/create`, `session/fork` — results auto-share), subagents (`subagents/prompt`, `subagents/interruptByParent` (0.2.2-rc.1, judged by parent + child), `subagents/interruptByUser` (0.2.2-rc.2 onward, judged by the child alone)), attachments and @ references (`fileUploads/upload`, `fileReferences/list`, `sessionReferenceResolver/candidates`), the panel long tail (`goals/*` seven verbs, `commands/list|execute`, `agentPresets/list|read|select`, `sessionFeedback/record`, `agentTeams/setEnabled`, `userQuestions/answer|attachWait`, `actionCards/act`, `pluginRecommendations/describe`, `toolResults/watch`), Forge panel operations (`forgePanel/*`, 31 session-scoped methods including the `forgePanel/follow` stream and `forgePanel/branches|diffBases|…` reads and writes), file tree and previews (`workspaceFiles/list|changes|read|readBytes|stat|search`, plus `officeToPdf/render` and 0.2.2-rc.2's `officeKit/render`), terminals (`terminal/*`, including 0.2.2-rc.2's `terminal/attach|watch`), jobs (`job/list|follow|kill`), `skills/list`, message feedback (`messageFeedback/*`), `schedule/list`, workspace session ops (`workspace/pinSession|unpinSession|archiveSession|unarchiveSession|insertSessionBefore`), plus six global reads: the `session/control` stream, `session/list`, the `workspace/follow` stream, the `forgePanel/changeRequestStates` stream, `session/search`, and `session/modelCatalog`, alongside `agentPresets/list|read` behind the zero-share privacy gate. `session/control`, `session/list`, `workspace/follow`, `session/search`, and `forgePanel/changeRequestStates` carry no session argument — their safety is **output filtering**: every frame, row, or PR state passes only along the share table (`forgePanel/changeRequestStates` is bound to non-dismissed `forgeChangeRequests` PR URLs of shared sessions), so unshared sessions' content never reaches the client; in `session/list` result rows, a `parentSessionId` naming an inaccessible session is deleted as well (the rest of the row passes through unchanged). `session/modelCatalog` is likewise parameter-less and globally read-only — it is the server's model-provider directory, group and model ids plus display names only, no session data; the server empties the `failures` array in the result (the host's per-group error texts may carry endpoint or credential details the client never shows anyway). `sessionReferenceResolver/candidates` (the @-mention resolver) answers with EVERY server session's title, cwd and a ready-made mention, so it travels through the same row-level filtering — only shared sessions' rows leave the box. Approval/question events ride a `$zr/events` subscription, each forwarded event judged by its `agentId`; the 5 session-scoped emits of shared sessions (including their child sessions) — `api-session/status`, `api-session/activity`, `api-session/error`, `agent-preset/selected`, and `goal/activation-changed` — also ride the same subscription, filtered by session reachability, while every other global emit is dropped.
+
+**Preset visibility:** when the host has no shared sessions, `agentPresets/list` returns an empty preset array and `agentPresets/read` is refused with `403 not-shared`. **Once any session is shared**, that gate opens completely: paired devices can read the machine-wide preset roster (names, descriptions, and invalidation reasons of custom presets) and read any preset's full YAML document by preset id (including system prompts and sub-plugin manifests). There is no per-preset or shared-session ownership filter — sharing a session implies consenting to expose all preset material.
+
+The `/v1/http` route is a second allowlist, keyed by **route name** (not part of the method table), under the same discipline: an unregistered route is 404 before any id is read, and a registered one is judged only along its declared session parameter. The client-side counterpart is `GET /_dsh/zen-remote/client/http/<route>` — the browser fetch wrapper redirects the `/api/changes.*` calls it intercepted (virtual session ids) here, the original id is restored before the relay round-trip, and the upstream Content-Type is held to JSON — anything else downgrades to `text/plain` + `nosniff`.
+
+`/v1/upload` starts on the **sub-client's own machine**: DSH's non-image attachment upload rides a request issued from inside a Web Worker, which neither a `window.fetch` wrapper nor the typert interception can see, so the plugin instead wraps the upload entry (`/api/session/uploadFileBinary`) of the host connection service's `fetchRoutes` table in the local backend and catches the request there — an upload carrying a virtual session id streams through the relay to the server (a local id passes through untouched, its body never read by us), an over-cap upload is refused locally on the client, slow links are bounded by the client-side 300-second timeout, and an upload's timeout or transport failure never moves the connection state. A local failure is still answered in the host's own "200 + failure envelope" shape, so the readable message lands on the attachment card. Export (`/api/session.export`) is the other entry wrapped in the same pass: an export naming a virtual id is refused in the backend with 403 `remote-unsupported` (the UI menu item is hidden remotely too).
+
+**Security boundary of the relay:**
+
+- The server executes everything through the DSH gateway service's public invoke/stream methods, under the operator identity — **it never replaces DSH internals**;
+- Subagent and fork sessions never enter the table; reachability walks the ancestor chain (a shared ancestor shares the family);
+- `dsh-session:` references are scanned too: DSH injects the referenced session's content along **messages** (the content text blocks of `session/prompt` / `subagents/prompt`), **queue edits** (`session/updateQueue`'s edit content) and **slash commands** (EVERY string of a `commands/execute` call — a command handler steers its raw input in as the next user message), with no access check of its own at injection time, so a call whose reference names an unshared session is refused server-side with 403; the @-mention candidates (`sessionReferenceResolver/candidates`) likewise only ever list shared sessions' rows;
+- Terminals are deliberate (a desktop client is a trusted device): what opens is a **server-side** PTY running as the server user, without the agent sandbox or approval restrictions; closing the session's remote access kills its terminal streams with it. DSH 0.2.2+'s `terminal/attach` is a duplex stream: the downlink carries `snapshot` / `output` / `state` / `ack` frames while the uplink sends `write` / `resize` commands through `/v1/stream-uplink` — the interceptor does not half-close the host's uplink inbox, it hands the iterable and the mux's uplink window (shape-checked, garbage dropped) to the relay client's pump; the `terminal/follow|write|resize` trio of ≤ 0.2.1 stays registered, so both DSH generations remote-terminal fine;
+- `workspaceFiles/read` and friends are not contained to the session directory (DSH itself does not contain them) — anything the server process can read is readable, under the same trusted-device premise as terminals;
+- The plugin bridge's whole-machine data requires the server owner's per-plugin consent — the toggles in the settings page's Plugin bridge section, everything OFF by default (on `role: 'peer'`, undeclared `scope: 'server'` consent defaults ON only for authenticated virtual-network peers `peer:<nodeId>` and local operator views, while external `lan-gate` `desktop-client` pairings remain **fail-closed OFF** unless explicitly consented); the loopback carries the operator's cookie, so a bridged plugin sees the same permissions the local browser sees. The bridge's boundary is therefore the DECLARED route set (exact equality, plus a `prefix: true` route's sub-paths under the raw-byte tail validation rule) plus the share table — there is **no** parameter-level scanning;
+- **Adapters (better-sidebar)**: beyond cooperative declarations, zen-remote ships a built-in adapter for `dsh-better-sidebar` **the nine versions 0.25.0 through 0.30.1** (`src/adapters/` — non-cooperative third-party plugins are bridged by it, with prefix/path-segment route matching and session-id rewriting in JSON bodies and path segments; 0.30.1 is a wire-identical patch release of 0.30.0 and registers under the same digest `394de9f588d37092`). A prefix hit's tail passes the shape validation rule: `?`/`#`/`..` (encoded forms included) or whitespace answers 400 `bad-request` (the same rule as the cooperative segment). **Consenting to its whole-machine toggle hands the paired desktop client whole-disk file read/write on the server, git write operations (commit, push, revert, …), and model spend through commit-message generation** — the product decision is "both directions forward, no path fencing", and a server owner should treat that toggle as terminal-grade trust in the paired machine; `open.external` (launching processes on the host) refuses for remote sessions, `settings.*` and `/sidebar/bundle` stay on the sub-client's own machine; the three WebSockets (`/sidebar/ws/fs-watch` file-tree watch, `/sidebar/ws/agent-opens` open push, `/sidebar/ws/sidechat` side-chat push) bridge over the byte tunnel — the first two carry the session id in their upgrade URL's query and their frames pass through untouched (the browser never reads the session id inside a push); `ws/sidechat`'s upgrade URL carries NO parameter at all — the ids ride the JSON text frames sent after the handshake (`{"op":"watch","threadIds":[…]}`), through the per-frame gate: the client rewrites every virtual id in a watch frame back to its real form before forwarding (an empty array = unsubscribe-all, passes verbatim), the server share-checks EVERY text frame before the plugin sees one (an unshared thread id never reaches the plugin — the connection dies), and the plugin's pushed `{"threadId":…}` top-level id is virtualized before it reaches the browser (better-sidebar's subscription comparison demands the exact virtual id); side chat (`sidechat.*`) forwards — its child sessions carry `meta.parentSession`, so they inherit the parent's share through the ancestor chain, and the `childId` in `sidechat.start`'s answer is virtualized before it reaches the browser; 0.28's (alpha.0 and stable) `changes.ops` long-poll (`wait: true`, parks up to 25 s — past the relay's 15 s header wait) has `wait` stripped on the server, so a remote session's "this round's files" view polls on 0.26's 2.5 s cadence; `sidechat.models` shows the **sub-client's own** model catalog in the picker while the choice goes through `sidechat.model` and takes effect on the **server** — when the two machines' catalogs differ, what the server actually applies is authoritative;
+- Concurrent streams are budgeted per device (32), and so are invokes kept in flight at once — past the per-device cap the invoke answers 429 `too-many-invokes`. Error codes shaped `*/internal` (`gateway/internal` and friends) are returned as the bare code with no message — that kind of message quotes server-side internals. Event answers are matched against the subscription and device they were forwarded to. Approval/question forwarding is **first come, first served**: whichever of the server's own UI and the sub-client answers first wins; the later answer is refused by the gateway and the client syncs to "already handled". The relay **never answers on the client's behalf**: an unshared session's approval/question events are not forwarded at all, and with the server's own UI offline too, the approval simply keeps waiting — the gateway re-delivers still-pending events to the next `$events` subscriber. A wait, never a rejection (an abstention would fail every pending approval of the session at once and break the push → wake → approve flow). Notification-type events (EMIT frames: session-list summaries, account expirations and other server-wide state) of unshared sessions are never forwarded; the sole exception is the 5 session-scoped events of shared sessions (and their child sessions) — `api-session/status`, `api-session/activity`, `api-session/error`, `agent-preset/selected`, and `goal/activation-changed` — which describe only a single session's run status, activity timestamp, error, selected preset, and goal activation, and are virtualized and forwarded per frame after checking the share table (any run status missed while offline is reconciled by re-fetching the list on reconnect).
+
+
+**better-sidebar mixed-version matrix** — the bridging decision is made per side: whether the plugin bridges at all follows the **server's** installed better-sidebar version (present in the adapter's version table + the owner's consent); what requests the UI sends follows the **client's own** version (the UI loads locally); and if the two ends run different zen-remote versions, the adapter digest comparison fails and the plugin falls back to the hidden treatment:
+
+| Two-end zen-remote | Server BS | Client BS | Result |
+| --- | --- | --- | --- |
+| New (has the 0.26 adapter) | 0.26 | 0.26 | Fully bridged; every new feature works |
+| New | 0.25 | 0.25 | Bridged as before; behavior identical to the previous release |
+| New | 0.25 | 0.26 | Bridged; the 0.26-only methods and `/sidebar/write` get 404 from the 0.25 server, and `ws/sidechat` dies on open (the 0.25 server has no such upgrade route) so side chat falls back to 15s polling — single-feature degradation: core side chat works, no mis-routing, nothing written locally |
+| New | 0.26 | 0.25 | Bridged; the UI never sends the new requests — equivalent to the 0.25 experience |
+| Old (≤ 2.2.1) | 0.26 | any | Not in the adapter's version table → unbridged (hidden treatment) |
+| Old | 0.25 | 0.26 | Bridged as 0.25; new methods are refused with the adapter's `adapter-method-unknown`, and `/sidebar/write` carrying a virtual id errors against the local plugin (no file written) — single-feature degradation |
+| One new, one old | any | any | Core remote sessions work; the adapter digests differ → the bridge comparison fails → hidden treatment, until both ends run the same version |
+
+### Plugin bridge: `POST /v1/plugin`
+
+A bridged plugin's panel request, rerouted by the sub-client's local backend (the `match` wrap — see `docs/plugin-bridge.md`), arrives here: coordinates in headers, **no body** (a body answers 400).
+
+| Header | Meaning |
+| --- | --- |
+| `x-zr-plugin` / `x-zr-plugin-version` / `x-zr-plugin-digest` | Plugin name, the caller's plugin version, declaration digest |
+| `x-zr-path` | The plugin route path (no query), verbatim, never decoded |
+| `x-zr-query` | The query string (no `?`; the session parameter already carries the REAL id) |
+| `accept`, `range` | The only request headers passed through to the plugin |
+
+**Validation chain** (first failure answers, with the `x-zen-remote-error: <code>` header): gateway secret and markers → body must be empty → header shapes → the plugin is in THIS server's registry → version AND digest equal the local declaration → `x-zr-path` matches the declared routes — an exact route by equality alone, a `prefix: true` route also by deeper sub-paths (the adapter segment's rule; multiple hits take the first in declaration order; `x-zr-path` is never decoded), with the prefix tail passing the shape validation rule (the SAME rule on the adapter segment): the tail after the declared path (RAW bytes) refuses `?`, `#`, `..` (any `%2e`/`%2E` encoding — the mixed `.%2e.` form included) and whitespace → 400 `bad-request`. The tail rides verbatim into the loopback request line: a `?` would break the parse-once query discipline, and whether `..` escapes the declared subtree depends on host URL normalization — a premise this rule refuses to rely on, so the verdict is on the raw bytes, never decode-then-check (`.` is RFC 3986-unreserved; no legitimate encoder emits `%2e`; `%252e` passing is the same design — it is the only legitimate encoding of a literal `%2e` filename, and with the host decoding at most once it resolves to an ordinary segment name) → the query is parsed once and the share wall reads the route's EFFECTIVE locator: the query convention (2.1's `sessionParam`, or an explicit `locator: { in: 'query' }`) requires exactly one non-empty occurrence, and that is the value the share table (ancestor chain included) judges; a v2 locator (path segment / JSON body) RE-LOCATES over the same adapter-core rule the sub-client classified with and share-checks EVERY hit (nothing located → 400 `bad-request`), with a JSON body consumed right there — buffered bounded by the route's `maxBody` (413 past it, 400 `bad-query` on a parse failure) and sent to the loopback as exactly that share-checked buffer → a `scope:'server'` route requires `pluginBridgeConsent[plugin] === true` (read live off the row) → the per-device budget. On success the query is RE-SERIALIZED from the parsed result via `URLSearchParams` — what was checked is exactly what is sent.
+
+**Error codes and statuses**:
+
+| code | status | condition |
+| --- | --- | --- |
+| `unsupported` | 501 | the bridge is not wired on this server |
+| `bad-request` | 400 | a body was sent; missing or malformed coordinate headers; a prefix hit's tail carrying `?`/`#`/`..` (encoded forms included) or whitespace |
+| `plugin-unknown` | 404 | the plugin is not in the local registry |
+| `plugin-mismatch` | 409 | version or digest differs from the local declaration |
+| `route-undeclared` | 404 | the path neither equals a declared exact route nor falls under a `prefix: true` route |
+| `bad-query` | 400 | the session parameter is missing, repeated, or empty |
+| `not-shared` | 403 | the session is not reachable |
+| `consent-off` | 403 | a whole-machine-data route without the owner's consent |
+| `busy` | 429 | the device already holds 8 in-flight bridged requests |
+| `loopback-auth` | 502 | the loopback cookie exchange failed (no token URL, no cookie obtained) |
+| `internal` | 502 | any other loopback failure (headers not sent yet; a mid-stream failure cuts the response) |
+
+**Loopback execution**: the server requests its OWN plugin route over loopback HTTP (`127.0.0.1:<webServer.port>`), Host header pinned to the loopback address — the plugin's own authentication and handler run exactly as they would for a local browser. The loopback request carries the OPERATOR's cookie: with none cached, one `GET /?token=<server token>` exchanges for it (no redirects followed; the pair comes off the 3xx `set-cookie`), and a 401 from the plugin route triggers exactly one re-exchange before a retry — a still-401 answer travels verbatim. **The loopback carries the operator's cookie, so the plugin sees the same permissions the local browser sees** — by design: the bridge replaces "the browser opening the panel locally", it does not bypass the plugin's own auth. The cookie lives in memory only — never logged, never persisted. Since 0.2.1 the webServer may serve self-signed https: certificate verification is skipped ONLY when dialing the literal `127.0.0.1`.
+
+**Streaming and budget**: the plugin answer's status plus its `content-type`, `content-length` (when present) and `cache-control` travel verbatim; the body is pumped chunk by chunk with real backpressure (a slow client slows the loopback, nothing buffers); the finish follows the relay stream's drain watchdog (default 5 s — a connection that stops reading is destroyed). At most 8 in-flight bridged requests per device (one slot held for the whole stream), 429 `busy` past that; a finish that cannot drain is destroyed after 5 seconds and its slot freed, while a client that stops reading MID-stream simply pins up to that device's 8 slots (everything else flows); the sub-client hanging up aborts the loopback request.
+
+**Write requests (2.2+)**: the method arrives in the `x-zr-method` header (default GET); `GET`/`HEAD` with a body still answers 400, and any other method's body IS the plugin request body (raw byte stream). The size gate is the declared `Content-Length` first, a streaming count as the fallback — past the route's `maxBody` the answer is 413 `body-too-large`; a method the route did not declare answers 405 `method-undeclared`; the passthrough whitelist gains `content-type` accordingly.
+
+### The plugin bridge's WebSocket byte tunnel: `POST /v1/plugin-tunnel/{open,send,close}`
+
+Routes declared `upgrade: true` travel over these three (the declaration side is in `docs/plugin-bridge.md`). The relay **never parses WebSocket**: the server→browser direction is **one NDJSON streaming response**, the browser→server direction is **ordered chunked POSTs**, and both directions are opaque bytes — the real upgrade handshake (the 101 and every frame) is produced by the plugin route on the server machine and crosses the tunnel untouched. One exception: a `locator: { in: 'json-body' }` upgrade route (better-sidebar's `ws/sidechat`) has a body-less GET for its handshake and carries its ids in the post-connection JSON frames, so the share table has no packet to open at open time — such a tunnel's **upstream direction is split into RFC 6455 frames**, refusing fragmented frames (`!fin` / `0x0`, returning `400 bad-request`), passing control frames (`0x8`/`0x9`/`0xA`), and locating/share-checking BOTH text (`0x1`) and binary (`0x2`) frames as UTF-8 JSON one by one (an unshared id answers 403 `not-shared` and tears the tunnel down; the frame NEVER reaches the plugin; an empty unsubscribe-all array and id-less frames pass), and the verified frames cross verbatim; the downstream direction stays opaque (resuming buffered tail immediately on `drain`). Query-locator upgrade routes keep zero parsing overhead and unchanged behavior.
+
+| Route | Headers | Body | Success answer |
+| --- | --- | --- | --- |
+| `/v1/plugin-tunnel/open` | The same coordinate headers as `/v1/plugin` | A small JSON: `{"headers":{"sec-websocket-key":…,"sec-websocket-version":…,"sec-websocket-protocol"?,"sec-websocket-extensions"?},"head"?}` — the four ws headers travel verbatim into the upgrade request (each passes a CR/LF check); `head` is the already-arrived early bytes, base64, optional | 200 NDJSON stream (shape below) |
+| `/v1/plugin-tunnel/send` | `x-zr-tunnel` (the tunnel id from the open line), `x-zr-seq` (strictly increasing from 0) | Raw bytes, ≤ 64 KiB | `{"ok":true}` — sent only after the plugin's socket took the bytes (backpressure: a stalled plugin slows THIS send) |
+| `/v1/plugin-tunnel/close` | `x-zr-tunnel` | none | `{"ok":true}`, idempotent (an unknown id still answers ok) |
+
+The open route's validation chain is **entirely shared** with `/v1/plugin` (registry → version and digest → the declared-route match (exact / prefix) → parse-once query → share table → consent wall; same order, same codes), plus one wall of its own: the route must ALSO be declared `upgrade: true` — behind an ordinary route there is no WebSocket endpoint to dial, so 404 `route-undeclared` (`prefix` cannot be combined with `upgrade`, so prefix sub-paths never reach the tunnel). On success the relay dials the local web server ITSELF (net/tls, loopback only; self-signed https verification is relaxed only for the literal `127.0.0.1`), hand-writes the upgrade request from the four received headers plus the operator's cookie (no Origin), and pumps the socket's bytes into the NDJSON stream line by line:
+
+- The first line `{"type":"open","tunnel":"<32 hex chars>"}` is the client's signal to stop HTTP-ing and start reading; a dial failure does not drop the connection — it becomes an `end` line before the stream closes;
+- `{"type":"data","b64":"…"}` carries upstream bytes (base64), at most 48 KiB of **raw** bytes per line (base64 inflates by 4/3 — the cap is on the raw bytes);
+- `{"type":"ping"}` heartbeat lines (default one per 15 s) keep reverse proxies from cutting an idle stream; the slow-reader discipline matches the relay streams — a client that stops reading pauses the UPSTREAM socket, and this process never buffers for a slow reader;
+- The final line `{"type":"end","reason":"upstream-closed"|"upstream-error"|"client-closed"}` precedes the stream close; close bytes the plugin sent (if any) already travelled as data lines — no WebSocket close frame is synthesized.
+
+The open body caps at 1 MiB (413 past it); each device holds at most 8 concurrent tunnels, 429 `busy` past that. A tunnel belongs to the device that opened it (`x-zen-remote-device`): another device's send/close answers 404 `tunnel-unknown`; a send whose `x-zr-seq` is not the expected sequence answers 409 `tunnel-out-of-order` and **closes the tunnel immediately** — a broken ordering contract makes the stream untrustworthy. Beyond these tunnel-specific codes, every other refusal matches the `/v1/plugin` error table (the validation chain is shared).
+
+---
+
+## Peer nodes & virtual networking
+
+`role: peer` is the third role: the machine keeps every serving half of a `host` (phone/browser QR access, lock-screen push, session sharing stay mounted) while joining a virtual network organized by a self-hosted relay gateway (`gateway-server/`, deployment in [`gateway-server/README.md`](../gateway-server/README.md)). Member machines discover each other automatically in both directions and mount each other's **remote-enabled** sessions into their sidebars — no public IP, no per-machine pairing codes, one invite link per machine.
+
+### The three roles compared
+
+| Role | `servesRole` (serving halves mounted: gateway / relay / push) | `connectsRole` (dial-out halves mounted: relay client / pool) | In one line |
+| --- | --- | --- | --- |
+| `host` (default) | ✅ | ❌ | This machine is a server: phones and desktop clients connect in |
+| `client` | ❌ | ✅ | This machine is a sub-client: connects to others, serves nobody |
+| `peer` | ✅ | ✅ | This machine is both a server and a network member: keeps phone QR access and push, joins the virtual network |
+
+Role resolution discipline: `resolveRole` accepts only the exact strings `client` / `peer` — anything else degrades to `host`, so a typo cannot amputate half the plugin. `role: peer` and `maxServers` (`LAN_GATE_MAX_SERVERS`, 1–64, default 8) are tunable in the advanced settings table; in peer mode the network-reported `maxPeersFromGateway` includes this machine, so the remote mount limit is that value minus one. An explicit local `maxServers` further limits it without being overwritten. When a member leaves or is ignored locally, eligible waiting peers fill the available slots. Lowering the local mount limit does not forcibly disconnect existing mounts; an administrator revoking admission still removes that peer immediately.
+
+### The invite link
+
+```
+zr-net://<host>[:port]/<networkId>[?tls=0|1][#<joinKey>]
+```
+
+- All newly generated invite links use the unified `zr-net://` scheme and infer transport from the host by default (loopback / private IPv4 / link-local / IPv6 ULA / CGNAT `100.64.0.0/10` / `localhost` / `.local` / `.lan` default to plaintext; other public hosts default to TLS), attaching `?tls=0` or `?tls=1` only when overriding the host default. Legacy `zr-nets://…` and `zr-net+insecure://…` links remain readable for backward compatibility.
+- Self-hosted `gateway-server` natively supports **single-port (`19393/tcp`) TLS** alongside direct HTTP/WS and optional Nginx/Caddy reverse proxies: mount `/certs` (`ZR_GATEWAY_CERT_DIR`) or upload/select certificates in **Gateway admin → Gateway & mail settings → TLS & Certificates** to enable HTTPS/WSS without splitting `19393/tcp` or the `19393/udp` + `19394/udp` STUN ports. TLS mode strictly verifies the trust chain and hostname and never silently falls back to plaintext; HTTP/WS lacks TLS authentication of the gateway control plane, while session content still has separate end-to-end encryption and local TOFU.
+- `#<joinKey>` is a **first-join credential only**: the join challenge-response handshake binds the identity with it once, and it never travels as a plaintext URL path afterwards.
+- Links are generated in the gateway's web console; the parser lives in `parseInviteUri` in `src/peer/crypto.ts`.
+- CLI joining: `npx dsh-zen-remote setup --role peer --invite "zr-net://…"`, or `dsh-zen-remote peer join <uri>`; `peer status` shows this machine's nodeId, admission state, and the network's peers with their live connection paths; `peer trust <nodeId>` explicitly re-trusts a changed identity after a mismatch block; `peer leave` leaves the network.
+
+### Connection path priority
+
+Each pair of member machines picks its path in this order:
+
+1. **`lan` — LAN direct**: the peer's address is in the same subnet (RFC1918 /24, or loopback; excludes CGNAT virtual tunnel ranges such as `100.64.0.0/10`);
+2. **`p2p` — UDP hole-punched direct**: the gateway's dual UDP ports (primary + alt, see the gateway deployment docs) exchange punch coordinates and the machines connect directly;
+3. **`relay` — gateway ciphertext relay**: when no direct path is ready within the 1000ms punch window, traffic transparently switches to the gateway's WebSocket — still end-to-end encrypted, unreadable to the gateway.
+
+Background re-probing uses a `3s → 8s → 25s` progressive backoff and upgrades back to direct as soon as the initial handshake RTT plus a `200ms` fast follow-up probe pass the RTT cap (when enabled). An established direct path is declared lost 15 seconds after its last valid receive (`onDirectLost` remains the sole criterion for tearing down the underlying `PunchSession`) and falls back to relay (or after 2 consecutive unanswered PINGs). The keepalive layer tracks up to 2 in-flight probes in a dual-slot `pendingPings` ring (a new 5s keepalive tick clears stale slots from the previous cycle so expired PONGs are still rejected, whereas intra-cycle `+200ms` fast-confirm retries and short-timeout retries preserve the prior slot so delayed PONGs still match) and enables intra-cycle short-timeout retries by default (`pingRetryDelayMs = 1500ms`, reporting 2 unanswered probes at `+1.5s` and `+3.0s` to trigger `demoteDirect` in `~3s` without prematurely destroying the 15s `PunchSession`); on the data plane, `PeerArqSession` uses existing RTO timers to detect zero-SACK stalls across `stallSuspectMs` (default `3.5s`) while a stream has in-flight fragments (distinguishing long-lived idle streams and receiver-backpressure zero-advancing SACKs, with synchronous `flushInflight()` re-entry early return on `onRto`), notifying the engine with a `10s` cooldown to demote when small PINGs pass but large DATA frames blackhole. Active fault demotion (`setRelayPath(nodeId, true)`) unconditionally sends a sealed WS `PING(streamId=0)` demote beacon even when `arq.inflightTotal() === 0`, allowing the receiver to penetrate the promotion grace window and reorder drain window in `0ms` and switch to `'ws'` synchronously (whereas re-anchoring via `resetPeerForReanchor` passes `sendDemoteBeacon = false` to avoid locking the peer into a 30s hold); within `500ms` (`WS_REORDER_GRACE_MS`) after receiving the first direct UDP frame, pre-promotion in-flight ordinary WS frames are absorbed without false demotion (ordinary WS frames arriving after `500ms` still demote for legacy-peer compatibility), late or same-key replayed `HELLO` envelopes within the grace window are answered with `ACK` without kicking the direct path, and key rotation resets inbound WS sequence counters; when one side promotes to direct (`promoteDirect`), it immediately sends a 0-byte UDP `ACK(streamId=0)` unlock frame to clear the peer's 30s `peerRelayHoldUntil` cooldown and pairs with `triggerFastProbe` (5s cooldown gate) so the slower side converges to direct within `~300–500ms` (`punch-coordinate` messages omitting `pluginVersion` preserve the peer's known version). During cold start, `PeerMux` waits up to `relayHandlerWaitMs` (engine default `3000ms` polled every `50ms`; standalone `PeerMux` default `0`) for the host relay handler to mount before returning `503 relay-unavailable`. The control-plane WebSocket runs a `10s` Ping / `15s` Pong heartbeat to reap half-open connections; when a node reconnects, changes local LAN interfaces, or observes a peer's gateway connection epoch (`connSeq`) advance, both ends symmetrically reset peer sessions onto relay first and re-punch, with automatic `mux` handshake self-healing and bounded `p2p` ARQ flow control (`windowSize = 16`, RTT-adaptive RTO `120–1000ms`). Recovery requires a reachable gateway and peer; these default timings do not guarantee lossless recovery from every outage.
+
+Ordinary known-length peer uploads and all `RelayClient` request paths (in addition to `invoke`, `openStream`, and `fetchSessionSnapshot`, covering `connect`, `postEventResult`, `unshare`, `http`, `pluginRequest`, `pluginTunnelOpen`, `pluginTunnelSend`, and `streamLines` uplink — 8 paths in total) add the `peerRecoveryMarginMs` (default 20-second) recovery budget while keeping `probeHealth()` capped at `<= 8s` so pool health sweeps never block (with `~3–4s` short-timeout/stall demotion, `15s` no-receive fallback to relay, and control frames prioritized past `DATA` bursts). Isolated functional tests cover mid-upload direct→relay and relay→direct transitions with matching byte counts and SHA256, and a single business forwarding operation. This does not establish acceptance for unknown-length streams, arbitrary file sizes, or every real NAT environment. On `role: 'peer'`, any `/_dsh/zen-remote/client/*` route other than `remote-status` carrying `x-zen-remote-via` is refused with `403 via-gateway`.
+
+### Join readiness and pausing
+
+- The wizard's advanced section accepts a gateway address, a 16-digit hexadecimal network ID and an optional passphrase. Omitting the passphrase uses the existing manual-approval flow. The passphrase is masked; collapsing the advanced section, leaving the form or closing the wizard clears that draft.
+- The third light means the remote handshake is complete and synchronization can begin, not that a particular session has finished synchronizing. No peers means waiting for another device. All-ignored peers, partial connectivity and older responses without readiness facts do not turn all lights green.
+- By default, `peer join` waits for readiness and exits nonzero on timeout while reporting the last state. Successful `--no-wait` means submitted only; JSON distinguishes `submitted` from `ready`. Ctrl-C during the wait returns 130 without withdrawing an already submitted join request.
+- Pausing retains the membership record and stops business connections. Updated nodes retain a restricted control connection and can resume without rejoining. Changed identities still require separate trust decisions at the gateway and affected nodes.
+- The network limit includes this machine. `authorized / paused / mismatch` occupy seats; pending and revoked members do not. Shrinking preserves existing mounts, reports `N > M` honestly and blocks additions; increasing the limit fills eligible slots again.
+
+### Gateway and node upgrade order
+
+Back up the gateway database and `master.key`, upgrade the independently deployed gateway, then upgrade each node. Updated gateways accept `blocked` paths and unknown latency as `null`; older gateways may discard these telemetry rows. A missing console edge is therefore not proof that the business connection is absent. Mixed versions may also lack in-place pause recovery; complete both upgrades before accepting recovery behavior.
+
+During `/peer/v1/ws` handshakes, peers and the gateway exchange lightweight version metadata (`hello` sends `pluginVersion` and `wireCompatLevel`; `welcome` and `peer-joined` broadcast `gatewayVersion`, `wireCompatLevel`, `wireCompatRange`, `recommendedPluginVersion`, and each member's `pluginVersion`, inferring `0.1.0` for legacy gateways that omit version fields). Only incompatible wire protocols refuse admission (`version-incompatible:*`) and halt reconnect backoff. Within compatible protocol versions, `/_dsh/zen-remote/client/peer/status` exposes a sanitized `versionSync` summary (with `gatewayConsoleUrl` stripped of paths, `networkId`, and `#joinKey`): legacy `0.1.0` gateways trigger a one-time dismissible upgrade modal for `peer` users, whereas `0.2.0+` gateways remain completely silent on chat screens and only show per-version dismissible gentle pills in settings, the wizard, and `dsh-zen-remote status`.
+
+Peers and the gateway control plane use the mutually bound `zr-peer-hs-v2` handshake protocol exclusively (no downgrade to unbound legacy handshakes); both `HELLO` handshake envelopes and the gateway WS control-plane auth enforce a symmetric `±5 minute` clock tolerance window, so keep machine clocks within 5 minutes of the gateway.
+
+Unknown latency appears as `—`; only a measured zero appears as `0 ms`. An identity block reported by either end is shown as blocked. Console topology and device rows apply **strict bilateral direct merging**: a pair counts as direct (showing the RTT range) only when both directions report a direct path (`lan` / `p2p`); if one side reports relay or has not yet reported while the other still reports direct, both sides display *"Relayed via gateway"* with `—` latency, and fully direct devices never show a conflicting *"Relaying"* indicator. Historical API names such as `liveRelayKbps` and `relayKbps` remain, but their values are **1024 bytes per second**, displayed with the existing `KB/s` label.
+
+### Transport upgrades and resource limits
+
+- Direct HTTP/WS, built-in single-port (`19393/tcp`) native TLS, and reverse-proxied HTTPS/WSS all remain supported. TLS verifies certificates and never silently falls back to plaintext.
+- Updated nodes retain the existing binary frame types and work through existing relay gateways. Ordinary requests and large responses interoperate with older nodes; upgrade both nodes for cancellation acknowledgements, state reclamation and receive flow control on both sides.
+- Cancellation is acknowledged and retried for a bounded period. Older nodes do not acknowledge cancellation, so mixed versions cannot guarantee remote subscription cleanup after packet loss. Retries of a completed legacy stream after the final-ack cache expires (60 seconds by default) may receive a reset instead of a final acknowledgement; the request is never re-executed.
+- Budgets limit queued/in-flight bytes, not total file size. Large responses and uploads use a segmented pipeline. Progressing long transfers and quiet live sessions without outstanding data are not closed based on total duration; outstanding data that makes no progress for the transport deadline (30 seconds by default) fails explicitly and releases resources.
+- Extremely fragmented stream IDs can exhaust the permanent terminal-range budget. Existing active streams remain usable, but new streams are explicitly refused until the node rejoins with a new session; replay protection is never discarded to force recovery. Normal consecutive IDs merge into ranges rather than consuming one permanent range per completed request.
+- The disabled-account admission fix requires updating the separately deployed `gateway-server`; updating only desktop plugins does not replace gateway authentication logic.
+
+### Security model & zero-knowledge boundary
+
+- **Self-certifying identity**: `nodeId = sha256(Ed25519 public key)[0..8]` — anyone holding the `(nodeId, public key)` pair can verify it independently; the gateway cannot forge a device it has never seen.
+- **Per-session end-to-end encryption**: for every pair of nodes and every session, both sides exchange ONE **ephemeral** X25519 key pair (verified using long-term Ed25519 signatures and the current handshake round; binding strength follows the mixed-version rules above) and derive bidirectional simplex AES-256-GCM AEAD keys via HKDF (forward-secret). The wire protocol's 28-byte routing header is the only plaintext (the gateway routes on it alone); payloads are unreadable to the gateway.
+- **Independent local TOFU pinning**: each machine pins its network peers' public keys in its own state file (`pinnedPeers` in `~/.dsh/zen-remote-state.json`; `verifyOrPinPeerKey` never auto-overwrites). Even if a gateway administrator resets a device's identity and the console shows `mismatch`, every other machine keeps refusing it locally (`identity-mismatch` — no handshake, no mounting) until someone at that machine explicitly clicks "trust new identity" or runs `dsh-zen-remote peer trust <nodeId>` to re-pin.
+- **Anti `zr~` re-nesting**: a remote session this machine mounts carries a `zr~<serverId>~<id>` virtual id; the share table refuses to register a virtual id as this machine's own shared session — "A mounts B, B re-exports A's sessions to C" chaining cannot happen, so session data crosses at most one hop in the network.
+- **Zero-knowledge gateway**: the gateway sees routing headers and ciphertext frames only, holds no session keys; what an administrator sees in the console is membership and online state, never session content.
+
+---
+
+## Push notes
+
+- The VAPID key pair is generated automatically on first boot and persisted to `~/.dsh/lan-gate-state.json` (override the directory with `DSH_HOME`); the public key is delivered to the page via the injected bootstrap script.
+- `/pwa/push/subscribe` requires a valid device token cookie (i.e. the device must already be paired); each device gets at most one subscription, capped at 20 total, to keep strangers from spamming your server with subscriptions or using it to fire requests elsewhere.
+- Push payloads carry only a title and a short body line (e.g. "DSH task complete") — **never any conversation content**. Delivery is standard Web Push (VAPID-signed, aes128gcm-encrypted); only the push service and your browser ever see the plaintext.
+- Revoking a device deletes its push subscription too; a 404/410 from the push endpoint (expired subscription) gets it auto-cleaned on the next send.
+- Mobile browsers require HTTPS before they'll register a service worker at all, so both push and offline support depend on step 2's reverse proxy — neither works on a real device until HTTPS is in place.
+- "When do I get pushed" is decided by the optional host plugin `dsh-push.mjs`: it listens on the DSH event bus and calls the local `/pwa/push/send`. Two legs. **Event leg (on by default, always fires):** a tool is waiting for your authorization (session event `approval/asked` with no matching `approval/decided` within 1.5s), or the model called `ask_user_question` and is waiting for your answer (session event `tool/call`). Neither is suppressed by the debounce, and both fire for subagents too. **Turn end (off by default):** for the old "buzz me when it finishes" behaviour set `DSH_PUSH_TURN_END=1` (this was the default before 1.0.3 — now it must be turned on explicitly); once on, only top-level sessions push and a subagent finishing never does. Which events count as a turn end still comes from `DSH_PUSH_EVENTS` (comma-separated), default `agent/turn-stopping` — the official turn-close checkpoint; override it if your DSH version names it differently. `DSH_PUSH_DEBOUNCE_MS` (default 15000) sets the minimum gap between notifications. Want the turn's outcome in the body? Set `DSH_PUSH_SUMMARY=1` and the body becomes the turn's final **text** output (`text` blocks only, so the model's reasoning never leaks; a turn that produced no prose falls back to the last tool name; truncated to 120 chars). The push payload is aes128gcm-encrypted end to end — Google/Apple push servers only ever see ciphertext; the remaining exposure is your own lock screen / notification center (both OSes can hide notification content on the lock screen if that matters to you). You can also skip the plugin entirely and trigger pushes yourself: `curl -X POST http://127.0.0.1:3088/pwa/push/send -H 'Content-Type: application/json' -d '{"title":"DSH task complete"}'`.
+- "The model pushes on its own" is the same `dsh-push.mjs` additionally registering a model tool, `push_notify` (`title` required, `body` optional), over the same encrypted `/pwa/push/send` path. Its description spells out both when to call it **and when not to** (listing only the former turns it into a per-turn reflex), and the same text is also injected as standing session context via `ctx.systemPrompt` — both come from one shared constant, so they cannot drift apart. It only shows up when the host has a tool registry (`ctx.tools`) and hasn't disabled it; `pushTool: false` in `lan-gate.config.json` (or `DSH_PUSH_TOOL=0`) turns it off entirely. Rate limiting is independent from the automatic notifications above: at most 1 push per session per 60 seconds, 20 total per hour across all sessions — over the limit, the call is silently skipped (not sent, not an error), so a chatty model can't turn your phone into a notification firehose. A push it does send resets the shared debounce clock, so an automatic notification right behind it is suppressed.
+
+---
+
+## Security boundary
+
+**What's covered:**
+- Pairing-code brute force — the code is single-use with a 10-minute TTL, and 5 wrong attempts locks that source IP for 15 minutes.
+- Role-bound codes — a web-device code cannot redeem through the desktop channel and vice versa; wrong-channel attempts neither consume the code nor count toward the lockout.
+- Revocable tokens — lost device, lent-out machine, one click in the settings block and it stops working immediately (open connections, established HTTP relay streams and push subscriptions all die with it).
+- Desktop clients are fenced into the relay prefix — every other path (DSH pages, `/api` included) gets 403.
+- The relay's three gates — device token, gateway marker headers + the per-load shared secret (`LAN_GATE_RELAY_SECRET`, not externally settable), and the per-method allowlist with output filtering; an unshared session's data never leaves the box.
+- Request volume — **unpaired** requests are rate-limited per resolved real client IP, 120/min by default, 429 past that; paired devices are exempt (desktop clients have the relay's own concurrency caps instead).
+- The admin surface is local-only — generating pairing codes, managing devices, triggering pushes: all local-direct only (loopback socket, no forwarded headers, loopback Host), and anything through the proxy (always carries forwarded headers) gets 403; so do requests carrying an `Origin` header or a non-JSON body (403/415) — DNS rebinding and cross-site simple requests cannot get in; a forwarded request wearing the gateway marker may read but not mutate (toggling a session's remote access excepted, see above).
+
+**What's not covered — your responsibility:**
+- A misconfigured reverse proxy — e.g. accidentally exposing `127.0.0.1:3088/lan-gate/admin` on the public domain too, or a wrong `X-Forwarded-Proto` making the gateway misjudge the client's protocol. These are configuration mistakes the gateway can't defend against.
+- A stolen or shared token — this is a single-user tool; the token is equivalent to full access, with no finer-grained permission tiers. Whoever has the token can use it — if you suspect a leak, revoke it and re-pair from the settings page.
+- **A desktop client is a trusted device** — its terminal runs as the server user without the agent sandbox or approval restrictions, file previews are not contained to the session directory, and it can create sessions in any server workspace. "Only shared sessions are visible" constrains session data, not the machine; giving a pairing code to a computer you don't trust is handing it the machine.
+- DSH's own capability boundary — the gateway only forwards traffic to DSH safely; it can't and doesn't add security measures DSH itself doesn't have (DSH's own `/api` trust fence is DSH's concern).
+- The state file `~/.dsh/lan-gate-state.json` stores the VAPID private key and every device's token in plaintext — this file *is* full access to your gateway. Mind its file permissions on the host, and don't sync `~/.dsh` into a shared drive or an untrusted backup location.
+- The client role keeps its own state file, `~/.dsh/zen-remote-state.json` (0600, atomic tmp+rename writes): the local server identity, the shared-session table and **the device tokens of every paired main server (up to 8)** all live in it — it is equivalent to full access to every paired server, and deserves the same care as the bullet above. The legacy scatter files `zen-remote-server.json` / `zen-remote-shares.json` migrate into it automatically on first start and are then deleted.
+
+---
+
+## Known issue: iOS 26.x viewport shrink
+
+On iOS 26.x, once DSH is added to the home screen and opened as a standalone PWA, the layout viewport loses a chunk of its bottom edge (measured on one iPhone on 26.5: 852px screen vs. 793px viewport — exactly one status-bar's worth) from cold start onward, until the app is fully quit and reopened. The same URL in a plain Safari tab is unaffected.
+
+This is not a bug in this plugin — it's a known iOS 26.x system defect (the layout viewport permanently shrinks the first time the on-screen keyboard is shown inside a standalone PWA; `innerHeight`, `visualViewport.height` and `100dvh` all shrink together). The missing strip sits outside the document, so no stylesheet can reach it — only the system paints it, using the manifest's `background_color`. This repo keeps that value at a light `#f9fafb` (matching the interface half's light theme background) so the dead strip blends into the page instead of standing out as a dark bar.
+
+> The Android bottom band is **not** painted from this value — do not change it to chase that. It is the Android system navigation bar, which follows the system dark-mode setting and is out of the page's reach.
+
+That's a visual mitigation, not a fix: in dark theme the strip is actually more visible (the manifest color can't follow the page theme), and it's also the launch-splash color, so the splash went from dark to light. The underlying shrink can only be fixed by Apple. the interface half applies two further mitigation layers (detection + an active reflow "heal") on its own side — see that plugin's README for details.
+
+---
+
+## FAQ
+
+**Upgrading from an older version — what do I need to do?**
+The old model approved devices by source IP, which is meaningless under the new token model. The first time the gateway starts with the new version, it detects the old state file and renames it to `lan-gate-state.json.v1.bak` (no data migration). Every device needs to go through pairing again.
+
+**The pairing code says expired or wrong — now what?**
+Codes are valid for 10 minutes and single-use — once expired or already used, go back to the local admin page and generate a new one. Five wrong codes in a row locks that source IP for 15 minutes; wait it out or try from a different network.
+
+**Not receiving push notifications?**
+Check in order: is the phone accessing an HTTPS domain (over plain HTTP the browser never registers a service worker, so push has nothing to run on)? Has the browser or the OS denied notification permission for this PWA? Check the local admin surface (`/lan-gate/status`) to see whether that device shows the 🔔 marker, confirming the subscription actually succeeded.
+
+---
+
+## Test locally
+
+```bash
+npm test   # boots a mock upstream, runs the gateway/auth/push suites: proxy+injection, pairing flow, push delivery
+```
+
+---
+
+## Troubleshooting: attach the debug report before screenshots
+
+When filing a GitHub issue, first click **Export diagnostics** at the very bottom of the plugin settings page **on the machine that misbehaves** and attach the downloaded JSON. It carries versions, role, config shapes (no addresses, no tokens), every interception/redirect diagnostic counter, the upload-redirect probe (`installedVia` tells whether the fetch-route wrap came in via inject or the fallback), and the last ~300 plugin event log lines (event codes and id shapes only — never conversation content; sub-client plugin route and WebSocket upgrade refusal logs are throttled per `(kind, plugin, reason)` over a 5-minute window at `info` level with prior-window suppression counts, routing in-window repeats to `debug` while still incrementing `diagnostics().refused` and `refusalsByReason` on every refusal so high-frequency polling never washes out the 300-entry `logRing`), all passed through two redaction layers (absolute paths keep only their leaf, URL hostnames degrade to an address class, token-shaped runs are masked). Exporting from both the server and the sub-client is ideal. Remote devices **cannot** fetch this report through the gateway (refused by the via wall) — it exports locally only.
+
+---
+
+## Layout
+
+| Path | Role |
+| --- | --- |
+| `lan-gate.mjs` | Gateway sub-plugin entry, loaded by the main entry on the host role: spawns the gateway child process and manages its lifecycle |
+| `dsh-push.mjs` | Push sub-plugin (loaded alongside the gateway on the host role): listens on the DSH event bus, calls the gateway's local `/pwa/push/send`, and registers the `push_notify` model tool |
+| `lib/lan-gate-server.cjs` | The gateway itself: single-file CommonJS (Node stdlib + one runtime dependency, `web-push`) — HTTP/WebSocket reverse proxy, pairing/tokens, rate limiting, PWA injection, Web Push |
+| `pwa/manifest.json` | PWA install manifest |
+| `pwa/sw.js` | Service worker (offline caching + push notifications) |
+| `pwa/inject.js` | Injected page bootstrap: SW register, gesture loader, push subscribe |
+| `pwa/touch-gestures.js` | Edge-swipe back / pinch-zoom |
+| `pwa/app.css` | Mobile touch-first CSS (`data-lan-device`-prefixed, desktop unaffected) |
+| `pwa/offline.html` | Offline fallback page |
+| `pwa/icons/` | SVG source + rasterized PNGs (192/512 + maskable) |
+| `cordis.patch.yml` / `.example` | Bundle patch layer / static-mount example |
+| `test/gateway.test.cjs` | Smoke tests: gateway boot, `/pwa` asset serving, HTML injection |
+| `test/auth.test.cjs` | Pairing flow, tokens, lockout, v1-state archival, survives restart |
+| `test/push.test.cjs` | Push subscribe/send, VAPID encryption, expired-subscription cleanup |
+| `test/util.cjs` | Shared test harness (boot/request/pair helpers) — not a test file itself |
+
+See [`AGENTS.md`](../AGENTS.md) for development conventions.
+
+---
+
+## Changelog
+
+### v0.3.0
+
+**Added**
+
+- Clear division of labor with the interface half: layout rules handed off entirely, this repo keeps only shell-level CSS (see "Division of labor" above);
+- Service worker bumped to v3: cache strategy changed from "shell and client assets both stale-while-revalidate" to "only the static shell is cache-first, everything else is network-first" — a new deploy is picked up immediately instead of leaving stale CSS behind across devices;
+- First-frame HTML now carries `viewport-fit=cover` directly, so a standalone PWA's safe area is correct from the very first frame instead of waiting for the client bundle to patch it in;
+- `dsh-push.mjs` adds a model tool, `push_notify`: the agent can decide for itself that a push is warranted (needs a decision, hit a key milestone, needs a human after an error) and fire it mid-task instead of waiting for the whole turn to close. Same aes128gcm-encrypted channel; host-side rate limiting (1/60s per session, 20/hour globally) and the `pushTool` switch (`lan-gate.config.json`) are independent of the existing turn-close auto-push.
+
+**Fixed**
+
+- Manifest and icons are now credential-less (no longer stuck behind the pairing wall) — this used to hide the install prompt on Android/desktop Chrome, with iOS Safari the accidental exception since it sends cookies on that fetch anyway;
+- The gateway now strips an upstream manifest `<link>` tag that used to shadow the gateway's own mobile-tailored manifest (browsers only honor the first manifest link);
+- Service worker registration now declares `scope: '/'` plus a `Service-Worker-Allowed: /` response header — previously its default scope was only `/pwa/` and it never actually controlled the app;
+- Removed the gateway's dead inline `DEVICE_CSS` copy, whose fullscreen-dialog rule used to stretch the interface half's session-info card off-screen — long misdiagnosed as an iOS/Chromium engine difference;
+- CSS/gesture gating switched from the literal `"phone"` value to "not desktop" — a real paired device defaults to kind `"auto"`, so the old gate never actually fired on a real phone;
+- Removed pull-to-refresh (an accidental overscroll used to fire a full reload mid-conversation); removed edge-swipe-back, handing that 24px zone to the interface half's own gesture (the old handler was a no-op against DSH's client-side routing anyway);
+- `manifest.json`'s `background_color` switched to a light color as a visual mitigation for the iOS 26.x standalone-PWA viewport shrink dead strip (known OS defect, not a fix — see "Known issue" above). Unrelated to the Android navigation bar.
+
+**Internal**
+
+- `pwa/app.css` trimmed from 163 to 95 lines; added `test/sw.test.cjs` covering the service worker's new cache strategy.
+
+---
+
+## Security
+
+Installing a plugin runs third-party code with your own permissions; being listed or published is not a security review. The gateway listens on `127.0.0.1` only by default and will not expose itself to the public internet on its own — every public-facing path must go through a reverse proxy you configure and that terminates TLS yourself. Run this only on your own server, keep the state file out of untrusted locations, and audit changes to `lib/lan-gate-server.cjs`.
+
+## License
+
+MIT. The gateway `lib/lan-gate-server.cjs` extends `dsh-mobile-gate`; original MIT copyright/license retained — see [LICENSE](../LICENSE).

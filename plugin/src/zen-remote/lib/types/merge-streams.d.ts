@@ -1,0 +1,544 @@
+/**
+ * Pure mergers for the three GLOBAL calls (T23b-2): `workspace/follow` and
+ * `session/control` are STREAMS whose frames carry no session-locating
+ * argument, and `session/list` is an unscoped invoke — the sidebar reads all
+ * three to render its tree, so a sub-client must see the server's shared
+ * sessions merged INTO the local answer instead of in place of it.
+ *
+ * Frame and result shapes are the generated 0.2.0 codecs, field by field:
+ * `workspace_follow_result` (baseline / upsert / remove / order / archived /
+ * pinned), `session_control_result` (exactly two frame types: `baseline`
+ * nesting `value.projections`, and one-key `projection` updates), and
+ * `session_list_result` (`{ items }` — no cursor field). The same shapes the
+ * server filters by (relay-filter.ts); remote frames arriving here have
+ * ALREADY been narrowed to the shared sessions and carry ORIGINAL ids.
+ *
+ * The rules, mirroring tasks/T23b2.md as corrected by tasks/T23b2-fix.md:
+ * - local frames pass through, except that `baseline` / `order` get the
+ *   remote workspaces APPENDED to their order (remote groups sort after
+ *   local) and the `archived` / `pinned` lists merge local + remote;
+ * - a remote baseline NEVER travels as a second baseline — it would wipe the
+ *   local data. It becomes one virtualized `upsert` per remote workspace,
+ *   then the merged `order` / `archived` / `pinned`;
+ * - remote frames that arrive before the local baseline are CACHED as state
+ *   only — the UI has seen nothing yet, so emitting them would order
+ *   workspaces the local baseline would immediately erase;
+ * - a remote stream that died (or a merely offline relay) emits NOTHING and
+ *   keeps the shown state ({@link WorkspaceMerger.onRemoteDown}): the UI's
+ *   `ClientWorkspaceModel.remove()` records ids in a never-cleared blacklist
+ *   and both `upsert` and baseline replacement drop blacklisted ids, so one
+ *   `remove` for a virtual id would make that group un-revivable on
+ *   reconnect — while the UI itself keeps the last complete projection
+ *   visible across carrier loss (its `handleCarrierFailure`);
+ * - a NEW remote baseline on the same server is DIFFED against the shown
+ *   set: still present → fresh `upsert` (content from the new baseline),
+ *   absent (deleted server-side / no longer shared) → `remove`, then the
+ *   merged `order` / `archived` / `pinned`;
+ * - a server RENAME (same serverId) re-upserts the shown groups under the
+ *   new title — no removals ({@link WorkspaceMerger.onServerRenamed});
+ * - only a serverId CHANGE removes the whole group
+ *   ({@link WorkspaceMerger.onRemoteGone}): the new prefix is fresh, so it
+ *   can never collide with the UI's blacklist. The relay entering
+ *   `unpaired` / `revoked` is NOT this case (T23b2-fix3): the server
+ *   persists its serverId (relay-server.ts loadServerId), so a re-pair to
+ *   the same server reuses the prefix and is handled as a remote death
+ *   ({@link WorkspaceMerger.onRemoteDown}) — the reconnect diff revives
+ *   the group;
+ * - a relay status that is not serving normally (T34: offline, unpaired,
+ *   revoked, interface mismatch) only ANNOTATES TITLES: setStatus +
+ *   onStatusChanged re-upsert the shown groups under the annotated titles,
+ *   and the reconnecting baseline (which always upserts) restores them.
+ * - a session the SERVER stopped serving (remote closed / idle-slept / its
+ *   fork parent closed → the filtered workspace upsert drops it from
+ *   `sessionIds`) keeps a TOMBSTONE in the group it was last seen in (CP4,
+ *   reworked by CP4-client-fix2): the merger remembers the workspace each
+ *   session id was last carried by, and the forwarded record for THAT
+ *   workspace still lists the id (appended at the end of `sessionIds`). The
+ *   UI's session store keeps the merged projection/list entry and nothing
+ *   ever removes it, so without this the sidebar would park the session in
+ *   「未分组」 forever — and hiding it in the merged `archived` frame instead
+ *   (what CP4-client first did) makes the RT navigation guard
+ *   `clearArchivedCurrent` (dsh-client-ui-workspace `watchNavigation`) kick
+ *   the OPEN session page back to the home page before its 「远程已关闭」
+ *   banner can show. A re-share (the id back in some workspace's
+ *   `sessionIds`) renders it live again and clears the tombstone; the
+ *   tombstone dies with its workspace (a remove) and with the identity
+ *   (onRemoteGone).
+ * - T58 reworks the tombstone's VISIBILITY, reshaped by T65: a closed-remote
+ *   session is HIDDEN — moved into the merged `archived` set (the host's
+ *   `sessionVisible` hides archived ids under the default filter) — while
+ *   STAYING in its group's forwarded `sessionIds`: under「显示已归档」it
+ *   renders in place, and it can never resurface as a 「未分组」 stray. The
+ *   one exception is the session the user currently has OPEN: it is not
+ *   hidden at all (the page must keep its 「远程已关闭」 banner), and once
+ *   the caller reports a different current session
+ *   ({@link WorkspaceMerger.setCurrentSession}) it moves into `archived`
+ *   too. `archived` is exactly what the host's navigation guard
+ *   `clearArchivedCurrent` acts on, so the CURRENT session may never enter
+ *   it — and an unreadable current-session signal falls back to the
+ *   conservative tombstone behavior (nothing is hidden). Because the
+ *   browser's report can lag the user's switch by up to a poll interval, a
+ *   JUST-created tombstone is not hidden for a short grace (T65, injectable
+ *   clock): the 1s poll re-judges with the fresh report afterwards — the
+ *   session the user really switched to keeps its tombstone, anything else
+ *   hides. Re-sharing the session takes it back out of `archived`
+ *   (live-carried ids never count as hidden). Since hiding moves only the
+ *   archived set, hide/reveal updates are exactly one merged archived frame
+ *   — no group content changes, no ordering dance; the current session
+ *   never enters the set by construction. The hidden ids are sticky: they
+ *   survive even the death of their home workspace until a re-share or the
+ *   identity ends.
+ * - workspaces from a CONNECTED server are ALL shown: the server keeps
+ *   every workspace and narrows `sessionIds` to shared sessions (relay-
+ *   filter.ts), so paired clients also see remote workspaces that have no
+ *   active shared sessions yet (for example in the New Session workspace
+ *   picker or sidebar `+` menu). While unpaired or revoked
+ *   (`isPairingDisconnected`), never-shown workspaces stay withheld until the
+ *   connection is active again. Once shown, a workspace stays shown even if
+ *   its sessions leave, and every removal path — the reconnecting baseline
+ *   diff, an explicit server remove, {@link WorkspaceMerger.onRemoteGone} —
+ *   emits a `remove` only for shown workspaces; never-shown ones leave the
+ *   state silently (a `remove` would blacklist the id in the UI's
+ *   ClientWorkspaceModel).
+ *
+ * Two KNOWN LIMITATIONS, both rooted in the UI's `removedIds` blacklist
+ * never clearing during a page's life (a reload rebuilds the model from
+ * scratch, which is why a reload fixes both):
+ * - switch to a DIFFERENT server and later back to the SAME old one: the
+ *   switch-away removed the old prefix, so the returning group's upserts
+ *   are dropped by the blacklist and it stays invisible until the page is
+ *   reloaded;
+ * - the server deletes a workspace and later shares a NEW workspace under
+ *   the SAME id: the deletion's remove blacklists the id, and the new
+ *   workspace's upserts are dropped the same way.
+ *
+ * Everything here is a pure state machine: no DSH imports, no network, no
+ * clocks — the virtual-id arithmetic is the one dependency (virtual-id.ts).
+ * Shapes are read defensively like relay-filter.ts does: a malformed frame is
+ * dropped (diagnosed through the optional hook), never forwarded.
+ *
+ * T52 adds two RESULT-side pure helpers on the same principles:
+ * {@link mergeModelCatalogs} folds the relay's `session/modelCatalog` answer
+ * into the local one (the catalog is the model-selection dropdown's data), and
+ * {@link virtualizeModelSelectionValue} rewrites a `modelSelection` projection
+ * value's provider ids to virtual group ids so the UI can find the current
+ * model's display name in the merged catalog.
+ *
+ * T52-fix2 made that rewrite CONDITIONAL on the server catalog listing the
+ * provider; T52-fix3 reverts it to UNCONDITIONAL, and the revert is final:
+ * the host's projection store is FIRST-WRITE-WINS per sequence number
+ * (dsh-api-session-controller lib/client.js:986-994 —
+ * `if (row?.kind === "sequenced" && seq <= row.seq) return`, and the
+ * seed / list blocks take the same road). A projection rewritten ORIGINAL
+ * while the catalog had not landed yet occupies its seq; when the catalog
+ * arrives, the same seq's VIRTUAL value is dropped as stale — the server
+ * group never gets its check mark, and resubmitting a reasoning effort
+ * echoes the ORIGINAL provider back, which `session/selectModel`'s routing
+ * refuses ("请选择「服务端 · …」分组里的模型"). The rewrite of ONE provider
+ * must therefore not depend on when the catalog happened to arrive. The
+ * accepted cost: a provider absent from the server's OWN catalog renders the
+ * `zr~<serverId>~provider/model` fallback string (the pre-fix2 display).
+ */
+/** The (serverId, serverName) pair a merger virtualizes with. A re-handshake
+ * with a different server retargets the SAME merger ({@link retarget}) so the
+ * locally observed baseline/order state survives the swap. */
+export interface MergerIdentity {
+    serverId: string;
+    serverName: string;
+}
+/**
+ * The status annotation (T34) appended to every shown remote group's title
+ * while the relay is not serving normally. The CALLER (intercept.ts) maps the
+ * relay state onto one annotation — `revoked` / `unpaired` outrank `offline`,
+ * which outranks `mismatch` — and the merger only renders the suffix it is
+ * told to. The suffixes are the CHINESE copy, deliberately hardcoded here:
+ * this module is background code with no access to the UI language (the
+ * English forms live in src/client/locales.ts, `remoteGroup*` keys).
+ */
+export type MergerAnnotation = 'none' | 'offline' | 'revoked' | 'unpaired' | 'mismatch';
+export type MergerLang = 'zh' | 'en';
+/** One workspace record rewritten for the UI: ids virtualized, the title
+ * prefixed with the server name and — while an annotation is set — suffixed
+ * with its status copy. Values are copied — the caller's frame is never
+ * mutated. */
+export declare function virtualizeWorkspace(record: Record<string, unknown>, identity: MergerIdentity, annotation: MergerAnnotation, lang?: MergerLang, workspaceEpoch?: number): Record<string, unknown>;
+export interface WorkspaceMergerOptions extends MergerIdentity {
+    /** Monotonic re-mount epoch (`0` on first mount, incremented each time the
+     * same serverId's slot emitted `remove` frames) so re-mounted virtual
+     * workspaceIds bypass DSH `ClientWorkspaceModel`'s page-lifetime `removedIds`
+     * blacklist without requiring a page reload. */
+    workspaceEpoch?: number;
+    /** Diagnostics for frames this merger dropped (unknown type or malformed).
+     * Optional: without it the drop is silent. */
+    onDiagnostic?: (message: string) => void;
+    /** T65: the clock the tombstone hide-grace runs on. Default Date.now;
+     * tests advance an injectable fake to cross the grace. */
+    now?: () => number;
+    /** Language for status annotation suffixes on group titles (`'zh'` default,
+     * `'en'` English). Accepts a getter for live resolution. */
+    lang?: MergerLang | (() => MergerLang) | undefined;
+    /** PB-25b: the known-real-session inventory report — every time the
+     * session registry changes, the FULL current set of real ids this merger
+     * knows (the sessionHome keys: live ids and tombstones alike, each one the
+     * UI holds as a `zr~` id under this identity) is handed over as a fresh
+     * snapshot. REPLACE semantics, never a delta: the consumer's share is
+     * redefined wholesale by every report, so no invalidation bookkeeping
+     * exists on either side. Documented ceiling: an id that appears (or
+     * leaves) between two registry changes is invisible to the consumer until
+     * the next change reports — dumb but correct, and the wiring owns the
+     * other half of the contract (read-only consumption; the plugin-route
+     * rewrite never mutates merge state). */
+    onKnownSessions?: (ids: ReadonlySet<string>) => void;
+}
+/** The lists a workspace merger contributes to the MS-3 multi-server
+ * composition: the locally observed truth (identical across every slot fed
+ * the same local stream) and this server's virtualized remote contribution
+ * (shown workspaces in remote order, archived = remote archived + the T58
+ * hidden closed sessions, pinned). Snapshots — the caller may mutate them
+ * freely; nothing here hands out a live reference. */
+export interface WorkspaceMergerParts {
+    local: {
+        orderIds: string[];
+        archivedIds: string[];
+        pinnedIds: string[];
+    };
+    remote: {
+        orderIds: string[];
+        archivedIds: string[];
+        pinnedIds: string[];
+        workspaces: Record<string, unknown>[];
+    };
+}
+export interface WorkspaceMerger {
+    readonly serverId: string;
+    readonly serverName: string;
+    /** Feed one frame of the LOCAL workspace/follow stream; returns the frames
+     * the UI should see (usually exactly the input, order-merged when remote
+     * state exists). */
+    onLocal(frame: unknown): unknown[];
+    /** Feed one server-filtered frame of the REMOTE stream; returns the frames
+     * the UI should see (possibly none — state-only while the local baseline
+     * has not passed). A later baseline is DIFFED against what was shown. */
+    onRemote(frame: unknown): unknown[];
+    /** The remote stream died or the relay went offline (the same server is
+     * expected back): emits NOTHING and keeps the shown state — the UI keeps
+     * the last projection visible across carrier loss, and a `remove` here
+     * would blacklist the virtual ids against revival. */
+    onRemoteDown(): unknown[];
+    /** The remote side is gone FOR GOOD under THIS identity: a serverId
+     * change. (Since T23b2-fix3 an `unpaired` / `revoked` relay is NOT this
+     * case — the same serverId comes back on re-pair, so the caller uses
+     * {@link onRemoteDown} there.) Removes everything shown from the remote
+     * side, resets the remote state. Idempotent — a second call with no
+     * remote state returns []. */
+    onRemoteGone(): unknown[];
+    /** The server was renamed (same serverId — call after {@link retarget}):
+     * re-upserts every shown workspace under the new title, nothing else. */
+    onServerRenamed(): unknown[];
+    /** Record the status annotation (T34) future virtualized titles carry. No
+     * frames on its own — pair it with {@link onStatusChanged} to re-upsert the
+     * shown groups under the new annotation, or let the next natural upserts
+     * (a reconnecting baseline) carry it. */
+    setStatus(annotation: MergerAnnotation): void;
+    /** Re-upsert every SHOWN workspace under the CURRENT annotation: the whole
+     * update when the relay's serving status changed without any remote frame
+     * (offline, revoked, unpaired, version mismatch). [] while nothing is
+     * shown (no local baseline yet, or no remote state). */
+    onStatusChanged(): unknown[];
+    /** Record the session id the UI currently has OPEN (T58) — the raw id as
+     * the UI knows it (a virtual id for a remote session, a local id
+     * otherwise); `undefined` means a READABLE signal says no session is
+     * open. An UNREADABLE signal is expressed by not calling this at all —
+     * the merger then keeps every tombstone (the conservative fallback).
+     * Returns the frames that apply the resulting hide transitions ([] when
+     * nothing changed). */
+    setCurrentSession(sessionId: string | undefined): unknown[];
+    /** Whether some closed-remote session is being kept visible — it is the
+     * current session (waiting for the user to navigate away), or the current
+     * session was never readable (conservative fallback). While true the
+     * caller should keep polling {@link setCurrentSession} at ≥1s intervals. */
+    readonly hasPendingHide: boolean;
+    /** Point the merger at a (possibly different) server. Local state survives;
+     * for a serverId change the remote state must be gone first (onRemoteGone
+     * first); for a rename it may stay. */
+    retarget(identity: MergerIdentity): void;
+    /** MS-3: the composition inputs the multi-server orchestrator builds the
+     * canonical merged frames from — the locally observed lists and this
+     * server's virtualized remote contribution, as snapshots. Reading the
+     * workspaces runs the same {@link forwardVisible} visibility gate the
+     * frame paths use (T56/T58), so the parts can never expose a group the
+     * frames would withhold. */
+    parts(): WorkspaceMergerParts;
+}
+/**
+ * The workspace/follow merger. Remote state is a Map keyed by the ORIGINAL
+ * workspace id whose INSERTION ORDER tracks the remote order (baseline sets
+ * it, upsert appends new keys, order frames reorder it) — that sequence is
+ * what gets appended to every local baseline/order that passes through.
+ */
+export declare function createWorkspaceMerger(options: WorkspaceMergerOptions): WorkspaceMerger;
+export interface ControlMergerOptions {
+    serverId: string;
+    serverName?: string;
+    onDiagnostic?: (message: string) => void;
+}
+export interface ControlMerger {
+    readonly serverId: string;
+    readonly serverName: string;
+    /** Local control frames pass through untouched; the local BASELINE also
+     * flushes anything the remote side buffered before it arrived. */
+    onLocal(frame: unknown): unknown[];
+    /** Remote baseline → per-session per-key `projection` frames; remote
+     * projection updates → virtualized. Unknown types are dropped. Frames
+     * arriving before the local baseline are buffered (the host's snapshot
+     * stream treats an update before the opening snapshot as a protocol
+     * violation and kills the stream). */
+    onRemote(frame: unknown): unknown[];
+    /** Always [] — a control stream has nothing to remove on a temporary
+     * remote end (the workspace merger owns the group). */
+    onRemoteDown(): unknown[];
+    /** Always [] — leftover projection state for vanished virtual sessions is
+     * harmless; the workspace merger removes the group. */
+    onRemoteGone(): unknown[];
+    /** Always [] — projection frames carry no display name. */
+    onServerRenamed(): unknown[];
+    /** Accepted and ignored: a status annotation is a TITLE concern, and
+     * control projections carry no titles. */
+    setStatus(annotation: MergerAnnotation): void;
+    /** Always [] — nothing shown here could carry an annotation. */
+    onStatusChanged(): unknown[];
+    /** Accepted and ignored; always answers []. */
+    setCurrentSession(sessionId: string | undefined): unknown[];
+    /** Always false — the control merger hides nothing. */
+    readonly hasPendingHide: boolean;
+    retarget(identity: MergerIdentity): void;
+}
+/** One `session/control` projection change, independent of the wire shape. */
+export interface ControlProjectionChange {
+    key: string;
+    value: unknown;
+}
+/**
+ * Read the changes of one live `session/control` `projection` frame in either
+ * wire shape. DSH 0.2.2-alpha.3 batched the frame per committed event —
+ * `{type:'projection', sessionId, seq, changes:[{key, val}]}` (its client
+ * face's handleControlFrame iterates `frame.changes`) — where 0.2.1 and
+ * 0.2.2-alpha.2 send one key per frame, `{type:'projection', sessionId, key,
+ * value, seq}` (that client face reads `frame.key` / `frame.value`). A
+ * `changes` array wins when present; `undefined` means neither shape is
+ * usable (a malformed entry spoils the whole frame, like every other
+ * malformed frame here).
+ */
+export declare function controlProjectionChanges(frame: Record<string, unknown>): ControlProjectionChange[] | undefined;
+/**
+ * One single-key `session/control` projection frame that BOTH client
+ * generations apply: the per-key `key` / `value` fields for DSH ≤ 0.2.2-alpha.2
+ * and a one-entry `changes` list for ≥ 0.2.2-alpha.3. Neither client face
+ * validates stream frames (the gateway client only runs a binary `decode`),
+ * and each reads only its own fields, so the extra ones are inert. Splitting a
+ * batched frame into one frame per key at the same seq is lossless: the
+ * projection store applies per key (`seq <= row.seq` per row).
+ */
+export declare function controlProjectionFrame(sessionId: string, key: string, value: unknown, seq: number): Record<string, unknown>;
+/**
+ * The session/control merger. The control stream is key-value projection
+ * traffic with no ordering constraints between sessions, so it needs no
+ * state beyond the pre-baseline buffer: local frames pass through, remote
+ * frames get their session id virtualized, and a remote baseline is EXPLODED
+ * into one `projection` frame per key (never a second baseline).
+ */
+export declare function createControlMerger(options: ControlMergerOptions): ControlMerger;
+/**
+ * Merge one `session/list` result pair (first page only — the caller skips
+ * paged requests). Local items keep their order and their pagination fields;
+ * the remote items are appended with virtualized session ids — `sessionId`
+ * AND `parentSessionId` (CP4): the fork link must point at the VIRTUAL parent
+ * id the UI knows, or the fork would sort beside a parent id that exists in
+ * no list the UI holds — and a T52-fix rewrite of the row's own projections
+ * block: a list row carries `{kind:'cached'|'sequenced', asOfSeq, values}`
+ * (RT dsh-api-session-controller lib/typert.remote-client.js:381-428) and the
+ * client face applies it PER SESSION (lib/client.js:2633 → applyListBlock
+ * :2842-2855) — a `sequenced` modelSelection lands under higher-seq-wins
+ * (lib/client.js:986-995, `seq <= row.seq` rejects), and the control stream's
+ * REWRITTEN frame rides that projection's OWN seq, so an original-provider
+ * value left in a row would poison the store forever: the remote session's
+ * dropdown would show the raw `provider/model` fallback with no check mark.
+ * The rewrite is UNCONDITIONAL (T52-fix3): first-write-wins per seq forbids
+ * a catalog gate — a row rewritten while the catalog was missing would
+ * occupy the seq forever. A missing or malformed remote result means "remote
+ * said nothing" — the local result passes back untouched.
+ */
+export declare function mergeSessionList(localResult: unknown, remoteResult: unknown, serverId: string, remoteDefault?: unknown): unknown;
+/**
+ * Fold the relay's `session/modelCatalog` answer into the local one (T52).
+ * The result shape is RT dsh-api-session-controller
+ * `session_modelCatalog_result$schema` (lib/typert.remote-client.js:489-518):
+ * `{default, routableProviders, groups, failures}` — provider group ids and
+ * display names only, no session data anywhere, so no output filter guards it
+ * server-side and nothing here needs narrowing.
+ *
+ * - server groups are APPENDED after the local ones (the dropdown sorts
+ *   `deepseek-account` / `deepseek-official` first and keeps the rest in
+ *   order, RT dsh-client-ui-model-selection lib/client.js:510 — appended
+ *   groups render last); each group id becomes the virtual group id
+ *   `zr~<serverId>~<original>` and its name is prefixed
+ *   `${encodeServerIdZeroWidth(serverId)}${serverName} · ${name}` (MS-4: the
+ *   WORD JOINER mark plus the serverId as 32 zero-width bits, so the browser
+ *   can hide OTHER paired servers' groups too) — the same workspace
+ *   title discipline the merger uses, PLUS the invisible WORD JOINER (T74):
+ *   the model menu's groups stopped carrying their id in the markup (0.2.0's
+ *   MenuGroup renders `aria-labelledby={useId()}` only), so the browser
+ *   classifies menu groups by this heading prefix instead
+ *   (client-data/model-group-side.ts). The sidebar's workspace TITLES stay
+ *   unmarked — those groups are keyed by their `zr~` row ids;
+ * - `default` and `failures` stay LOCAL untouched: the default drives what a
+ *   blank LOCAL session would run (a remote session's current model comes
+ *   from its projection instead), and the UI renders every failure as a
+ *   prominent warning row whose Retry reloads the WHOLE catalog
+ *   (lib/client.js:816-827) — a server-side group failure is not retryable
+ *   from here and would put a permanent alarm on every dropdown, so it does
+ *   not travel (dsh-vision-router's settings read the same result and shows
+ *   an error state exactly when groups are empty AND failures exist,
+ *   lib/client.js:635-647 — dropping remote failures keeps that honest).
+ *   NOTE: a NEW 0-event (`asOfSeq === -1`) server session's projection
+ *   carries `{ lastUsed: null, next: null }`; when the remote server's
+ *   `modelCatalog.default` is cached on the client, projection virtualization
+ *   seeds `modelSelection.next` from it so the UI displays and targets the
+ *   remote server's default model rather than falling back to
+ *   `catalog.value.default` (the LOCAL default) until the first selection at
+ *   `seq: 0` overwrites it. If the remote catalog has not landed yet, it
+ *   falls back to `catalog.value.default` until a selection or turn lands.
+ * - `routableProviders` mirrors the group ids by construction host-side
+ *   (RT dsh-api-session-controller lib/index.js:544 — literally
+ *   `groups.map(g => g.id)`); no client UI reads it (the dropdown's
+ *   routable verdict comes from the groups themselves, lib/client.js:334),
+ *   so appending the virtual ids is a consistency move: the merged catalog
+ *   keeps the invariant the Host maintains, whatever reads it next.
+ *
+ * A malformed local or remote value means "one side said nothing" — the
+ * local result passes back untouched, like {@link mergeSessionList}.
+ */
+export declare function mergeModelCatalogs(localValue: unknown, remoteValue: unknown, identity: MergerIdentity): unknown;
+export declare function virtualizeModelSelectionValue(value: unknown, serverId: string, unselectedDefault?: unknown): unknown;
+export interface ForgeStatesMerger {
+    onLocal(frame: unknown): unknown[];
+    onRemote(serverId: string, frame: unknown): unknown[];
+    onRemoteGone(serverId: string): unknown[];
+}
+/**
+ * Merge local and remote `forgePanel/changeRequestStates` frames into a
+ * single stream compatible with DSH's `foldStates` reducer (which clears its
+ * map on every `baseline` frame). Remote baselines fold in as `changed` frames
+ * once `localSeen` is established, except when a server shrinks/leaves and a
+ * composed `baseline` is required to evict stale remote URLs.
+ */
+export declare function createForgeStatesMerger(): ForgeStatesMerger;
+/**
+ * Rewrite one projection key's value for a remote session so embedded
+ * server-scoped ids (`modelSelection.provider`, `subagentCatalog[].id`,
+ * `agentTeam.tasks[].ownerId`) carry `zr~<serverId>~`. Unrecognized keys and
+ * malformed shapes pass through by identity.
+ */
+export declare function virtualizeProjectionValue(key: string, value: unknown, serverId: string, unselectedDefault?: unknown): unknown;
+/**
+ * Virtualize every rewritable entry in a session projection `values` map
+ * (shared across `session/follow`, `session/projections`, `session/list`, and
+ * `session/control`). Returns the input map unchanged if nothing needed
+ * rewriting.
+ */
+export declare function virtualizeProjectionValues(values: Record<string, unknown>, serverId: string, unselectedDefault?: unknown): Record<string, unknown>;
+/**
+ * T63: the virtual session ids a set of FORWARDED workspace frames carries —
+ * the `sessionIds` of `upsert` records and of baseline `value.items`. The
+ * workspace route feeds these to the summary sync, which announces list rows
+ * for ids the UI has no summary for yet (the sidebar drops a group member
+ * without one — RT dsh-client-ui-workspace orderByRecency / groupByWorkspace).
+ * Reading the FORWARDED output (not the merger's raw state) is the point:
+ * paired empty groups forward cleanly with `sessionIds: []` (contributing zero
+ * session ids), and T58 already handles hidden sessions while keeping a
+ * one-shot ask gate. Only virtual ids count — local baseline content rides
+ * these frames verbatim and its rows already have summaries.
+ */
+export declare function virtualSessionIdsInWorkspaceFrames(frames: readonly unknown[]): string[];
+/**
+ * T63: the synthesized `api-session/added` emit frames for one relay
+ * `session/list` answer — one `{type:'emit', event:'api-session/added',
+ * args:[row]}` frame per row. This is the host's own mechanism for adding a
+ * list row without a re-pull (RT dsh-api-session-controller: the client face
+ * subscribes `api-session/added` → handleSessionAdded → mergeSummary →
+ * applyMutation's upsert, which ADDS an unknown row and fills an existing
+ * one — idempotent), and the emit frame shape is the client face's
+ * exact-keys `{type, event, args}` with args a JSON array
+ * (dsh-api-gateway lib/client.js parseRemoteEventFrame) — the same shape the
+ * T52 catalog-refresh frame uses. The rows are virtualized by
+ * {@link mergeSessionList} itself, so a synthesized row carries exactly what
+ * the merged `session/list` route would have answered: the session id AND
+ * the fork parent virtualized, and the projections' modelSelection providers
+ * rewritten (a row's `sequenced` block must not poison the projection store
+ * against the control stream's rewritten frames — T52-fix3). A malformed
+ * remote result means "the server said nothing" — no frames.
+ */
+export declare function sessionSummaryAddedFrames(remoteResult: unknown, serverId: string, remoteDefault?: unknown): unknown[];
+/** The cumulative LOCAL lists one workspace merger's `local` side holds. */
+export interface LocalWorkspaceLists {
+    orderIds: string[];
+    archivedIds: string[];
+    pinnedIds: string[];
+}
+/**
+ * MS-3: fold one LOCAL `workspace/follow` frame into the orchestrator's
+ * cumulative local lists — the baseline replaces all three, `order` /
+ * `archived` / `pinned` each replace their own list, and every other frame
+ * (upsert / remove / junk) observes nothing. The parsing is the merger's own
+ * `observeLocal` reading, extracted so the multi-server orchestrator keeps
+ * the same truth WITHOUT a second shape definition drifting away from it.
+ */
+export declare function localWorkspaceLists(frame: unknown, current: LocalWorkspaceLists): LocalWorkspaceLists;
+/** One slot's remote contribution for {@link composeMergedWorkspaceFrames}
+ * — the `remote` half of {@link WorkspaceMergerParts}. */
+export interface RemoteWorkspaceContribution {
+    orderIds: string[];
+    archivedIds: string[];
+    pinnedIds: string[];
+    workspaces: Record<string, unknown>[];
+}
+/**
+ * MS-3: the canonical merged frames over N servers — local first, then each
+ * server's contribution in the given (pairing) order. The order list is
+ * plain concatenation, the archived set is DEDUPLICATED in that order (the
+ * single-server merger dedupes the same way), and pinned concatenates (the
+ * single-server pinned frame never deduped either). With no remotes the
+ * frames collapse to the local-only form.
+ */
+export declare function composeMergedWorkspaceFrames(local: LocalWorkspaceLists, remotes: readonly RemoteWorkspaceContribution[]): {
+    order: {
+        type: 'order';
+        workspaceIds: string[];
+    };
+    archived: {
+        type: 'archived';
+        archivedSessionIds: string[];
+    };
+    pinned: {
+        type: 'pinned';
+        pinnedSessionIds: string[];
+    };
+    workspaces: Record<string, unknown>[];
+};
+/**
+ * Merge one server's filtered `session/search` `{ items, hasMore }` answer
+ * onto the accumulator (local first, then each server), virtualizing every
+ * valid remote hit's `sessionId`.
+ */
+export declare function mergeSessionSearch(localResult: unknown, remoteResult: unknown, serverId: string): unknown;
+/** Format one remote agent preset display name with localized built-in fallback
+ * and `[<serverName>] ` prefix so the origin server stays clear. */
+export declare function resolveRemotePresetName(presetId: string, rawName: unknown, serverName: string, lang?: MergerLang): string;
+/**
+ * Merge one server's `agentPresets/list` roster onto the local answer: every
+ * remote preset gets a virtual `id`, `[serverName]`-prefixed display name
+ * (with built-in preset fallback), and `isDefault: false` so local default
+ * settings never accidentally pick a remote preset id.
+ */
+export declare function mergeAgentPresetRosters(localResult: unknown, remoteResult: unknown, identity: MergerIdentity, lang?: MergerLang): unknown;
+//# sourceMappingURL=merge-streams.d.ts.map

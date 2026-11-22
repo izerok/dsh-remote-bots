@@ -1,0 +1,756 @@
+/**
+ * Admin routes for the 2.0.0 settings surface (T14): pairing, device
+ * management and a push test, driven from the DSH plugin page's settings
+ * block (the T15 client half) instead of the gateway's own admin page.
+ *
+ * Why these live in the HOST process rather than the gateway: the gateway's
+ * admin API is loopback-only by design (isLocalDirect — loopback peer, no
+ * X-Forwarded-* headers), while a browser page runs on DSH's origin, never
+ * on the gateway's. So the browser talks to THESE same-origin routes and
+ * this module then calls the gateway AS the local machine — a bare
+ * `http://127.0.0.1:<port>` request with hand-built headers (no cookies, no
+ * Origin, no forwarded anything) that `isLocalDirect` admits.
+ *
+ * Two walls every route applies, in order:
+ *
+ *   1. `admit` — routes registered via webServer.register do NOT pass
+ *      through DSH's `/api` authentication, so each request must ask the
+ *      connection service itself; its rejection is relayed verbatim.
+ *   2. The gateway marker. A request wearing `x-zen-remote-via` arrived
+ *      THROUGH the gateway from a remote device (the gateway strips
+ *      client-forged copies before stamping its own). POSTs are refused —
+ *      pairing and device management are server-side acts. GET status is
+ *      answered, but with the live pairing code stripped. The marker wall
+ *      runs BEFORE same-origin because a forwarded request presents as
+ *      same-origin (the gateway rewrites Origin/Host), so the marker is the
+ *      only thing identifying it.
+ *
+ * The ONE deliberate exception is the shares route (T33a): toggling session
+ * sharing is exactly what the spec grants the Web application端 (devices
+ * behind the gateway have full server permissions), so there the marker wall
+ * is skipped and a forwarded POST passes once it clears admit and
+ * same-origin. Desktop application clients can never reach any admin route —
+ * the gateway only forwards them into the relay prefix.
+ *
+ * Every POST additionally passes sameOriginPost, and bodies are capped at
+ * 16 KiB of JSON object. The handler is built by a factory so the tests can
+ * drive it over a real socket with a mock gateway and a mock admit.
+ */
+import { withPeer } from './owner-peer.js';
+import { request as httpRequest } from 'node:http';
+import { responseJson, sameOriginPost } from './http.js';
+import { restoreBusy } from './share-ops.js';
+/** Prefix all admin routes live under (one webServer prefix registration). */
+export const ADMIN_ROUTE_PREFIX = '/_dsh/zen-remote/admin';
+/** GET: the gateway's status verbatim plus the effective config; remote
+ * callers get the live pairing code stripped. */
+export const ADMIN_STATUS_ROUTE = `${ADMIN_ROUTE_PREFIX}/status`;
+/** POST `{role}`: mint a pairing code. */
+export const ADMIN_PAIR_ROUTE = `${ADMIN_ROUTE_PREFIX}/pair`;
+/** POST `{action, id?, role?, kind?, name?}`: device management, whitelist below. */
+export const ADMIN_ACTION_ROUTE = `${ADMIN_ROUTE_PREFIX}/action`;
+/** POST: fire one fixed test notification through the gateway. */
+export const ADMIN_PUSH_TEST_ROUTE = `${ADMIN_ROUTE_PREFIX}/push-test`;
+/** GET: every shared session with its clocks, viewers and titles.
+ * POST `{action, sessionId?}`: share / unshare / unshare-all (T33a). */
+export const ADMIN_SHARES_ROUTE = `${ADMIN_ROUTE_PREFIX}/shares`;
+/** GET: the plugin bridge's registered plugins with their whole-machine-data
+ * consent, for the settings page's 插件桥 section (PB-5). */
+export const ADMIN_PLUGIN_BRIDGE_ROUTE = `${ADMIN_ROUTE_PREFIX}/plugin-bridge`;
+/** Longest wait for one gateway round-trip. */
+const GATEWAY_TIMEOUT_MS = 5000;
+/** Inbound admin body cap — the settings forms send a few hundred bytes. */
+const MAX_BODY_BYTES = 16 * 1024;
+/** Tag every test notification carries, so the phone can spot and sweep them. */
+const TEST_PUSH_TAG = 'dsh-zen-remote-test';
+/** The device-management verbs this surface forwards. `new-code` is
+ * deliberately absent: minting codes is the pair route's job, and forwarding
+ * it twice would only blur which surface created the live code. */
+const FORWARDABLE_ACTIONS = new Set(['set-role', 'set-kind', 'rename', 'revoke', 'revoke-all']);
+/** The share-toggle verbs POST shares understands (T33a). */
+const SHARE_ACTIONS = new Set(['share', 'unshare', 'unshare-all']);
+/** Longest wait for one session/projections or session/list call.
+ * A hung typert gateway must not hold a route open forever. */
+const PROJECTION_TIMEOUT_MS = 5000;
+/** Maximum concurrent cold-session title fallback lookups (`session/projections`)
+ * per admin handler instance — strictly below DSH's 5-slot cold observation LRU
+ * so missing summaries never thrash the host cache. */
+const MAX_TITLE_FALLBACK_CONCURRENCY = 3;
+/** Fixed test-push copy — Chinese by default, English for `lang: 'en'`
+ * (`'auto'` has no requester signal here, so it falls to Chinese). */
+const TEST_PUSH_COPY = {
+    zh: { title: 'DSH 测试推送', body: '这是一条来自 dsh-zen-remote 设置页的测试通知' },
+    en: { title: 'DSH Test Push', body: 'This is a test notification from the dsh-zen-remote settings page' },
+};
+/**
+ * One rejection carrying the status the client should see.
+ *
+ * Fields are assigned in the body rather than declared as constructor
+ * parameter properties: check scripts import these modules through Node's
+ * strip-only type stripping, which rejects that syntax (same reason as
+ * UploadError in index.ts).
+ */
+class AdminError extends Error {
+    status;
+    code;
+    constructor(status, code, message) {
+        super(message);
+        this.name = 'AdminError';
+        this.status = status;
+        this.code = code;
+    }
+}
+/** The gateway-wizard declared fields (GW-1). They reach the browser only
+ * through the sanitized wizard/status projection (src/wizard/status.ts) —
+ * the raw config dump on admin/status strips them, the same redaction
+ * discipline that keeps `deviceToken` off every wire surface. */
+const INGRESS_FIELDS = [
+    'ingressMode',
+    'ingressDomain',
+    'ingressHttpsPort',
+    'ingressAcmeEmail',
+    'ingressPublicUrl',
+];
+/** Copy the snapshot without the wizard-declared fields (a copy, never the
+ * live object — the resolver's values are per-request but still shared with
+ * other readers of the same getConfig() answer). */
+function publicConfigSnapshot(snapshot) {
+    const values = { ...snapshot.values };
+    const sources = { ...snapshot.sources };
+    for (const field of INGRESS_FIELDS) {
+        delete values[field];
+        delete sources[field];
+    }
+    return {
+        values: values,
+        sources: sources,
+    };
+}
+/**
+ * Read the whole body under the cap and demand one JSON object. An empty
+ * body counts as `{}` — the gateway's own reader treats absence the same
+ * way, and the push-test button posts no body at all.
+ */
+async function readJsonBody(req) {
+    // A declared oversized body is refused before a byte is read, so the client
+    // gets its 400 without the server (or the phone) spending the whole body on
+    // the wire. The streaming cap below remains as the chunked-body guard.
+    const declared = req.headers['content-length'];
+    const expected = declared === undefined ? undefined : Number(declared);
+    if (expected !== undefined && Number.isSafeInteger(expected) && expected > MAX_BODY_BYTES) {
+        throw new AdminError(400, 'bad-request', `request body exceeds the ${MAX_BODY_BYTES}-byte limit`);
+    }
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+        const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+        size += bytes.length;
+        if (size > MAX_BODY_BYTES) {
+            throw new AdminError(400, 'bad-request', `request body exceeds the ${MAX_BODY_BYTES}-byte limit`);
+        }
+        chunks.push(bytes);
+    }
+    const text = Buffer.concat(chunks).toString('utf8');
+    if (text.trim() === '')
+        return {};
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    }
+    catch {
+        throw new AdminError(400, 'bad-request', 'request body must be valid JSON');
+    }
+    if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new AdminError(400, 'bad-request', 'request body must be a JSON object');
+    }
+    return parsed;
+}
+/**
+ * One call to the gateway AS the local machine: a fresh loopback connection
+ * with only the headers this call needs. No cookie, no Origin, and above all
+ * no X-Forwarded-* — any of those would make the gateway's isLocalDirect
+ * classify the call as proxied/remote and refuse the local-only surface.
+ * Resolves with whatever parsable JSON the gateway returned, at any status;
+ * deciding what that means for the route is the caller's job.
+ */
+async function callGateway(options, method, path, payload) {
+    const body = payload === undefined ? undefined : JSON.stringify(payload);
+    const base = typeof options.gatewayBase === 'function' ? options.gatewayBase() : options.gatewayBase;
+    return await new Promise((resolve, reject) => {
+        const request = httpRequest(new URL(path, base), {
+            method,
+            headers: body === undefined
+                ? undefined
+                : { 'Content-Type': 'application/json; charset=utf-8', 'Content-Length': String(Buffer.byteLength(body)) },
+            signal: AbortSignal.timeout(options.timeoutMs ?? GATEWAY_TIMEOUT_MS),
+        }, (response) => {
+            const chunks = [];
+            response.on('data', (chunk) => {
+                chunks.push(chunk);
+            });
+            response.on('error', () => {
+                reject(new AdminError(502, 'gateway-unreachable', 'The gateway response failed'));
+            });
+            response.on('end', () => {
+                try {
+                    resolve({ status: response.statusCode ?? 0, body: JSON.parse(Buffer.concat(chunks).toString('utf8')) });
+                }
+                catch {
+                    reject(new AdminError(502, 'gateway-unreachable', 'The gateway returned an unparsable response'));
+                }
+            });
+        });
+        request.on('error', () => {
+            reject(new AdminError(502, 'gateway-unreachable', 'The gateway did not answer'));
+        });
+        request.end(body);
+    });
+}
+/**
+ * One gateway round-trip for a state-changing route. A 2xx reply relays to
+ * the browser verbatim; anything else becomes a 502 error envelope — the
+ * gateway DID answer, but with a refusal the settings page must not mistake
+ * for success (and must not see raw, since the envelope shape is ours).
+ */
+async function relay(options, method, path, payload, res) {
+    const reply = await callGateway(options, method, path, payload);
+    if (reply.status < 200 || reply.status >= 300) {
+        responseJson(res, 502, { ok: false, error: { code: 'gateway-error', status: reply.status } });
+        return;
+    }
+    responseJson(res, reply.status, reply.body);
+}
+function testPushPayload(lang) {
+    return { ...(lang === 'en' ? TEST_PUSH_COPY.en : TEST_PUSH_COPY.zh), tag: TEST_PUSH_TAG };
+}
+/** GET status: the gateway payload plus the live config. Recomputed per
+ * request — volatile row fields (serverName, idleHours, …) change without a
+ * plugin restart, so an apply-time snapshot would go stale. */
+async function respondStatus(options, req, res) {
+    const viaGateway = req.headers['x-zen-remote-via'] !== undefined;
+    const config = publicConfigSnapshot(options.getConfig());
+    let gateway = null;
+    let gatewayStatus = null;
+    let gatewayReachable = false;
+    try {
+        const reply = await callGateway(options, 'GET', '/lan-gate/status');
+        gatewayStatus = reply.status;
+        // A parsable JSON reply is not automatically a healthy gateway: an error
+        // envelope (403, 500) must not surface as "reachable".
+        if (reply.status >= 200 && reply.status < 300) {
+            gateway = reply.body;
+            gatewayReachable = true;
+        }
+    }
+    catch {
+        // No answer at all (refused, reset, timeout, non-JSON): gatewayStatus
+        // stays null and the settings page renders from config alone.
+    }
+    // A remote device may see the device list but never the live pairing
+    // code — and never the untrusted-proxy detection or the web-claim record
+    // (GW-fix-2/L1, GW-9): both are server-owner surfaces carrying network
+    // topology facts and device ids a remote device has no business reading.
+    if (viaGateway && gateway !== null && typeof gateway === 'object') {
+        ;
+        gateway.pairing = null;
+        gateway.lastForwardedSource = null;
+        gateway.lastWebClaim = null;
+    }
+    responseJson(res, 200, { ok: true, gateway, gatewayReachable, gatewayStatus, config, viaGateway });
+}
+/** Read the typert gateway lazily per call, treating a throwing lookup as
+ * an unavailable composition rather than a route failure. */
+function typertGatewayOf(options) {
+    try {
+        return options.typert?.();
+    }
+    catch {
+        return undefined;
+    }
+}
+/**
+ * One call to the typert gateway's `session/projections`, under the per-call
+ * timeout. Every failure mode the route can survive is a VALUE here — only
+ * a transport failure or a timeout throws, and the caller decides what those
+ * mean (titles: null; existence: 502). The typert lookup runs INSIDE the
+ * guard: a throwing lookup is a degraded composition, not a route failure.
+ * The timeout rides the call's cancellation signal (`AbortSignal.timeout`,
+ * the same shape the relay passes into gateway calls), so a timed-out
+ * invocation is actually STOPPED, not merely abandoned by the waiter.
+ */
+async function projectionOf(options, sessionId) {
+    const gateway = typertGatewayOf(options);
+    if (gateway === undefined)
+        return { kind: 'no-gateway' };
+    const value = await gateway.invoke(withPeer({
+        namespace: 'session',
+        method: 'projections',
+        args: { request: { sessionId } },
+        signal: AbortSignal.timeout(options.projectionTimeoutMs ?? PROJECTION_TIMEOUT_MS),
+    }, options.getPeer));
+    if (value === null || value === undefined)
+        return { kind: 'no-session' };
+    const values = value.values;
+    return {
+        kind: 'values',
+        values: values !== null && typeof values === 'object' ? values : {},
+    };
+}
+/**
+ * Parse a `session/list` response into a `sessionId -> title` map.
+ * Explicit `null` values (unnamed sessions before their first `session/title`
+ * event) are stored in the map so callers preserve `null` without falling back
+ * to a cold `session/projections` read; missing entries or invalid shapes are
+ * omitted (or return `undefined` to trigger full fallback).
+ */
+function extractSummaryTitles(result) {
+    if (result === null || typeof result !== 'object')
+        return undefined;
+    const items = result.items;
+    if (!Array.isArray(items))
+        return undefined;
+    const titles = new Map();
+    for (const item of items) {
+        if (item === null || typeof item !== 'object')
+            continue;
+        const sessionId = item.sessionId;
+        if (typeof sessionId !== 'string' || sessionId === '')
+            continue;
+        const values = item.projections?.values;
+        if (values === null || typeof values !== 'object' || Array.isArray(values))
+            continue;
+        if (!Object.prototype.hasOwnProperty.call(values, 'title'))
+            continue;
+        const title = values.title;
+        if (typeof title === 'string' || title === null)
+            titles.set(sessionId, title);
+    }
+    return titles;
+}
+/**
+ * One session title through `session/projections`. Anything other than a
+ * string answer — a null projection (session gone), a service-less or
+ * degraded composition, a transport failure, a timeout — is `null`, and one
+ * failed title must never fail the listing around it.
+ */
+async function titleOf(options, sessionId) {
+    try {
+        const outcome = await projectionOf(options, sessionId);
+        if (outcome.kind !== 'values')
+            return null;
+        const title = outcome.values.title;
+        return typeof title === 'string' ? title : null;
+    }
+    catch {
+        return null;
+    }
+}
+/**
+ * Prove a session exists before `share` enters it into the table, and hand
+ * back its projection values for the caller's follow-up checks. The same
+ * `session/projections` call the titles use, where a `null` projection IS
+ * the "no such live session" answer. A transport failure or timeout is NOT
+ * a null — it refuses with 502 rather than quietly sharing a session nobody
+ * could see. Without a typert gateway there is nothing to ask, and the table
+ * alone is the truth available (empty values, no objection).
+ */
+async function requireSession(options, sessionId) {
+    let outcome;
+    try {
+        outcome = await projectionOf(options, sessionId);
+    }
+    catch {
+        throw new AdminError(502, 'gateway-unreachable', 'The session lookup failed');
+    }
+    if (outcome.kind === 'no-gateway')
+        return {};
+    if (outcome.kind === 'no-session')
+        throw new AdminError(404, 'no-session', `no live session "${sessionId}"`);
+    return outcome.values;
+}
+/** Release one sessionQuery lease: the observation is a plain
+ * `Symbol.dispose` carrier (RT dsh-session-query SessionObservationReader —
+ * every lease pins a cold-cache entry until released). */
+function releaseObservation(observation) {
+    const disposable = observation;
+    disposable[Symbol.dispose]?.();
+}
+/**
+ * Whether the session is a subagent child, judged off the DURABLE HEADER
+ * first: `sessionQuery.observeSession` reads the live-or-persisted session's
+ * immutable header (released immediately), and `origin === 'subagent'` is
+ * authoritative — per dsh-session's `validateSessionHeader` that marker is
+ * the one subagent signal, and a header WITHOUT it is an ordinary session
+ * (top-level or fork), full stop.
+ *
+ * Why the header wins over the projection's `subagent` identity: a fork of a
+ * subagent session REPLAYS the source's `subagent/descriptor` events, so the
+ * projection would wrongly condemn an ordinary fork — while a child whose
+ * descriptor turned corrupt projects null and would slip through.
+ *
+ * The projection identity stays as the fallback for compositions without
+ * sessionQuery and for reads that fail (session gone between the two
+ * lookups, unreadable log) — degraded knowledge beats none.
+ */
+async function isSubagentSession(options, sessionId, projectionValues) {
+    let query;
+    try {
+        query = options.sessionQuery?.();
+    }
+    catch {
+        query = undefined;
+    }
+    if (query !== undefined) {
+        let observation;
+        try {
+            observation = await query.observeSession(sessionId);
+        }
+        catch {
+            observation = undefined;
+        }
+        if (observation !== undefined) {
+            try {
+                return observation.header?.origin === 'subagent';
+            }
+            finally {
+                releaseObservation(observation);
+            }
+        }
+    }
+    return projectionValues.subagent !== null && typeof projectionValues.subagent === 'object';
+}
+/** Build one handler-scoped title coordinator (never shared across handler
+ * instances). Shared queries use internal `AbortSignal.timeout` rather than
+ * any caller's socket signal so one client closing never cancels peers. */
+function createSharesTitleCoordinator(options) {
+    let inFlightSummaryList;
+    const inFlightFallbackTitles = new Map();
+    let activeFallbacks = 0;
+    const fallbackWaiters = [];
+    function acquireFallbackSlot() {
+        if (activeFallbacks < MAX_TITLE_FALLBACK_CONCURRENCY) {
+            activeFallbacks += 1;
+            return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+            fallbackWaiters.push(resolve);
+        });
+    }
+    function releaseFallbackSlot() {
+        const next = fallbackWaiters.shift();
+        if (next !== undefined) {
+            // Transfer slot ownership directly to the next waiter without decrementing
+            // `activeFallbacks`, preventing same-tick arrivals from stealing a 4th slot.
+            next();
+            return;
+        }
+        activeFallbacks = Math.max(0, activeFallbacks - 1);
+    }
+    function getSummaryTitles() {
+        if (inFlightSummaryList !== undefined)
+            return inFlightSummaryList;
+        const gateway = typertGatewayOf(options);
+        if (gateway === undefined)
+            return Promise.resolve(undefined);
+        let settled = false;
+        let current;
+        current = (async () => {
+            try {
+                const result = await gateway.invoke(withPeer({
+                    namespace: 'session',
+                    method: 'list',
+                    args: { _request: {} },
+                    signal: AbortSignal.timeout(options.projectionTimeoutMs ?? PROJECTION_TIMEOUT_MS),
+                }, options.getPeer));
+                return extractSummaryTitles(result);
+            }
+            catch {
+                return undefined;
+            }
+            finally {
+                settled = true;
+                if (current !== undefined && inFlightSummaryList === current)
+                    inFlightSummaryList = undefined;
+            }
+        })();
+        if (!settled)
+            inFlightSummaryList = current;
+        return current;
+    }
+    function fallbackTitleOf(sessionId) {
+        const existing = inFlightFallbackTitles.get(sessionId);
+        if (existing !== undefined)
+            return existing;
+        const task = (async () => {
+            await acquireFallbackSlot();
+            try {
+                return await titleOf(options, sessionId);
+            }
+            finally {
+                inFlightFallbackTitles.delete(sessionId);
+                releaseFallbackSlot();
+            }
+        })();
+        inFlightFallbackTitles.set(sessionId, task);
+        return task;
+    }
+    function invalidateSummaryList() {
+        inFlightSummaryList = undefined;
+    }
+    return { getSummaryTitles, fallbackTitleOf, invalidateSummaryList };
+}
+/** GET shares: the table verbatim (read fresh per request), plus derived fields
+ * and session titles resolved summary-first via `session/list` with a
+ * concurrency-bounded per-session `session/projections` fallback for misses. */
+async function respondShares(options, coordinator, res) {
+    const store = options.store;
+    const viewerCount = options.viewerCount ?? (() => 0);
+    const shares = store.list().map((entry) => {
+        const remaining = store.remainingMs(entry.sessionId);
+        return {
+            sessionId: entry.sessionId,
+            sharedAt: entry.sharedAt,
+            lastActivityAt: entry.lastActivityAt,
+            busy: entry.busy,
+            remainingMs: remaining === Infinity ? null : remaining,
+            viewers: viewerCount(entry.sessionId),
+            title: null,
+        };
+    });
+    if (shares.length === 0 || typertGatewayOf(options) === undefined) {
+        responseJson(res, 200, { ok: true, shares });
+        return;
+    }
+    const summaryTitles = await coordinator.getSummaryTitles();
+    const missingRows = [];
+    for (const row of shares) {
+        if (summaryTitles?.has(row.sessionId)) {
+            row.title = summaryTitles.get(row.sessionId) ?? null;
+        }
+        else {
+            missingRows.push(row);
+        }
+    }
+    if (missingRows.length > 0) {
+        await Promise.all(missingRows.map(async (row) => {
+            row.title = await coordinator.fallbackTitleOf(row.sessionId);
+        }));
+    }
+    responseJson(res, 200, { ok: true, shares });
+}
+/**
+ * Build the admin route handler for one plugin row. The returned handler
+ * owns the full response lifecycle of every request under
+ * {@link ADMIN_ROUTE_PREFIX} and never throws.
+ */
+export function createAdminHandler(options) {
+    const sharesCoordinator = createSharesTitleCoordinator(options);
+    return async (req, res) => {
+        // Wall 1 first: DSH's own admission (webServer routes skip /api auth).
+        const admission = options.admit(req);
+        if ('rejection' in admission) {
+            responseJson(res, admission.rejection, {
+                ok: false,
+                error: { code: admission.rejection === 401 ? 'unauthorized' : 'forbidden' },
+            });
+            return;
+        }
+        const url = new URL(req.url ?? '/', 'http://dsh.internal');
+        const route = url.pathname;
+        const method = req.method ?? 'GET';
+        try {
+            if (route === ADMIN_STATUS_ROUTE) {
+                if (method !== 'GET') {
+                    res.setHeader('Allow', 'GET');
+                    responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } });
+                    return;
+                }
+                await respondStatus(options, req, res);
+                return;
+            }
+            if (route === ADMIN_SHARES_ROUTE) {
+                // No table, no route: a composition that never built the share store
+                // answers like any unknown admin path.
+                if (options.store === undefined) {
+                    responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown admin route' } });
+                    return;
+                }
+                if (method === 'GET') {
+                    await respondShares(options, sharesCoordinator, res);
+                    return;
+                }
+                if (method === 'POST') {
+                    // The deliberate exception to the marker wall (see the module
+                    // comment): the Web application端 behind the gateway may toggle
+                    // sharing, so a via-gateway POST is NOT refused here. Same-origin
+                    // still applies — a forwarded request passes it because the
+                    // gateway rewrites Origin/Host onto the upstream origin.
+                    if (!sameOriginPost(req)) {
+                        responseJson(res, 403, {
+                            ok: false,
+                            error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+                        });
+                        return;
+                    }
+                    const body = await readJsonBody(req);
+                    const action = body.action;
+                    if (typeof action !== 'string' || !SHARE_ACTIONS.has(action)) {
+                        responseJson(res, 400, {
+                            ok: false,
+                            error: { code: 'bad-action', message: `action must be one of ${[...SHARE_ACTIONS].join(', ')}` },
+                        });
+                        return;
+                    }
+                    const store = options.store;
+                    if (action === 'unshare-all') {
+                        for (const entry of store.list())
+                            store.unshare(entry.sessionId, 'manual');
+                        sharesCoordinator.invalidateSummaryList();
+                        responseJson(res, 200, { ok: true });
+                        return;
+                    }
+                    const sessionId = body.sessionId;
+                    if (typeof sessionId !== 'string' || sessionId === '') {
+                        responseJson(res, 400, { ok: false, error: { code: 'bad-request', message: 'sessionId is required' } });
+                        return;
+                    }
+                    if (action === 'share') {
+                        const values = await requireSession(options, sessionId);
+                        // Subagent children never enter the table — they inherit
+                        // reachability through the parent chain. Judged off the durable
+                        // header when sessionQuery is reachable (a fork of a subagent
+                        // replays the descriptor events, so the projection alone would
+                        // both over- and under-reject — see isSubagentSession).
+                        if (await isSubagentSession(options, sessionId, values)) {
+                            responseJson(res, 400, {
+                                ok: false,
+                                error: { code: 'subagent-session', message: 'subagent sessions are reachable through their parent and cannot be shared alone' },
+                            });
+                            return;
+                        }
+                        store.share(sessionId);
+                        // A session whose agent is mid-turn must not look idle: the same
+                        // restore a restart runs, scoped to whatever runs right now.
+                        restoreBusy(store, options.listAgents ?? (() => []));
+                        sharesCoordinator.invalidateSummaryList();
+                        responseJson(res, 200, { ok: true });
+                        return;
+                    }
+                    store.unshare(sessionId, 'manual');
+                    sharesCoordinator.invalidateSummaryList();
+                    responseJson(res, 200, { ok: true });
+                    return;
+                }
+                res.setHeader('Allow', 'GET, POST');
+                responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET or POST' } });
+                return;
+            }
+            if (route === ADMIN_PLUGIN_BRIDGE_ROUTE) {
+                // No registry, no route: a composition that never built the plugin
+                // bridge answers like any unknown admin path.
+                if (options.pluginBridge === undefined) {
+                    responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown admin route' } });
+                    return;
+                }
+                if (method !== 'GET') {
+                    res.setHeader('Allow', 'GET');
+                    responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use GET' } });
+                    return;
+                }
+                // Wall 2, the pair/action rule: this listing feeds a MANAGEMENT
+                // surface (the consent toggles below it), so a request that arrived
+                // through the gateway is refused — consent is granted on the server
+                // machine, by its owner, period.
+                if (req.headers['x-zen-remote-via'] !== undefined) {
+                    const isEn = options.getConfig().values.lang === 'en';
+                    responseJson(res, 403, {
+                        ok: false,
+                        error: {
+                            code: 'via-gateway',
+                            message: isEn ? 'Plugin bridge settings can only be modified on the server machine' : '插件桥设置只能在服务端本机操作',
+                        },
+                    });
+                    return;
+                }
+                // The consent source is a live row read; a broken one reads as the
+                // empty map (nothing consented) instead of failing the listing.
+                let consent = {};
+                try {
+                    consent = options.pluginBridge.getConsent();
+                }
+                catch {
+                    consent = {};
+                }
+                // registry.list() arrives plugin-sorted; the map keeps that order.
+                // PB-11: `adapted` marks the entries an ADAPTER stands in for —
+                // zen-remote-internal forwarding for a plugin that never registered
+                // anything — so the settings page can say「由 zen-remote 适配」.
+                // Absent (a wiring that predates adapters) reads as none.
+                const adapted = options.pluginBridge.adaptedPlugins?.() ?? new Set();
+                const plugins = options.pluginBridge.registry.list().map((declaration) => ({
+                    plugin: declaration.plugin,
+                    version: declaration.version,
+                    hasServerScope: declaration.routes.some((route) => route.scope === 'server'),
+                    consent: consent[declaration.plugin] === true,
+                    adapted: adapted.has(declaration.plugin),
+                }));
+                responseJson(res, 200, { ok: true, value: { plugins } });
+                return;
+            }
+            if (route === ADMIN_PAIR_ROUTE || route === ADMIN_ACTION_ROUTE || route === ADMIN_PUSH_TEST_ROUTE) {
+                if (method !== 'POST') {
+                    res.setHeader('Allow', 'POST');
+                    responseJson(res, 405, { ok: false, error: { code: 'method-not-allowed', message: 'Use POST' } });
+                    return;
+                }
+                // Wall 2, BEFORE same-origin: a forwarded remote request presents as
+                // same-origin (the gateway rewrites Origin/Host), so the marker is
+                // the only signal that says "this did not start on this machine".
+                if (req.headers['x-zen-remote-via'] !== undefined) {
+                    const isEn = options.getConfig().values.lang === 'en';
+                    responseJson(res, 403, {
+                        ok: false,
+                        error: {
+                            code: 'via-gateway',
+                            message: isEn ? 'Pairing and device management are only available on the server machine' : '配对与设备管理只能在服务端本机操作',
+                        },
+                    });
+                    return;
+                }
+                if (!sameOriginPost(req)) {
+                    responseJson(res, 403, {
+                        ok: false,
+                        error: { code: 'origin-rejected', message: 'The request must originate from this DSH Web application' },
+                    });
+                    return;
+                }
+                if (route === ADMIN_PUSH_TEST_ROUTE) {
+                    await readJsonBody(req); // drained and validated; the copy is fixed
+                    // The copy language is read HERE, not at apply time: a lang edit on
+                    // the row applies live, and getConfig() re-resolves per request.
+                    await relay(options, 'POST', '/pwa/push/send', testPushPayload(options.getConfig().values.lang), res);
+                    return;
+                }
+                const body = await readJsonBody(req);
+                if (route === ADMIN_ACTION_ROUTE && (typeof body.action !== 'string' || !FORWARDABLE_ACTIONS.has(body.action))) {
+                    responseJson(res, 400, {
+                        ok: false,
+                        error: { code: 'bad-action', message: `action must be one of ${[...FORWARDABLE_ACTIONS].join(', ')}` },
+                    });
+                    return;
+                }
+                await relay(options, 'POST', route === ADMIN_PAIR_ROUTE ? '/lan-gate/pair' : '/lan-gate/action', body, res);
+                return;
+            }
+            responseJson(res, 404, { ok: false, error: { code: 'not-found', message: 'Unknown admin route' } });
+        }
+        catch (error) {
+            if (error instanceof AdminError) {
+                responseJson(res, error.status, { ok: false, error: { code: error.code, message: error.message } });
+                return;
+            }
+            responseJson(res, 500, { ok: false, error: { code: 'internal', message: 'The admin route failed' } });
+        }
+    };
+}
+//# sourceMappingURL=admin-routes.js.map

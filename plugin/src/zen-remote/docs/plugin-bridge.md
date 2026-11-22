@@ -1,0 +1,133 @@
+# 插件桥（给插件作者）
+
+你的插件只要**登记一份桥接声明**，它的面板数据就能在远程会话里照常显示：子客户端把「该插件的某次 GET 请求」改道到主服务端，主服务端用本机回环 HTTP 请求你插件的接口，把响应原样交回浏览器。你不需要依赖 zen-remote 的任何运行时——没装 zen-remote 时，`inject` 永远不触发，你的插件行为与从前完全一致。
+
+什么时候用：你的插件在**会话页**里渲染自己的面板，面板数据来自插件自己注册在 DSH webServer 上的 GET 接口，且数据按会话区分（或明确属于整机数据）。装了 zen-remote 的两台 DSH 之间，远程会话里的面板将取**服务端**的数据，而不是子客户端本机的空数据。
+
+## 接入
+
+在插件的 `apply` 里向 zen-remote 登记一份声明，dispose 挂进 `effect`（行卸载时撤下）：
+
+```ts
+import type { Context } from '@deepseek-ai/cordis'
+import type { BridgeDeclaration, ZenRemoteService } from 'dsh-zen-remote'
+
+export function apply(ctx: Context) {
+  ctx.inject(['zenRemote'], (c) => {
+    const bridge: ZenRemoteService = c.zenRemote
+    const declaration: BridgeDeclaration = {
+      plugin: '@scope/my-plugin',       // 必须与 package.json 的 name 一致
+      version: '0.2.0',                 // 必须与运行版本一致
+      routes: [
+        { path: '/my-plugin/session-data', scope: 'session' },
+        { path: '/my-plugin/all-tasks', scope: 'server' },
+      ],
+    }
+    const dispose = bridge.bridge(declaration)
+    ctx.effect(() => dispose, 'my-plugin: bridge declaration')
+  })
+}
+```
+
+- 类型从主包拿：`import type { BridgeDeclaration, ZenRemoteService } from 'dsh-zen-remote'`。
+- 没装 zen-remote：`inject(['zenRemote'])` 不触发，以上代码零影响；装了旧版 zen-remote：同样不触发（服务是 2.1 起提供）。
+- 两端都要登记：zen-remote 判定「已桥接」要求**两端插件名、确切版本、声明摘要**一致（声明摘要 = 对规范化声明做 sha256 取 16 位十六进制；路由顺序不影响摘要，任何字段值影响）。两端不一致时面板拿到 503（见下文），不会落到本机数据。
+
+## 声明字段表
+
+`BridgeDeclaration = { plugin, version, routes }`，校验失败登记时直接抛错：
+
+| 字段 | 规则 |
+| --- | --- |
+| `plugin` | 非空字符串；npm 包名形状（允许 `@scope/name`，全小写）；长度 ≤ 214 |
+| `version` | 非空字符串（原样比较，不做 semver 解析） |
+| `routes` | 非空数组，最多 64 条 |
+
+每条 `BridgeRoute`：
+
+| 字段 | 规则 |
+| --- | --- |
+| `path` | 以 `/` 开头；不含 `?`、`#`、`..`、空白；**不得**以 `/_dsh/` 或 `/api` 开头（宿主与 zen-remote 自己的前缀不能被桥接）；同一声明内不得重复 |
+| `scope` | 必填，只能是 `'session'`（数据属于单个会话）或 `'server'`（整机数据，需主服务端主人逐插件同意） |
+| `sessionParam` | 可选，缺省 `'sessionId'`；须匹配 `/^[A-Za-z][A-Za-z0-9_]{0,63}$/`——你的接口用别的名字接会话 id 时在这里声明 |
+| `stream` | 可选，缺省 `false`；标记该路由以流式响应回答 |
+| `methods` | 可选，缺省 `['GET']`；大写 HTTP 方法数组，只接受 `GET`、`HEAD`、`POST`、`PUT`、`PATCH`、`DELETE`，去重并按字典序排序后进规范化与摘要（2.2 起，写请求） |
+| `maxBody` | 可选，缺省 `1048576`（1 MiB）；请求体上限（字节），正整数，最高 500 MiB（与中继上传上限同源单一定义） |
+| `upgrade` | 可选；置 `true` 标记该路由是 WebSocket 升级端点，远程会话里经字节隧道转发（2.2 起，见下文「WebSocket 路由」）。只能为 `true` 或省略；不能与 `stream` 同用；升级路由只有 GET——显式 `methods` 里出现其他方法登记即报错 |
+| `locator` | 可选（2.4 起）；会话 id 在请求里的位置，替代 `sessionParam`（两者同写登记即报错）：`{ in: 'query', name }` 指定查询参数；`{ in: 'path-segment', index }` 数声明路径之后的第 index 段（0 起）；`{ in: 'json-body', fields }` 取 JSON 体的顶层字段（可列多个，出现几个算几个）。`path-segment` 必须配 `prefix: true`；不写 `locator` 时 `sessionParam` 语义原样保留 |
+| `prefix` | 可选（2.4 起）；置 `true` 时命中 `path` 本身或其任意子路径（`path/…`，按未解码的原始路径名判断，与适配器同一条规则）。不能与 `upgrade` 同用 |
+| `deny` | 可选（2.4 起）；置 `true` 标记路由的数据只在本机有意义：远程会话里命中即拒——请求带虚拟会话 id，或浏览器当前打开的就是远程会话——统一 503 `route-denied`，字节隧道路由同样生效；本地会话完全不受影响 |
+| `rewriteIds` | 可选（2.4 起）；两种形态，都把远程转发回来的 JSON 响应缓冲（上限 8 MB，超限原样直通、非 JSON 不动）后再改写。`true`（回显型）：对解析后的响应做深扫，凡与「**请求自带的**真实会话 id ∪ 子客户端已知的会话清单」里任一真实 id 确切相等的字符串，换回虚拟形态交还浏览器（2.4 后期扩源：已知清单是本机合并流维护的会话集合——侧边栏当前以 `zr~` 形态持有的每个真实 id，subagents.live 的对象键、workflows.list 的行这类「不在本请求里但在视野里」的 id 也按值改写；清单由各合并流**替换式**上报后取并集，流刷新即失效，两次刷新之间新出现的 id 要等下一次刷新才生效；改道层只读消费，绝不反向修改合并状态）。`{ fields: ['value.childId', …] }`（创建型）：响应会诞生**请求与已知清单都从未携带**的全新会话 id（如 sidechat.start 新建的 childId）的创建类路由用这个形态——按位置声明那些 id 在响应里的点路径，每段非空、仅 `[A-Za-z0-9_-]`、不含通配符与数组下标（数组元素场景归按值深扫）；改写时逐条路径取值，路径不存在或中途穿过数组、标量即跳过，取到非空且还不是虚拟形态的字符串就地包上 `zr~<服务端>~<id>` 外壳。按值与按位并存，同一字符串只改一次。**`true` 的边界**：请求与已知清单都不含的真实会话 id 仍会原样到达浏览器（浏览器拿真实 id 发后续请求会被判本地、拿到空数据）——那正是 `fields` 形态要接管的场景。`true` 与 `{ fields }` 是不同声明、摘要不同，且 **`fields` 数组的顺序也进摘要**（`["a","b"]` 与 `["b","a"]` 摘要不同）；既有声明（含 `true`）摘要逐位不变。不能与 `stream` 同用 |
+
+声明里出现未知字段直接报错（防拼错）。`methods`、`maxBody`、`upgrade` 与 2.4 的四个字段（`locator`/`prefix`/`deny`/`rewriteIds`）只在**显式给出**时进摘要——2.1 时代（没有这些字段）的声明，摘要与当年完全一致，升级不破坏已桥接状态。2.1 只匹配 **exact 路径**；2.4 起声明 `prefix: true` 的路由额外命中其子路径（见上表）。
+
+两个字段同写时 `deny` 优先：远程命中的请求先被 `route-denied` 拒下，`rewriteIds` 的改写不可达（本地请求两边都不触发，响应原样交回）。`upgrade` 路由上的 `rewriteIds`：query 定位的升级路由在隧道半边被忽略——隧道搬运的是不透明字节，无从改写（同一声明路由被当作普通 HTTP 请求命中时照常生效）；json-body 定位的升级路由则照常作用在**下行文本帧**上——帧先解 JSON、深扫或按位改写后重新封帧再给浏览器。
+
+## 你的插件要守的约定
+
+- **请求 query 带当前会话 id**：浏览器侧对 `scope:'session'` 路由的请求必须带 `sessionParam`（缺省 `sessionId`）参数；改道时 zen-remote 靠它找回真实会话 id。没有该参数的请求不算远程请求，会落到本机。
+- **服务端按会话 id 解析上下文，不信客户端路径**：同一份面板代码在两台机器上各有一个实例，你的接口拿到的会话 id 永远是**服务端**的会话；不要假设「请求来自本机浏览器」。
+- **响应不改写**：响应体原样交回浏览器。不要在响应里携带自己的本机地址或让浏览器再拿响应里的会话 id 去发第二个请求——第二个请求是否改道由它自己的参数决定，跨请求拼链路是远程面板最常见的坏法。
+- **侧切换重开流**：`scope:'session'` 的流式响应绑定当前会话；用户把面板切到另一个会话时重新发起请求，不要复用旧流。
+
+## 未桥接时浏览器看到什么
+
+远程会话里、声明命中的路由上，任何导致「无法转发」的情形都回答**同一个 503 形状**，且**绝不落到本机插件**（本机数据不会混进远程会话）：
+
+```
+HTTP/1.1 503
+x-zen-remote: unbridged
+content-type: application/json; charset=utf-8
+
+{"ok":false,"error":{"code":"zr-plugin-unbridged","reason":"<reason>","plugin":"<插件名>"}}
+```
+
+`reason` 的全部取值：
+
+| reason | 含义 |
+| --- | --- |
+| `not-on-server` | 服务端没登记这个插件 |
+| `version-mismatch` | 两端版本不同（升级某端后未重启行） |
+| `declaration-mismatch` | 版本相同但声明摘要不同 |
+| `consent-off` | 声明含 `scope:'server'` 路由，且主服务端主人未同意（设置页「插件桥」里逐插件打开） |
+| `offline` | 中继离线（或传输失败） |
+| `server-too-old` | 服务端 zen-remote 过旧，握手没有插件表 |
+| `server-changed` | 会话 id 指向另一台服务端（切换服务端后页面未刷新） |
+| `bad-query` | 会话参数重复，或虚拟会话 id 解析失败（浏览器侧缺失 / 为空的请求走本地放行，到不了 503） |
+| `method-not-bridged` | 请求方法不在该路由声明的 `methods` 内（未声明即只转发 GET） |
+| `route-denied` | 路由声明了 `deny: true`：远程会话（或浏览器当前打开的就是远程会话）命中即拒，本机数据不进远程面板；本地会话不受影响 |
+| `not-shared` / `busy` / `plugin-unknown` / `plugin-mismatch` / `route-undeclared` / `loopback-auth` / `internal` | 服务端中继路由的对应拒绝原样透传（会话未共享 / 该设备并发超限 / 服务端无此登记 / 版本或摘要不符 / 路径未声明 / 服务端回环鉴权失败 / 服务端内部错误） |
+
+## 限制
+
+- 2.1 只转发 **GET**；2.2 起路由可声明 `methods` 开放写方法（POST 等），请求体经中继流式转发，受该路由 `maxBody` 约束（缺省 1 MiB）——超限在本地即回答 413，不落本机、不到服务端。
+- 2.1 只匹配 **exact 路径**；2.4 起声明 `prefix: true` 的路由额外命中其子路径（见「声明字段表」）。
+
+## WebSocket 路由（2.2 起）
+
+路由声明 `upgrade: true` 后即成为 WebSocket 升级端点：远程会话里浏览器对该路径的 `new WebSocket(...)` 由子客户端本机接住，经中继的**字节隧道**接到服务端本机插件——升级请求头（`sec-websocket-key` / `sec-websocket-version`，及可选的 `sec-websocket-protocol` / `sec-websocket-extensions`）与双向字节各自**原样搬运，两端都不解析 WebSocket 帧**：101 响应、每个帧、关闭字节都是不透明字节，真正的握手由插件路由在服务端本机完成。例外：`locator: { in: 'json-body' }` 的升级路由（会话 id 在连接后的 JSON 文本帧里，握手本身是不带体的 GET）逐帧处理——客户端把每个文本帧的虚拟 id 还原成真实 id 再按序转发，服务端对每个文本帧按共享表核对后才交给插件，`rewriteIds` 声明（或适配器的响应钩子）也会作用在下行文本帧上；query 定位的升级路由保持不透明字节直通。三路由的协议形状见 `docs/remote-access.md` 的「插件桥」一节。
+
+浏览器侧没有新接口：拿到的仍是原生 `WebSocket`，感知不到隧道。升级无法转发时（未桥接、会话不可达等原因）浏览器看到的就是一次握手失败——子客户端在 socket 上回答与 HTTP 改道相同的 503 `zr-plugin-unbridged` 形状（reason 取值见上表），表现为 `error` / `close` 事件。
+
+限制：
+
+- 声明侧：`upgrade` 只能为 `true` 或省略，不能与 `stream` 同用，升级路由只有 GET（见字段表）；
+- 上行字节按最大 64 KiB 分块、严格按序转发（服务端按序号把关，乱序即断）；下行字节每行最多 48 KiB，走一条 NDJSON 流；
+- 每设备并发隧道上限 8；
+- 隧道随浏览器 socket 断开即关闭；服务端一侧的字节流断掉时浏览器 socket 直接切断——字节隧道不代拟关闭帧，插件自己发的关闭字节（若有）已作为数据先行到达。
+
+相关阅读：主服务端一侧的路由协议见 `docs/remote-access.md` 的「插件桥」小节；设置页的同意开关与状态文案见 `docs/interface.md`。
+
+## 适配器（zen-remote 内部）
+
+协作声明是插件作者对自己的接口登记；**适配器**是 zen-remote 为**不配合的第三方插件**写的内部转发模块，按目标插件的**确切版本**编写，负责把该插件请求与响应里的会话 id 在两端改写。它不是对外接口：插件作者不需要、也无法登记适配器；适配器随 zen-remote 本体分发，整块可移除（`src/adapters/` 目录删掉后，其余功能一字不改照常工作）。
+
+一个适配器声明三类信息：
+
+- **路由与定位**：每条路由给 `path`（exact 或前缀匹配）、可转发的方法与体上限，以及 `locator`——会话 id 在请求里的位置（query 参数 / 前缀后的路径段 / JSON 体顶层字段）。`local: true` 的前缀（如静态资源）永远留本机，不参与改道。
+- **远程判定**：定位到的会话 id 全是 `zr~` 虚拟 id → 远程转发；全不是（或一个都没定位到）→ 本地放行；**混合 → 503 `bad-query`**，绝不落本机。
+- **两个钩子（可选）**：子客户端侧 `client.request`（拒绝或改写 JSON 体，如在转发前拒绝 `open.external`）与 `client.response`（把响应里的真实会话 id 换回虚拟 id，JSON 响应缓冲上限 8 MB，超限原样直通）；主服务端侧 `server.request`（回环前拒绝或剥字段，如剥掉 `cwd`）。
+
+登记规则：适配器按宿主 `pluginPackages` 服务探测目标插件的**已装版本**，版本不在适配器声明的版本清单里就不登记——唯一例外：接线层会读已装插件的 `lib/index.js`，用该适配器的纯函数 surface 抽取器把 wire 面还原成摘要（16 位十六进制），摘要命中适配器 `surfaces` 表里的某一代，就按已装版本登记（注册摘要仍是路由表哈希，含版本号）。上游发了 wire 不变的补丁版时 zen-remote 不用发版即可桥接；抽取失败、表不命中都按未登记版本拒绝，只会更严不会更松。登记进与协作声明同一张注册表（版本 = 已装版本，摘要 = 适配器路由表的规范化哈希），握手同一个 `plugins` 字段，整机数据的同意开关逐插件生效（默认关，设置页条目标注「由 zen-remote 适配」）。若某插件既有适配器、自己又登记了协作声明，**以插件自己的声明为准**（适配器让位，记一条日志）。
+
+2.4 起协作声明与适配器同规则——exact 与 `prefix: true` 前缀都支持，query / 路径段 / JSON 体三种定位两半共用同一套定位规则；适配器侧另外提供 `local: true` 的纯本机路由、按请求判定的 `deny` 钩子、请求/响应重写钩子以及多版本 `versions` 清单与 `surfaces` 表（协作声明一次只登记当前版本）。

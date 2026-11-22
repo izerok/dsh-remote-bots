@@ -1,0 +1,4 @@
+# Local install artifact of the merged plugin (its own dependency tree for
+# link: installs). Recreate with `pnpm install` inside plugin/.
+# Never commit node_modules; the plugin's pnpm-lock.yaml IS committed.
+plugin/node_modules/

@@ -1,0 +1,9 @@
+- insert:
+    - id: bots
+      name: '@kadaliao/dsh-bots'
+      config:
+        enabled: true
+        # Shared workspace. Defaults to ~/.dsh/bots/workspace.
+        workdir: ''
+        # Existing folders by bot handle, e.g. { forge: /projects/forge }.
+        workdirs: {}

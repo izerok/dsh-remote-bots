@@ -1,5 +1,10 @@
 # Patches
 
+> **Legacy（2026-11-22 起）：patch 体系退为归档。** 本仓方向已改为单插件化——
+> 两份上游代码 fork 进仓、整合成一个插件（`plugin/`，见 `plugin/VENDORING.md`）。
+> 本目录的 patch 仍可干净应用、仍是已验证的可用交付物，但新部署请等合并插件测通
+> 后的新版指引；合并插件合入前，本目录内容不再更新。
+
 给 `kadaliao/dsh-bots` 加 zen-remote Plugin Bridge 声明，让 Bots 面板（`/​__dsh_bots/*`）能在 zen-remote 远程会话里显示，而不是静默拿到本机数据（见下文“没打 patch 时到底发生什么”）。
 
 ## 当前版：dsh-bots-zen-bridge.patch（bots 0.17.1 → 0.17.2-zen.2）

@@ -1,0 +1,2410 @@
+/**
+ * The plugin bridge's route interception (PB-4): the sub-client's local
+ * DSH process owns a webServer whose `match(pathname)` every request goes
+ * through (RT dsh-host-webserver lib/index.js:350-364 — `handle` computes
+ * the RAW, undecoded pathname and calls `this.match`). Overriding that one
+ * method intercepts every route lookup — including routes registered AFTER
+ * us, because the host re-reads the instance method per request. A request
+ * aimed at a BRIDGED plugin's declared route, carrying a VIRTUAL session id,
+ * cannot be served locally (the session lives on the server): the surrogate
+ * handler forwards it through `relay.pluginRequest` (PB-3's
+ * `relay/v1/plugin`) with the real id restored, and streams the answer
+ * back (PB-21: where the id lives is the route's own declaration — the 2.1
+ * query parameter, or a declaration-v2 locator in a prefix route's path
+ * segment or the JSON body; the v2 shapes ride the SAME adapter-core
+ * locate → classify → rewrite functions the adapters run, and a
+ * `prefix: true` route forwards its full matched, rewritten path).
+ * Everything else — undeclared routes, local sessions — flows to the
+ * original route untouched.
+ *
+ * PB-22 gives the two remaining declaration-v2 flags their client meaning:
+ * a `deny: true` route answers the uniform 503 with reason `route-denied`
+ * whenever a REMOTE context touches it — the request locating a virtual id,
+ * or the browser's CURRENT session being one (T62's signal) — while a local
+ * session passes through exactly as before; a `rewriteIds: true` route's
+ * JSON answer is buffered (the 8 MB adapter cap) and deep-scanned, every
+ * string EXACTLY equal to one of the request's own real session ids
+ * rewritten to its virtual form (`zr~` carries the real id inside, so the
+ * request's own hits ARE the read-only mapping — no table is consulted or
+ * written), unknown strings passing through untouched.
+ *
+ * PB-25a adds the position form: `rewriteIds: { fields }` declares the dot
+ * paths where the response's NEWLY-CREATED session ids sit (a creation
+ * route's `childId` was never in the request, so no value scan can catch
+ * it). On top of the value scan, each declared path's non-empty, non-virtual
+ * string gains the virtual shell of THIS request's server id; missing paths
+ * are no-ops and nothing is ever guessed beyond the declared positions.
+ *
+ * PB-25b widens the value scan's lookup from the request-local mapping to
+ * the request-local mapping UNION the KNOWN-real-session inventory: the
+ * merged global streams report every real id the sub-client currently holds
+ * (the sidebar's `zr~` rows — subagents.live's object keys, workflows.list
+ * rows: ids in the browser's view but not in THIS request), and a string
+ * exactly equal to one of those is rewritten too, in the same request-sourced
+ * virtual shell. The inventory is READ-ONLY consumption — the scan never
+ * touches merge state — and it is read live per answer: a stream refresh
+ * replaces its share, and the next answer sees the fresh union (ids that
+ * appear between two refreshes wait for the next refresh — the documented
+ * ceiling). Without the option the scan is exactly the PB-22 behavior.
+ *
+ * The un-bridged refusals answer a UNIFORM 503 shape (header
+ * `x-zen-remote: unbridged`, JSON body naming the reason) — and, decisive
+ * for the security posture, they answer WITHOUT the local plugin handler
+ * ever running: a remote session must never execute a plugin route against
+ * local state, not even when the bridge is down (docs/adr/0001).
+ *
+ * The wrap is gated on a structural shape check like the typert and
+ * fetch-route ones; uninstall restores `match` only while the instance
+ * still holds OUR wrapper — a later wrapper chained over us keeps working,
+ * and ours goes inert instead (the same posture as intercept.ts and
+ * fetch-route-intercept.ts).
+ */
+
+import type { IncomingMessage, ServerResponse } from 'node:http'
+import type { BridgeLocator, BridgeRegistry, BridgeStatus, NormalizedBridgeRoute } from './plugin-bridge.js'
+import { routeDeniesRemoteOf, routeLocatorOf, routeMaxBodyOf, routeMethodsOf, routePrefixOf, routeRewriteFieldsOf, routeRewritesIdsOf, routeUpgradesOf } from './plugin-bridge.js'
+import { PassThrough, Readable, Transform, Duplex } from 'node:stream'
+import { createHash, timingSafeEqual } from 'node:crypto'
+import type { Socket } from 'node:net'
+import type { RelayClient } from './relay-client.js'
+import { fromVirtual, isVirtual, toVirtual } from './virtual-id.js'
+import { encodeRfc6455Frame, parseRfc6455Frames, type Rfc6455Frame } from './plugin-tunnel.js'
+import type { NormalizedAdapter, NormalizedAdapterRoute, AdapterIdHit, AdapterVerdict, AdapterRemoteVerdict } from './plugin-adapter-core.js'
+import { adapterPathMatches, classifyAdapterRequest, locateAdapterIds, rewriteAdapterRequest, adapterOwnsRegistryEntry, MAX_ADAPTER_RESPONSE_BUFFER_BYTES, ADAPTER_RESPONSE_HEADER_ALLOWLIST, AdapterMultiValueQueryError } from './plugin-adapter-core.js'
+
+/** The RFC 6455 handshake GUID — the SHA-1 input of Sec-WebSocket-Accept. */
+const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+/** The byte triplet that ends every HTTP/1.1 header block — the seam where
+ * an upgrade answer's HEAD stops and its WebSocket frames begin (PB-26b:
+ * both directions strip or buffer up to this mark). */
+const HEADER_END = Buffer.from('\r\n\r\n', 'utf8')
+
+/** Structural verdict of {@link checkWebServerShape}: the facts the wrap
+ * reads per request — the `match` function the host's handle calls, the two
+ * route tables, and (PB-10) the `upgrades` table the host's upgrade handler
+ * reads `this.upgrades.get(pathname)` from (both Maps, RT
+ * lib/index.js:467-478 and 298-308; the probe verified them on real
+ * 0.2.0-rc.2 / 0.2.1-alpha.2 instances). */
+export type WebServerShapeCheck = { ok: true } | { ok: false; reasons: string[] }
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/** PB-22: the rewriteIds deep scan — every string in the parsed JSON that is
+ * EXACTLY a key of `known` becomes its virtual form; everything else passes
+ * through untouched. The mapping's membership is the ONLY rewrite trigger —
+ * no shape guessing (a session-id-LOOKING string the request never carried
+ * is not ours to rewrite), and object KEYS are left alone: the scan walks
+ * object values, array items and bare strings, exactly the positions a
+ * response can hand an id back to the browser in. Containers are rebuilt
+ * unconditionally, which keeps the rule obvious at the cost of allocations
+ * bounded by the 8 MB buffer cap.
+ *
+ * PB-25b adds the second lookup: a string exactly equal to a member of
+ * `knownIds` (the merged streams' known-real-session inventory, `undefined`
+ * when the wiring passed none — the scan then stays exactly the request-local
+ * behavior) is rewritten into THIS request's virtual shell, same source as
+ * the position rewrite's serverId. Already-virtual strings are never
+ * re-wrapped, and the set is read-only: the scan consults it, never mutates
+ * it. */
+function deepRewriteIds(
+  value: unknown,
+  known: ReadonlyMap<string, string>,
+  knownIds: ReadonlySet<string> | undefined,
+  serverId: string,
+): unknown {
+  if (typeof value === 'string') {
+    const mapped = known.get(value)
+    if (mapped !== undefined) return mapped
+    if (knownIds !== undefined && !isVirtual(value) && knownIds.has(value)) return toVirtual(serverId, value)
+    return value
+  }
+  if (Array.isArray(value)) return value.map((item) => deepRewriteIds(item, known, knownIds, serverId))
+  if (isRecord(value)) {
+    const out: Record<string, unknown> = {}
+    for (const [key, item] of Object.entries(value)) out[key] = deepRewriteIds(item, known, knownIds, serverId)
+    return out
+  }
+  return value
+}
+
+/** PB-25a: the position-based half of a `rewriteIds: { fields }` route's
+ * rewrite. Runs AFTER the value scan above, on the (rebuilt, private) parsed
+ * answer: each declared dot path is walked object-by-object, and a path that
+ * exists and holds a NON-EMPTY, NON-virtual string gains its virtual shell
+ * (`zr~<serverId>~<id>`, the serverId of the request this answer belongs to
+ * — a forward always located one). A path that does not exist — or that
+ * would walk through an array or a scalar — is a no-op: the answer's shape
+ * is the plugin's business, never a rewrite trigger (no shape guessing), and
+ * array elements stay the value scan's business (the declaration refuses
+ * numeric segments outright). Already-virtual values are skipped, so a known
+ * id sitting on a declared path is rewritten exactly once, by whichever half
+ * reached it first. Returns the virtual ids this pass MINTED (PB-26a) —
+ * exactly the positions it wrapped, deduped; a position the value scan
+ * already wrapped is not a mint (that row is in the browser's view). */
+function rewriteIdsAtFields(root: unknown, fields: readonly string[], serverId: string): string[] {
+  const minted = new Set<string>()
+  for (const field of fields) {
+    const segments = field.split('.')
+    let node: unknown = root
+    for (const segment of segments.slice(0, -1)) {
+      node = isRecord(node) ? node[segment] : undefined
+    }
+    if (!isRecord(node)) continue
+    const key = segments[segments.length - 1]
+    const value = node[key]
+    if (typeof value === 'string' && value !== '' && !isVirtual(value)) {
+      const virtualId = toVirtual(serverId, value)
+      node[key] = virtualId
+      minted.add(virtualId)
+    }
+  }
+  return [...minted]
+}
+
+/** Pump a response body reader into the browser response with real
+ * backpressure — the one discipline every verbatim passthrough runs. The
+ * `close` listener settles the wait when the browser vanishes mid-body (a
+ * lost drain event would otherwise hang the write loop). */
+async function pumpResponse(
+  res: ServerResponse,
+  reader: { read(): Promise<{ done: boolean; value?: Uint8Array }> },
+): Promise<void> {
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!res.write(value)) {
+      await new Promise<void>((resolve) => {
+        const settled = (): void => {
+          res.off('drain', settled)
+          res.off('close', settled)
+          resolve()
+        }
+        res.once('drain', settled)
+        res.once('close', settled)
+      })
+    }
+  }
+}
+
+/** PB-22/PB-25a/PB-25b: a rewriteIds route's JSON answer — buffered whole
+ * (the 8 MB adapter cap), deep-scanned with the request's own real→virtual
+ * mapping PLUS the known-real-session inventory (read live by the caller),
+ * plus, when the route declared field paths, the position rewrite on those
+ * paths, re-serialized with a corrected content-length. Past the cap, a
+ * non-JSON content type, or a parse failure the answer passes through
+ * untouched (the adapter discipline): a rewrite is strictly
+ * better-than-nothing, never a reason to mangle or refuse an answer. The
+ * caller has already handled the relay's refusal marker — this owns the
+ * entire normal answer. PB-26a: the virtual ids the position rewrite minted
+ * are reported through `onMinted` — at most once per answer, only when there
+ * are any, and only after the rewritten body is what the browser receives
+ * (a serialization failure passes the original bytes and reports nothing). */
+async function answerRewriteIds(
+  res: ServerResponse,
+  response: Response,
+  known: ReadonlyMap<string, string>,
+  fields: readonly string[] | undefined,
+  serverId: string,
+  knownIds: ReadonlySet<string> | undefined,
+  onMinted: ((virtualIds: readonly string[]) => void) | undefined,
+): Promise<void> {
+  const contentType = response.headers.get('content-type')
+  const verbatimHeaders = {
+    ...(contentType !== null ? { 'content-type': contentType } : {}),
+    ...(response.headers.get('content-length') !== null ? { 'content-length': response.headers.get('content-length')! } : {}),
+    ...(response.headers.get('cache-control') !== null ? { 'cache-control': response.headers.get('cache-control')! } : {}),
+  }
+  const reader = response.body?.getReader()
+  if (reader === undefined || contentType === null || !contentType.includes('application/json')) {
+    res.writeHead(response.status, verbatimHeaders)
+    if (reader !== undefined) await pumpResponse(res, reader)
+    res.end()
+    return
+  }
+  const chunks: Buffer[] = []
+  let size = 0
+  let overflow = false
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    size += value.length
+    // The over-cap chunk ITSELF is body content — it lands in the
+    // passthrough buffer too; only the REWRITE is cancelled.
+    chunks.push(Buffer.from(value))
+    if (size > MAX_ADAPTER_RESPONSE_BUFFER_BYTES) {
+      overflow = true
+      break
+    }
+  }
+  if (overflow) {
+    res.writeHead(response.status, verbatimHeaders)
+    for (const chunk of chunks) {
+      if (!res.write(chunk)) {
+        await new Promise<void>((resolve) => {
+          const settled = (): void => {
+            res.off('drain', settled)
+            res.off('close', settled)
+            resolve()
+          }
+          res.once('drain', settled)
+          res.once('close', settled)
+        })
+      }
+    }
+    await pumpResponse(res, reader)
+    res.end()
+    return
+  }
+  const text = Buffer.concat(chunks).toString('utf8')
+  let outBody: Buffer
+  let minted: string[] = []
+  try {
+    const scanned = deepRewriteIds(JSON.parse(text), known, knownIds, serverId)
+    if (fields !== undefined) minted = rewriteIdsAtFields(scanned, fields, serverId)
+    outBody = Buffer.from(JSON.stringify(scanned), 'utf8')
+  } catch {
+    // Not JSON after all (or the scan hit something unserializable): the
+    // original bytes pass through, length recomputed for the corrected
+    // header set.
+    outBody = Buffer.from(text, 'utf8')
+    res.writeHead(response.status, { ...verbatimHeaders, 'content-length': String(outBody.length) })
+    res.end(outBody)
+    return
+  }
+  res.writeHead(response.status, { ...verbatimHeaders, 'content-length': String(outBody.length) })
+  res.end(outBody)
+  if (minted.length > 0 && onMinted !== undefined) {
+    try {
+      onMinted(minted)
+    } catch {
+      // Bookkeeping for the sidebar — never a reason to fail an answer
+      // the browser already has.
+    }
+  }
+}
+
+/** Pure inspection of the RAW webServer instance — nothing is mutated, so a
+ * failed check leaves every route exactly as it was. */
+export function checkWebServerShape(webServer: unknown): WebServerShapeCheck {
+  if (!isRecord(webServer)) return { ok: false, reasons: ['webServer: not an object'] }
+  const reasons: string[] = []
+  if (typeof webServer.match !== 'function') reasons.push('match: not a function')
+  if (!(webServer.exact instanceof Map)) reasons.push('exact: not a Map')
+  if (!(webServer.prefixes instanceof Map)) reasons.push('prefixes: not a Map')
+  if (!(webServer.upgrades instanceof Map)) reasons.push('upgrades: not a Map')
+  if (reasons.length > 0) return { ok: false, reasons }
+  return { ok: true }
+}
+
+/** One failure of the bridge answered to a browser, in the diagnostics
+ * ring. The query NEVER travels — only the plugin name and the reason. */
+export interface PluginRouteFailureRecord {
+  time: string
+  plugin: string
+  reason: string
+}
+
+/** What the client status route surfaces about this interception. */
+export interface PluginRouteInterceptDiagnostics {
+  installed: boolean
+  shape: WebServerShapeCheck
+  /** Requests forwarded through the relay (virtual ids on declared routes,
+   * everything green). */
+  forwarded: number
+  /** Requests answered with the uniform unbridged 503. */
+  refused: number
+  /** The refusals keyed by reason. */
+  refusalsByReason: Record<string, number>
+  /** The most recent refusals, oldest first, capped — time, plugin, reason
+   * only, never a query, never a session id. */
+  recentFailures: PluginRouteFailureRecord[]
+  /** PB-10: tunnels live RIGHT NOW. */
+  tunnelsCurrent: number
+  /** PB-10: tunnels opened / torn down since the install. */
+  tunnelsOpened: number
+  tunnelsClosed: number
+  /** PB-11: adapter requests forwarded through the relay. */
+  adapterForwarded: number
+  /** PB-11: adapter JSON answers rewritten by a `client.response` hook, and
+   * answers that passed through UNTOUCHED because the buffer cap (8 MB) or
+   * a parse failure made a rewrite impossible. */
+  adapterResponseRewrites: number
+  adapterResponsePassthroughs: number
+}
+
+export interface InstallPluginRouteInterceptOptions {
+  /** The RAW webServer instance (`ctx.webServer[symbols.original]`). */
+  webServer: object
+  /** The local declaration registry (the `zenRemote` service's table). */
+  registry: BridgeRegistry
+  /** SINGLE-SERVER mode: the client relay client; `pluginRequest` is the
+   * forwarding door. Required together with {@link getServerId} and
+   * {@link getStatus} unless the MS-4 per-server faces below are given
+   * (MS-5's pool wiring). */
+  relay?: RelayClient
+  /** SINGLE-SERVER mode: the CURRENT handshake's server id, read live per
+   * call; a virtual id minted for another server (or before any handshake)
+   * refuses `server-changed`. */
+  getServerId?: () => string | undefined
+  /** SINGLE-SERVER mode: the PB-2 bridge verdicts, computed live per call; a
+   * plugin that is not bridged right now refuses with the status's own
+   * reason. */
+  getStatus?: () => BridgeStatus[]
+  /** The validated adapters (PB-11), as the wiring registered them.
+   * Absent/empty — the pluggable default — means no adapter routes exist
+   * and this interception behaves exactly as before. */
+  adapters?: readonly NormalizedAdapter[]
+  /** The session id the browser is CURRENTLY looking at (T62's report,
+   * read live per call). A VIRTUAL id means a remote session's panel is
+   * the request's origin — the signal an adapter route's `deny` hook uses
+   * to refuse requests (like better-sidebar's `open.external`) that carry
+   * no session field of their own, and (PB-22) the same-origin wall a
+   * cooperative route's `deny: true` raises. Absent → deny judges
+   * conservatively (only the request's own ids speak). */
+  getCurrentSession?: () => string | undefined
+  /** PB-25b: the KNOWN real session ids of this sub-client — the merged
+   * global streams' session inventories, unioned by the wiring. Read LIVE
+   * per rewriteIds answer, not captured at install: the streams report after
+   * the intercept installs, and a stream refresh replaces its share
+   * replace-style, so a getter is the only form that sees the fresh union —
+   * the same live-read discipline as getServerId/getStatus/getCurrentSession
+   * above. A rewriteIds route's value scan rewrites a string exactly equal
+   * to a member even when THIS request never carried it (the id already sits
+   * in the browser's view — subagents.live's object keys, workflows.list
+   * rows), wrapped in THIS request's virtual shell. The set is READ-ONLY
+   * consumption: nothing here mutates merge state. Absent → the scan is
+   * exactly the request-local PB-22 behavior. */
+  getKnownRealIds?: () => ReadonlySet<string>
+  /** MS-4: the per-server faces of the connection pool. A request whose
+   * located ids are `zr~<serverId>~…` is validated, forwarded and
+   * response-rewritten against THAT server alone: its relay client
+   * (`undefined` — a server the pool does not hold — refuses
+   * `server-changed`), its bridge verdicts and its known-real-id inventory.
+   * Each is optional and falls back on its own to the single-server face
+   * above: no `getRelayForServer` → `relay` exactly when the id belongs to
+   * `getServerId()`; no `getStatusForServer` → `getStatus()`; no
+   * `getKnownRealIdsForServer` → `getKnownRealIds()`. All read live. */
+  getRelayForServer?: (serverId: string) => RelayClient | undefined
+  getStatusForServer?: (serverId: string) => BridgeStatus[]
+  getKnownRealIdsForServer?: (serverId: string) => ReadonlySet<string>
+  /** PB-26a: called with the virtual session ids a response rewrite
+   * PRODUCED — a `rewriteIds.fields` route's wrapped positions, or the ids
+   * an adapter's `client.response` hook passed through `virtualize` (e.g.
+   * better-sidebar's `sidechat.start` childId) — so the session-summary
+   * sync can announce subagent/sidechat rows that never appear in
+   * workspace/follow. At most once per answer, deduped, only when there is
+   * something to report; a throwing callback never fails the answer. */
+  onMintedVirtualIds?: (virtualIds: readonly string[]) => void
+  /** Per-apply in-memory loopback marker: when `servesRole` and `connectsRole`
+   * share one `webServer` (peer mode), a request arriving from this process's
+   * own `pluginLoopback` / `pluginTunnel` carries this secret and passes
+   * straight through to the local plugin handler (header stripped). */
+  loopbackSecret?: string
+  /** Progress logging, wired to the context logger by index.ts. */
+  log?: (format: string, ...args: unknown[]) => void
+  /** Per-request forwards lines (T3): volume is one line per request, so
+   * they ride the debug channel and only surface at logLevel=debug. */
+  debug?: (format: string, ...args: unknown[]) => void
+  /** Throttle window (ms) for repeated `plugin route/upgrade refused` `log` lines
+   * keyed by `${kind}:${plugin}:${reason}`; defaults to 5 minutes (`0` disables). */
+  refusalLogWindowMs?: number
+  /** Clock reader for refusal-log throttling; defaults to `Date.now`. */
+  now?: () => number
+}
+
+export interface PluginRouteInterceptHandle {
+  /** Restore `match` — ONLY while the instance still holds our wrapper
+   * (chained-over wraps go inert instead). Idempotent. */
+  uninstall(): void
+  diagnostics(): PluginRouteInterceptDiagnostics
+}
+
+/** Longest failure ring kept for the status surface. */
+const MAX_FAILURES = 10
+
+/** Default 5-minute window for throttling identical refusal info logs. */
+const DEFAULT_REFUSAL_LOG_WINDOW_MS = 5 * 60_000
+
+/** What one declared-route hit carries from the match lookup into its
+ * surrogate handler. */
+interface DeclaredHit {
+  plugin: string
+  version: string
+  digest: string
+  /** The declared route path — what an exact route forwards verbatim (a
+   * prefix route forwards its full matched pathname instead). */
+  path: string
+  /** The EFFECTIVE session-id locator (PB-21, {@link routeLocatorOf}): the
+   * declared locator, or the 2.1 query-parameter convention read as one —
+   * a route never runs without a locating rule. */
+  locator: BridgeLocator
+  /** The EFFECTIVE prefix mark (PB-21, {@link routePrefixOf}): the route
+   * admits its variable path tail. */
+  prefix: boolean
+  /** The EFFECTIVE forwardable methods (PB-9): the declared list, or
+   * `['GET']` when the route declared none. */
+  methods: string[]
+  /** The EFFECTIVE body cap (PB-9), in bytes. */
+  maxBody: number
+  /** PB-22: the route refuses a REMOTE context outright (`deny: true` —
+   * local-only data): the surrogate answers `route-denied` instead of
+   * forwarding or passing through whenever the request carries a virtual id
+   * or the browser's current session is one. */
+  deny: boolean
+  /** PB-22: the route's JSON answers are deep-scanned for the request's own
+   * real session ids and re-serialized with their virtual forms. Both
+   * `rewriteIds` forms mark it true. */
+  rewriteIds: boolean
+  /** PB-25a: the declared field paths of a `{ fields }`-form `rewriteIds`
+   * route — where the response's NEWLY-CREATED session ids sit. `undefined`
+   * for a `true` route (value scan only) and for a route without the field. */
+  rewriteFields: readonly string[] | undefined
+  /** The same effective values folded into the adapter-core route shape —
+   * the object locate/classify/rewrite consume (PB-21, see
+   * {@link bridgeRouteAsAdapterRoute}). */
+  view: NormalizedAdapterRoute
+}
+
+/** The NormalizedBridgeRoute read through the adapter-core route shapes
+ * (PB-21): the declaration-v2 locators must ride the SAME locate →
+ * classify → rewrite functions the adapters run — never a second copy of
+ * those rules — so the cooperative route is handed to them as the
+ * NormalizedAdapterRoute those functions consume. Every field comes from a
+ * plugin-bridge effective reader; `deny` stays unset — the cooperative
+ * `deny: true` flag is a static declaration, not an adapter-style hook, so
+ * the surrogate halves judge it themselves (PB-22). */
+function bridgeRouteAsAdapterRoute(route: NormalizedBridgeRoute): NormalizedAdapterRoute {
+  return {
+    path: route.path,
+    match: routePrefixOf(route) ? 'prefix' : 'exact',
+    methods: routeMethodsOf(route),
+    maxBody: routeMaxBodyOf(route),
+    stream: route.stream,
+    upgrade: routeUpgradesOf(route),
+    locator: routeLocatorOf(route),
+    local: false,
+  }
+}
+
+export function installPluginRouteIntercept(options: InstallPluginRouteInterceptOptions): PluginRouteInterceptHandle {
+  // Shape FIRST, like every wrap: a caller that skipped checkWebServerShape
+  // (or a host whose shape changed between the check and this call) gets an
+  // INERT handle — nothing on the instance is touched — instead of a
+  // TypeError from a missing table midway through the install.
+  const shape = checkWebServerShape(options.webServer)
+  if (!shape.ok) {
+    options.log?.('plugin route intercept refused: %s', shape.reasons.join('; '))
+    return {
+      uninstall() {},
+      diagnostics(): PluginRouteInterceptDiagnostics {
+        return {
+          installed: false,
+          shape,
+          forwarded: 0,
+          refused: 0,
+          refusalsByReason: {},
+          recentFailures: [],
+          adapterForwarded: 0,
+          adapterResponseRewrites: 0,
+          adapterResponsePassthroughs: 0,
+          tunnelsCurrent: 0,
+          tunnelsOpened: 0,
+          tunnelsClosed: 0,
+        }
+      },
+    }
+  }
+  const { webServer, registry, log, debug } = options
+  const adapters = options.adapters ?? []
+  const getCurrentSession = options.getCurrentSession
+  const getKnownRealIds = options.getKnownRealIds
+  const onMintedVirtualIds = options.onMintedVirtualIds
+  const { relay, getServerId, getStatus } = options
+  const { getRelayForServer, getStatusForServer, getKnownRealIdsForServer } = options
+  // Exactly one mode, like installIntercept: the pool faces or the single
+  // row client — a wiring that passes neither would refuse every forwarded
+  // request as server-changed / not-bridged, so it is refused here instead.
+  if (
+    (getRelayForServer === undefined && (relay === undefined || getServerId === undefined))
+    || (getStatusForServer === undefined && getStatus === undefined)
+  ) {
+    throw new Error(
+      'installPluginRouteIntercept requires either `relay` + `getServerId` + `getStatus` (single server) or `getRelayForServer` + `getStatusForServer` (pool)',
+    )
+  }
+  // The single-server facts, proven present by the guard above.
+  const singleRelay = relay as RelayClient
+  const singleGetServerId = getServerId as () => string | undefined
+  const singleGetStatus = getStatus as () => BridgeStatus[]
+  /** MS-4: the relay client serving one server id, or `undefined` (the
+   * `server-changed` refusal). */
+  const relayOfServer = (serverId: string): RelayClient | undefined =>
+    getRelayForServer !== undefined ? getRelayForServer(serverId) : serverId === singleGetServerId() ? singleRelay : undefined
+  const statusesOfServer = (serverId: string): BridgeStatus[] =>
+    getStatusForServer !== undefined ? getStatusForServer(serverId) : singleGetStatus()
+  const knownRealIdsOfServer = (serverId: string): ReadonlySet<string> | undefined =>
+    getKnownRealIdsForServer !== undefined ? getKnownRealIdsForServer(serverId) : getKnownRealIds?.()
+  /** MS-4: the one server every located virtual id of a request belongs to,
+   * with its relay client — or the refusal reason, judged id by id in hit
+   * order (the single-server walls' order). A request naming ids of two
+   * servers is refused like a foreign one: it has no single home. */
+  const serverOfHits = (hits: readonly AdapterIdHit[]): { serverId: string; relay: RelayClient } | 'bad-query' | 'server-changed' => {
+    let located: { serverId: string; relay: RelayClient } | undefined
+    for (const idHit of hits) {
+      const parts = fromVirtual(idHit.value)
+      if (parts === undefined || parts.id === '') return 'bad-query'
+      if (located === undefined) {
+        const target = relayOfServer(parts.serverId)
+        if (target === undefined) return 'server-changed'
+        located = { serverId: parts.serverId, relay: target }
+      } else if (parts.serverId !== located.serverId) {
+        return 'server-changed'
+      }
+    }
+    return located ?? 'bad-query'
+  }
+  const target = webServer as { match: (this: unknown, pathname: string) => unknown }
+  const savedMatch = target.match
+  const loopbackSecretBytes = typeof options.loopbackSecret === 'string' && options.loopbackSecret !== ''
+    ? Buffer.from(options.loopbackSecret, 'utf8')
+    : undefined
+  const isLoopbackBypass = (req: IncomingMessage): boolean => {
+    if (loopbackSecretBytes === undefined) return false
+    const raw = req.headers['x-zen-remote-loopback']
+    const candidate = Array.isArray(raw) ? raw[0] : raw
+    if (typeof candidate !== 'string' || candidate === '') return false
+    const candidateBytes = Buffer.from(candidate, 'utf8')
+    if (candidateBytes.length !== loopbackSecretBytes.length) return false
+    if (!timingSafeEqual(candidateBytes, loopbackSecretBytes)) return false
+    delete req.headers['x-zen-remote-loopback']
+    return true
+  }
+
+  let installed = true
+  let forwarded = 0
+  let refused = 0
+  let adapterForwarded = 0
+  let adapterResponseRewrites = 0
+  let adapterResponsePassthroughs = 0
+  let tunnelsCurrent = 0
+  let tunnelsOpened = 0
+  let tunnelsClosed = 0
+  const refusalsByReason: Record<string, number> = {}
+  const recentFailures: PluginRouteFailureRecord[] = []
+  const refusalLogWindowMs =
+    options.refusalLogWindowMs !== undefined && Number.isFinite(options.refusalLogWindowMs) && options.refusalLogWindowMs >= 0
+      ? options.refusalLogWindowMs
+      : DEFAULT_REFUSAL_LOG_WINDOW_MS
+  const now = options.now ?? Date.now
+  const refusalLogGate = new Map<string, { lastLoggedAt: number; suppressed: number }>()
+
+  /** Throttle repeated identical refusal `log` lines over `refusalLogWindowMs`
+   * so high-frequency polling does not wash out the diagnostic ring; repeats
+   * fall back to `debug` while `recordRefusal` still counts every refusal. */
+  const logRefusal = (kind: 'route' | 'upgrade', plugin: string, reason: string): void => {
+    const format = kind === 'route' ? 'plugin route refused for %s: %s' : 'plugin upgrade refused for %s: %s'
+    if (refusalLogWindowMs <= 0) {
+      log?.(format, plugin, reason)
+      return
+    }
+    const ts = now()
+    const key = `${kind}:${plugin}:${reason}`
+    const existing = refusalLogGate.get(key)
+    if (existing === undefined || ts - existing.lastLoggedAt >= refusalLogWindowMs || ts < existing.lastLoggedAt) {
+      const priorSuppressed = existing?.suppressed ?? 0
+      refusalLogGate.set(key, { lastLoggedAt: ts, suppressed: 0 })
+      if (priorSuppressed > 0) {
+        log?.(`${format} (suppressed %d repeats)`, plugin, reason, priorSuppressed)
+      } else {
+        log?.(format, plugin, reason)
+      }
+      return
+    }
+    existing.suppressed += 1
+    debug?.(format, plugin, reason)
+  }
+
+  /** The unbridged refusal written straight onto an upgrading socket
+   * (PB-10): the WebSocket handshake never happened, so the "response" is
+   * hand-written HTTP — same shape, same marker, then the socket dies
+   * without the local plugin ever seeing the connection. */
+  const answerUnbridgedSocket = (socket: Socket, plugin: string, reason: string): void => {
+    recordRefusal(plugin, reason)
+    logRefusal('upgrade', plugin, reason)
+    const body = Buffer.from(JSON.stringify({ ok: false, error: { code: 'zr-plugin-unbridged', reason, plugin } }), 'utf8')
+    try {
+      socket.write(
+        `HTTP/1.1 503 Service Unavailable\r\n` +
+          `x-zen-remote: unbridged\r\n` +
+          `content-type: application/json; charset=utf-8\r\n` +
+          `content-length: ${body.length}\r\n` +
+          `connection: close\r\n` +
+          `\r\n`,
+      )
+      socket.end(body)
+    } catch {
+      // The socket was already gone.
+    }
+  }
+
+  const recordRefusal = (plugin: string, reason: string): void => {
+    refused += 1
+    refusalsByReason[reason] = (refusalsByReason[reason] ?? 0) + 1
+    if (recentFailures.length >= MAX_FAILURES) recentFailures.shift()
+    recentFailures.push({ time: new Date().toISOString(), plugin, reason })
+  }
+
+  /** The uniform unbridged 503: one shape for every refusal, the local
+   * plugin handler never reached. */
+  const answerUnbridged = (res: ServerResponse, plugin: string, reason: string): void => {
+    recordRefusal(plugin, reason)
+    logRefusal('route', plugin, reason)
+    res.setHeader('x-zen-remote', 'unbridged')
+    res.setHeader('content-type', 'application/json; charset=utf-8')
+    res.writeHead(503)
+    res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-unbridged', reason, plugin } }))
+  }
+
+  /** The original route handler when it is worth calling at all. */
+  const handlerOf = (route: unknown): ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined =>
+    route !== undefined && isRecord(route) && typeof (route as { handler?: unknown }).handler === 'function'
+      ? (route as { handler: (req: IncomingMessage, res: ServerResponse) => Promise<void> }).handler
+      : undefined
+
+  /** The declared route this pathname hits — exact equality, or, for a
+   * route declared `prefix: true` (PB-21), equality or one path segment
+   * deeper on the RAW undecoded pathname. The rule is `adapterPathMatches`
+   * itself, run against the route's adapter-core view, so the cooperative
+   * match can never drift from the adapters'. First plugin in registry
+   * order wins, and within it the first route in declaration order — a
+   * pathname two routes of one plugin can both hit belongs to the earlier
+   * one, exactly as the exact-only lookup always did. */
+  const declaredRouteOf = (pathname: string): DeclaredHit | undefined => {
+    for (const declaration of registry.list()) {
+      for (const route of declaration.routes) {
+        const view = bridgeRouteAsAdapterRoute(route)
+        if (!adapterPathMatches(view, pathname)) continue
+        return {
+          plugin: declaration.plugin,
+          version: declaration.version,
+          digest: declaration.digest,
+          path: route.path,
+          locator: routeLocatorOf(route),
+          prefix: routePrefixOf(route),
+          methods: routeMethodsOf(route),
+          maxBody: routeMaxBodyOf(route),
+          deny: routeDeniesRemoteOf(route),
+          rewriteIds: routeRewritesIdsOf(route),
+          rewriteFields: routeRewriteFieldsOf(route),
+          view,
+        }
+      }
+    }
+    return undefined
+  }
+
+  /** The surrogate handler, query locator's half (every 2.1 route and an
+   * explicit query declaration): ONE query parse, the virtual-id gate, the
+   * unbridged walls in contract order, then the relay round-trip. A
+   * declaration-v2 locator dispatches to the PB-21 half below. */
+  const surrogateHandler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const passthrough = async (): Promise<void> => {
+        if (originalHandler !== undefined) {
+          await originalHandler(req, res)
+          return
+        }
+        res.writeHead(404)
+        res.end()
+      }
+      // Chained-over: inert passthrough, exactly the posture of the other
+      // intercepts.
+      if (!installed || isLoopbackBypass(req)) {
+        await passthrough()
+        return
+      }
+      // PB-21: a v2 locator (path-segment / json-body) runs the adapter-core
+      // pipeline in its own half — the query locator keeps THIS code path
+      // verbatim. The dispatch sits after the installed check, so the v2
+      // half never runs chained-over either.
+      if (declared.locator.in !== 'query') {
+        await surrogateV2Handler(declared, originalHandler)(req, res)
+        return
+      }
+      // ONE parse of the query (the session parameter's home — `match` only
+      // ever saw the pathname): everything below reads THIS parse. The
+      // parameter NAME is the effective locator's (the 2.1 sessionParam for
+      // a route that declared no locator — the same value routeLocatorOf
+      // reads back out).
+      let requestUrl: URL
+      try {
+        requestUrl = new URL(req.url ?? '/', 'http://local')
+      } catch {
+        answerUnbridged(res, declared.plugin, 'bad-query')
+        return
+      }
+      const searchParams = requestUrl.searchParams
+      const values = searchParams.getAll(declared.locator.name)
+      // The parameter appearing MORE than once is a shape violation the
+      // bridge refuses (bad-query) — never a passthrough, and never a
+      // forward of whichever duplicate a parser happens to keep. Its TOTAL
+      // absence, though, is the LOCAL route's business (a whole-machine
+      // route may simply not take one).
+      if (values.length > 1) {
+        answerUnbridged(res, declared.plugin, 'bad-query')
+        return
+      }
+      const value = values.length === 1 ? values[0] : undefined
+      // PB-22: a `deny: true` route refuses a REMOTE context outright — the
+      // request locating a virtual id, or the browser's CURRENT session
+      // being one (T62's signal; requests like open.external carry no id of
+      // their own). The uniform 503 with the route's own reason: the local
+      // handler is never reached, and the forward path below is unreachable
+      // for this route. A local session's request without a virtual id falls
+      // through — `deny` must not touch local behavior.
+      if (declared.deny) {
+        const current = getCurrentSession?.()
+        if ((current !== undefined && isVirtual(current)) || (value !== undefined && value.startsWith('zr~'))) {
+          answerUnbridged(res, declared.plugin, 'route-denied')
+          return
+        }
+      }
+      // A LOCAL id (or none at all): the original route's business — its
+      // handler runs exactly as if we were never here.
+      if (value === undefined || value === '' || !value.startsWith('zr~')) {
+        await passthrough()
+        return
+      }
+      const parts = fromVirtual(value)
+      if (parts === undefined || parts.id === '') {
+        answerUnbridged(res, declared.plugin, 'bad-query')
+        return
+      }
+      const targetRelay = relayOfServer(parts.serverId)
+      if (targetRelay === undefined) {
+        answerUnbridged(res, declared.plugin, 'server-changed')
+        return
+      }
+      // PB-9: the method must be one the route declared — the write surface
+      // is exactly as explicit as the read one was in 2.1, and an undeclared
+      // method never reaches the local plugin OR the relay.
+      const method = req.method ?? 'GET'
+      if (!declared.methods.includes(method)) {
+        answerUnbridged(res, declared.plugin, 'method-not-bridged')
+        return
+      }
+      // PB-9: the body gate, BEFORE a byte moves — a declared
+      // Content-Length past the route's `maxBody` is refused locally (the
+      // relay would refuse it at the streaming count anyway; refusing here
+      // saves the round-trip and keeps the plugin out of it entirely).
+      const hasBody = method !== 'GET' && method !== 'HEAD'
+      const declaredLength = Number(req.headers['content-length'])
+      if (hasBody && Number.isFinite(declaredLength) && declaredLength > declared.maxBody) {
+        res.setHeader('content-type', 'application/json; charset=utf-8')
+        res.writeHead(413)
+        res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+        recordRefusal(declared.plugin, 'body-too-large')
+        log?.('plugin request for %s refused locally: body-too-large (%s declared)', declared.path, req.headers['content-length'])
+        return
+      }
+      const status = statusesOfServer(parts.serverId).find((entry) => entry.plugin === declared.plugin)
+      if (status === undefined || !status.bridged) {
+        answerUnbridged(res, declared.plugin, status?.reason ?? 'not-on-server')
+        return
+      }
+      forwarded += 1
+      // Logged HERE, after the virtual-id gate (PB-5-fix): a local panel
+      // polling its route every second must not log a line a second — the
+      // bridge only speaks when a request actually leaves for the relay (or
+      // is refused below, which answerUnbridged logs).
+      debug?.('plugin route %s forwards for %s', declared.path, declared.plugin)
+      // The session id rides the CHECKED parse, restored to its ORIGINAL
+      // form, re-serialized once — what was judged is what is forwarded.
+      searchParams.set(declared.locator.name, parts.id)
+      // PB-22: the request's own real→virtual pair — the READ-ONLY mapping a
+      // rewriteIds route's answer scan consults (`zr~` carries the real id
+      // inside, so the ids this very request named are exactly the ones the
+      // answer may hand back). PB-25b: the scan consults ONE more source
+      // beside this mapping — the known-real-session inventory, read live at
+      // the answer (never copied here) and consumed read-only; nothing here
+      // writes any session table.
+      const idMapping: ReadonlyMap<string, string> = new Map([[parts.id, value]])
+      const controller = new AbortController()
+      // The counting gate's failure has its OWN abort signal (PB-9-fix, the
+      // mirror of the relay route's bodyGateError): tripping the gate is a
+      // LOCAL verdict — it must tear the relay round-trip down AND be
+      // readable in the catch below without depending on the error MESSAGE
+      // surviving undici's fetch rejection. It also tells the relay client
+      // (through the aborted signal) that this is a caller abort, never a
+      // transport death.
+      let bodyGateFailed = false
+      const bodyAbort = new AbortController()
+      const forwardSignal = AbortSignal.any([controller.signal, bodyAbort.signal])
+      const onClientGone = (): void => {
+        if (!res.writableEnded) controller.abort()
+      }
+      res.on('close', onClientGone)
+      try {
+        const accept = typeof req.headers.accept === 'string' ? req.headers.accept : undefined
+        const range = typeof req.headers.range === 'string' ? req.headers.range : undefined
+        const requestContentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined
+        // PB-9: the request body streams through a counting Transform —
+        // node's pipe owns the backpressure, and the route's `maxBody` is
+        // enforced ON THE STREAM for a chunked body (no Content-Length for
+        // the pre-check above to read). Past the cap the gate errors, which
+        // aborts the relay round-trip mid-flight and answers the local 413
+        // below (the browser's headers are not out — nothing ever started).
+        let bodyStream: ReadableStream<Uint8Array> | null = null
+        if (hasBody) {
+          let pumped = 0
+          const gate = new Transform({
+            transform(chunk: Buffer, _encoding, callback) {
+              pumped += chunk.length
+              if (pumped > declared.maxBody) {
+                callback(new Error('zr-plugin-body-too-large'))
+                return
+              }
+              callback(null, chunk)
+            },
+          })
+          req.on('error', (error) => gate.destroy(error))
+          gate.on('error', () => {
+            if (!bodyGateFailed) bodyGateFailed = true
+            bodyAbort.abort()
+          })
+          // The fetch body must be a WEB ReadableStream (undici's contract);
+          // Readable.toWeb adapts the counting gate, preserving backpressure.
+          bodyStream = Readable.toWeb(gate) as ReadableStream<Uint8Array>
+          req.pipe(gate)
+        }
+        const response = await targetRelay.pluginRequest(
+          {
+            plugin: declared.plugin,
+            version: declared.version,
+            digest: declared.digest,
+            // A prefix route (PB-21) forwards its FULL matched pathname —
+            // the declared base alone would lose the variable tail; an
+            // exact route's pathname IS the declared path, the bytes that
+            // always travelled.
+            path: declared.prefix ? requestUrl.pathname : declared.path,
+            query: searchParams.toString(),
+            method,
+            ...(hasBody ? { body: bodyStream } : {}),
+            ...(hasBody && requestContentType !== undefined ? { contentType: requestContentType } : {}),
+            ...(hasBody && Number.isFinite(declaredLength) && declaredLength > 0 ? { contentLength: declaredLength } : {}),
+            ...(accept !== undefined ? { accept } : {}),
+            ...(range !== undefined ? { range } : {}),
+          },
+          forwardSignal,
+        )
+        // A relay-side refusal travels its OWN marker header (PB-3); the
+        // browser sees the uniform unbridged shape with that code as the
+        // reason. The relay's JSON body is disposed unread.
+        const refusal = response.headers.get('x-zen-remote-error')
+        if (refusal !== null) {
+          await response.body?.cancel().catch(() => {})
+          answerUnbridged(res, declared.plugin, refusal)
+          return
+        }
+        // PB-22: a rewriteIds route's answer is buffered and deep-scanned
+        // (the ids this request named come back virtual); everything else —
+        // non-JSON answers included — streams verbatim. PB-25a: a
+        // `{ fields }` declaration adds the position rewrite, under THIS
+        // request's own server id. PB-25b: the scan's lookup widens to the
+        // known inventory, read live right here (undefined when the wiring
+        // passed no getter — the scan stays request-local).
+        if (declared.rewriteIds) {
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, parts.serverId, knownRealIdsOfServer(parts.serverId), onMintedVirtualIds)
+          return
+        }
+        const contentType = response.headers.get('content-type')
+        const contentLength = response.headers.get('content-length')
+        const cacheControl = response.headers.get('cache-control')
+        res.writeHead(response.status, {
+          ...(contentType !== null ? { 'content-type': contentType } : {}),
+          ...(contentLength !== null ? { 'content-length': contentLength } : {}),
+          ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+        })
+        // Stream the body through with real backpressure; a mid-stream
+        // failure with headers already out can only cut the response.
+        const reader = response.body?.getReader()
+        if (reader !== undefined) await pumpResponse(res, reader)
+        res.end()
+      } catch (error) {
+        // The gate's local flag FIRST (PB-9-fix): the counting gate tripped
+        // mid-forward — the chunked body outgrew the route's `maxBody` while
+        // the relay round-trip was still being written. The browser's
+        // headers are not out, so the local 413 still fits — same shape the
+        // pre-check above answers. The flag is local on purpose: the gate's
+        // error cannot be relied on to survive undici's fetch rejection
+        // wrapper, and the relay client has (correctly) NOT judged the link
+        // offline for a caller abort — answering from the wire's error would
+        // misreport this as 503 offline.
+        if (bodyGateFailed && !res.headersSent) {
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.writeHead(413)
+          res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+          recordRefusal(declared.plugin, 'body-too-large')
+          return
+        }
+        if (controller.signal.aborted || res.destroyed || res.headersSent) {
+          // The browser is gone (its abort tore the relay round-trip down)
+          // or the body already started: the status cannot change, so the
+          // response is cut.
+          try {
+            res.destroy()
+          } catch {
+            // Already gone.
+          }
+          return
+        }
+        const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : 'offline'
+        answerUnbridged(res, declared.plugin, code === 'aborted' ? 'offline' : code)
+      } finally {
+        res.off('close', onClientGone)
+      }
+    }
+
+  /** The PB-21 surrogate half for the declaration-v2 locators — json-body,
+   * and path-segment on a prefix route: the adapter surrogate's pipeline
+   * (locate → classify → walls → rewrite → the relay round-trip) run
+   * through the SAME adapter-core functions against the route's
+   * adapter-core view. The response discipline stays the query half's —
+   * three headers, no hooks: `deny` and `rewriteIds` are PB-22's business.
+   * Dispatch above guarantees `installed` and a non-query locator. */
+  const surrogateV2Handler = (declared: DeclaredHit, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const plugin = declared.plugin
+      // The local passthrough. A json-body route has ALREADY consumed the
+      // request body by the time this runs (the classify needs the parsed
+      // body), so the replay hands the buffered bytes back behind the
+      // original request's metadata — the shape a local handler actually
+      // reads (method/url/headers/pipe).
+      const passthrough = async (replayBody?: Buffer): Promise<void> => {
+        if (originalHandler === undefined) {
+          res.writeHead(404)
+          res.end()
+          return
+        }
+        if (replayBody !== undefined) {
+          const replay = new PassThrough()
+          replay.end(replayBody)
+          Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
+          await originalHandler(replay as unknown as IncomingMessage, res)
+          return
+        }
+        await originalHandler(req, res)
+      }
+      let controller: AbortController | undefined
+      const onClientGone = (): void => {
+        if (controller !== undefined && !res.writableEnded) controller.abort()
+      }
+      res.on('close', onClientGone)
+      // The counting gate's LOCAL flag (the query half's PB-9-fix shape): a
+      // tripped gate answers the local 413 in the catch below — never an
+      // offline verdict, never a half-written response.
+      let bodyGateFailed = false
+      const bodyAbort = new AbortController()
+      try {
+        let url: URL
+        try {
+          url = new URL(req.url ?? '/', 'http://local')
+        } catch {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        const pathname = url.pathname
+        const searchParams = url.searchParams
+        const method = req.method ?? 'GET'
+        const hasBody = method !== 'GET' && method !== 'HEAD'
+
+        // PB-22: the deny wall's current-session half — a remote panel is
+        // the request's origin even when it carries no id of its own
+        // (open.external's shape). Refused before any body byte is read.
+        if (declared.deny) {
+          const current = getCurrentSession?.()
+          if (current !== undefined && isVirtual(current)) {
+            answerUnbridged(res, plugin, 'route-denied')
+            return
+          }
+        }
+
+        // A json-body route buffers the request body up front, bounded by
+        // the route's own maxBody — the cooperative 413 shape, answered
+        // locally, the plugin never reached. A path-segment route's body is
+        // never consumed by locating; it streams through the counting gate
+        // at the forward.
+        let bufferedBody: Buffer | undefined
+        if (hasBody && declared.locator.in === 'json-body') {
+          const chunks: Buffer[] = []
+          let size = 0
+          let over = false
+          for await (const chunk of req) {
+            size += (chunk as Buffer).length
+            if (size > declared.maxBody) {
+              over = true
+              break
+            }
+            chunks.push(Buffer.from(chunk as Uint8Array))
+          }
+          if (over) {
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.writeHead(413)
+            res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+            recordRefusal(plugin, 'body-too-large')
+            log?.('plugin request for %s refused locally: body-too-large (%s buffered)', declared.path, size)
+            return
+          }
+          bufferedBody = Buffer.concat(chunks)
+        }
+        // A present body must parse as JSON when the route locates in it —
+        // a corrupted body refuses rather than falling through to the local
+        // plugin with a body the locate could not judge (the adapter half's
+        // shared rule).
+        let parsedBody: unknown
+        let bodyGiven = false
+        if (hasBody && declared.locator.in === 'json-body' && bufferedBody !== undefined && bufferedBody.length > 0) {
+          try {
+            parsedBody = JSON.parse(bufferedBody.toString('utf8'))
+            bodyGiven = true
+          } catch {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+        }
+        // The remote/local verdict on the ids as they arrived — the
+        // adapter-core classify (locate inside), no second copy of the
+        // rule: every id virtual → forward, none → local, a mix → the
+        // uniform refusal (docs/adr/0001: a remote session never reaches a
+        // local plugin).
+        let verdict: AdapterRemoteVerdict
+        try {
+          verdict = classifyAdapterRequest(declared.view, pathname, searchParams, bodyGiven ? parsedBody : undefined)
+        } catch (error) {
+          if (error instanceof AdapterMultiValueQueryError) {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+          throw error
+        }
+        // PB-22: the deny wall's request half — the locate found a virtual
+        // id (a remote verdict, or a mixed one: that too means a virtual id
+        // sat in the request). This route never serves a remote context, so
+        // the answer is the route's own refusal, not the mixed shape.
+        if (declared.deny && verdict.kind !== 'local') {
+          answerUnbridged(res, plugin, 'route-denied')
+          return
+        }
+        if (verdict.kind === 'local') {
+          await passthrough(bufferedBody)
+          return
+        }
+        if (verdict.kind === 'mixed') {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        // Remote: the route's method wall, then the per-id server walls —
+        // the query half's gates, re-run per located id.
+        if (!declared.methods.includes(method)) {
+          answerUnbridged(res, plugin, 'method-not-bridged')
+          return
+        }
+        // PB-22: the request's own real→virtual pairs, collected while the
+        // wall validates each hit — the READ-ONLY mapping a rewriteIds
+        // route's answer scan consults (`zr~` carries the real id inside, so
+        // the ids this very request named are exactly the ones the answer
+        // may hand back). PB-25a: the SAME unwrap hands the position rewrite
+        // its server id — the ids this request located live under it, so a
+        // NEWLY-created id joins them (the query half's source verbatim;
+        // `remote` always has at least one hit). PB-25b: the scan consults
+        // ONE more source beside this mapping — the known-real-session
+        // inventory, read live at the answer (never copied here) and
+        // consumed read-only; nothing here writes any session table.
+        // MS-4: every located id must name ONE server the wiring serves;
+        // that server's relay, verdicts and inventory carry the rest.
+        const home = serverOfHits(verdict.hits)
+        if (home === 'bad-query' || home === 'server-changed') {
+          answerUnbridged(res, plugin, home)
+          return
+        }
+        const locatedServerId = home.serverId
+        const idMapping = new Map<string, string>()
+        for (const idHit of verdict.hits) idMapping.set(fromVirtual(idHit.value)!.id, idHit.value)
+        // The bridge verdicts judged from the SAME live table the query
+        // half reads.
+        const status = statusesOfServer(locatedServerId).find((entry) => entry.plugin === plugin)
+        if (status === undefined || !status.bridged) {
+          answerUnbridged(res, plugin, status?.reason ?? 'not-on-server')
+          return
+        }
+        // Real ids in, coordinates rewritten — the adapter-core rewrite:
+        // the query re-serialized, the path segment re-encoded, the JSON
+        // body re-serialized. The forward carries the REWRITTEN pathname —
+        // a prefix route's full matched path, never the declared base.
+        const rewrite = rewriteAdapterRequest(declared.view, pathname, searchParams, bodyGiven ? parsedBody : undefined, verdict.hits, (virtualId) => fromVirtual(virtualId)!.id)
+        forwarded += 1
+        debug?.('plugin route %s forwards for %s', rewrite.pathname, plugin)
+        controller = new AbortController()
+        const forwardSignal = AbortSignal.any([controller.signal, bodyAbort.signal])
+        const accept = typeof req.headers.accept === 'string' ? req.headers.accept : undefined
+        const range = typeof req.headers.range === 'string' ? req.headers.range : undefined
+        const requestContentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined
+        const declaredLength = Number(req.headers['content-length'])
+        let bodyStream: ReadableStream<Uint8Array> | null = null
+        let contentLength: number | undefined
+        if (hasBody && declared.locator.in === 'json-body') {
+          // The buffer forwards in full: the (possibly rewritten)
+          // re-serialization when ids sat in it, the original bytes
+          // otherwise. The REWRITTEN byte count is the declared length —
+          // the budget reads what actually travels.
+          const payload = rewrite.bodyText !== undefined ? Buffer.from(rewrite.bodyText, 'utf8') : bufferedBody ?? Buffer.alloc(0)
+          contentLength = payload.length
+          bodyStream = Readable.toWeb(Readable.from(payload)) as ReadableStream<Uint8Array>
+        } else if (hasBody) {
+          // The pre-check first — a DECLARED Content-Length past the cap
+          // never starts a round-trip — then the counting gate for a
+          // chunked body, exactly the query half's PB-9 discipline.
+          if (Number.isFinite(declaredLength) && declaredLength > declared.maxBody) {
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.writeHead(413)
+            res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+            recordRefusal(plugin, 'body-too-large')
+            log?.('plugin request for %s refused locally: body-too-large (%s declared)', declared.path, req.headers['content-length'])
+            return
+          }
+          let pumped = 0
+          const gate = new Transform({
+            transform(chunk: Buffer, _encoding, callback) {
+              pumped += chunk.length
+              if (pumped > declared.maxBody) {
+                callback(new Error('zr-plugin-body-too-large'))
+                return
+              }
+              callback(null, chunk)
+            },
+          })
+          req.on('error', (error) => gate.destroy(error))
+          gate.on('error', () => {
+            if (!bodyGateFailed) bodyGateFailed = true
+            bodyAbort.abort()
+          })
+          bodyStream = Readable.toWeb(gate) as ReadableStream<Uint8Array>
+          req.pipe(gate)
+          if (Number.isFinite(declaredLength) && declaredLength > 0) contentLength = declaredLength
+        }
+        const response = await home.relay.pluginRequest(
+          {
+            plugin,
+            version: declared.version,
+            digest: declared.digest,
+            path: rewrite.pathname,
+            query: rewrite.query.toString(),
+            method,
+            ...(bodyStream !== null ? { body: bodyStream } : {}),
+            ...(bodyStream !== null && requestContentType !== undefined ? { contentType: requestContentType } : {}),
+            ...(bodyStream !== null && contentLength !== undefined ? { contentLength } : {}),
+            ...(accept !== undefined ? { accept } : {}),
+            ...(range !== undefined ? { range } : {}),
+          },
+          forwardSignal,
+        )
+        // Down from here the query half's response discipline verbatim: the
+        // relay refusal marker, the three cooperative headers, the pump
+        // with real backpressure — plus (PB-22) the rewriteIds branch.
+        const refusal = response.headers.get('x-zen-remote-error')
+        if (refusal !== null) {
+          await response.body?.cancel().catch(() => {})
+          answerUnbridged(res, plugin, refusal)
+          return
+        }
+        if (declared.rewriteIds) {
+          await answerRewriteIds(res, response, idMapping, declared.rewriteFields, locatedServerId, knownRealIdsOfServer(locatedServerId), onMintedVirtualIds)
+          return
+        }
+        const contentType = response.headers.get('content-type')
+        const responseLength = response.headers.get('content-length')
+        const cacheControl = response.headers.get('cache-control')
+        res.writeHead(response.status, {
+          ...(contentType !== null ? { 'content-type': contentType } : {}),
+          ...(responseLength !== null ? { 'content-length': responseLength } : {}),
+          ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+        })
+        const reader = response.body?.getReader()
+        if (reader !== undefined) await pumpResponse(res, reader)
+        res.end()
+      } catch (error) {
+        // The gate's local flag first (the query half's shape): the 413
+        // still fits while the browser's headers are not out.
+        if (bodyGateFailed && !res.headersSent) {
+          res.setHeader('content-type', 'application/json; charset=utf-8')
+          res.writeHead(413)
+          res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+          recordRefusal(plugin, 'body-too-large')
+          return
+        }
+        if (controller?.signal.aborted || res.destroyed || res.headersSent) {
+          try {
+            res.destroy()
+          } catch {
+            // Already gone.
+          }
+          return
+        }
+        const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : 'offline'
+        answerUnbridged(res, plugin, code === 'aborted' ? 'offline' : code)
+      } finally {
+        res.off('close', onClientGone)
+      }
+    }
+
+  // ---- PB-11: the adapter interception ---------------------------------------
+  //
+  // An adapter (src/adapters/, validated into a NormalizedAdapter by the
+  // wiring) claims routes of a NON-cooperative plugin: the match lookup
+  // below hands one of those requests to a surrogate that locates the
+  // session ids (query / path segment / JSON body), classifies the request
+  // — every id virtual → forward, none → local passthrough, a mix → the
+  // uniform 503 (docs/adr/0001: a remote session never reaches a local
+  // plugin) — rewrites the ids to their real halves and forwards through
+  // the SAME relay door the cooperative surrogate uses. On the way back a
+  // `client.response` hook maps real ids to virtual form inside a buffered
+  // JSON answer (8 MB cap; past it the answer passes through untouched).
+
+  /** The adapter route this pathname hits, if any: only an adapter that
+   * STILL owns its plugin's registry entry qualifies — a plugin's own
+   * cooperative declaration always wins, and the adapter yields silently
+   * here (the registration-time yield logged a line already). */
+  const adapterRouteOf = (pathname: string): { adapter: NormalizedAdapter; route: NormalizedAdapterRoute } | undefined => {
+    if (!installed || adapters.length === 0) return undefined
+    for (const adapter of adapters) {
+      if (!adapterOwnsRegistryEntry(adapter, registry.get(adapter.plugin))) continue
+      for (const route of adapter.routes) {
+        if (route.local) continue
+        if (adapterPathMatches(route, pathname)) return { adapter, route }
+      }
+    }
+    return undefined
+  }
+
+  /** The adapter surrogate: locate → classify → walls → rewrite → hooks →
+   * the relay round-trip, then the buffered JSON rewrite on the way back. */
+  const adapterSurrogateHandler = (hit: { adapter: NormalizedAdapter; route: NormalizedAdapterRoute }, originalHandler: ((req: IncomingMessage, res: ServerResponse) => Promise<void>) | undefined) =>
+    async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+      const { adapter, route } = hit
+      const plugin = adapter.plugin
+      // The local passthrough. A body-locating route has ALREADY consumed
+      // the request body by the time this runs, so the replay hands the
+      // buffered bytes back behind the original request's metadata — the
+      // shape a local handler actually reads (method/url/headers/pipe).
+      const passthrough = async (replayBody?: Buffer): Promise<void> => {
+        if (originalHandler === undefined) {
+          res.writeHead(404)
+          res.end()
+          return
+        }
+        if (replayBody !== undefined) {
+          const replay = new PassThrough()
+          replay.end(replayBody)
+          Object.assign(replay, { method: req.method, url: req.url, headers: req.headers })
+          await originalHandler(replay as unknown as IncomingMessage, res)
+          return
+        }
+        await originalHandler(req, res)
+      }
+      // Chained-over: inert passthrough, exactly the posture of the other
+      // intercepts.
+      if (!installed || isLoopbackBypass(req)) {
+        await passthrough()
+        return
+      }
+      let controller: AbortController | undefined
+      const onClientGone = (): void => {
+        if (controller !== undefined && !res.writableEnded) controller.abort()
+      }
+      res.on('close', onClientGone)
+      try {
+        let url: URL
+        try {
+          url = new URL(req.url ?? '/', 'http://local')
+        } catch {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        const pathname = url.pathname
+        const searchParams = url.searchParams
+        const method = req.method ?? 'GET'
+        const hasBody = method !== 'GET' && method !== 'HEAD'
+
+        // The route's deny hook runs BEFORE any id locating: a request the
+        // adapter refuses on path grounds (better-sidebar's open.external
+        // from a remote panel, the side-chat methods) answers here — these
+        // requests often carry NO session field, so the classify below
+        // would otherwise read them as local and let them through.
+        if (route.deny !== undefined) {
+          const denial = route.deny({ pathname, method, currentSessionId: getCurrentSession?.() })
+          if (denial !== undefined) {
+            answerUnbridged(res, plugin, denial)
+            return
+          }
+        }
+
+        // A body-locating route buffers the request body up front (bounded
+        // by the route's own maxBody — the cooperative 413 shape, answered
+        // locally, the plugin never reached). Any other locator's body
+        // streams through the cooperative counting gate below.
+        let bufferedBody: Buffer | undefined
+        if (hasBody && route.locator.in === 'json-body') {
+          const chunks: Buffer[] = []
+          let size = 0
+          let over = false
+          for await (const chunk of req) {
+            size += (chunk as Buffer).length
+            if (size > route.maxBody) {
+              over = true
+              break
+            }
+            chunks.push(Buffer.from(chunk as Uint8Array))
+          }
+          if (over) {
+            res.setHeader('content-type', 'application/json; charset=utf-8')
+            res.writeHead(413)
+            res.end(JSON.stringify({ ok: false, error: { code: 'zr-plugin-body-too-large' } }))
+            recordRefusal(plugin, 'body-too-large')
+            return
+          }
+          bufferedBody = Buffer.concat(chunks)
+        }
+        // A present body must be a JSON object when the route locates in
+        // the body: a remote request with a corrupted body refuses rather
+        // than falling through to the local plugin.
+        let parsedBody: unknown
+        let bodyGiven = false
+        if (hasBody && route.locator.in === 'json-body' && bufferedBody !== undefined && bufferedBody.length > 0) {
+          try {
+            parsedBody = JSON.parse(bufferedBody.toString('utf8'))
+            bodyGiven = true
+          } catch {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+        }
+
+        // The remote/local verdict on the ids as they arrived. A duplicated
+        // query id refuses rather than silently collapsing (PB-12 review).
+        let verdict: AdapterRemoteVerdict
+        try {
+          verdict = classifyAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined)
+        } catch (error) {
+          if (error instanceof AdapterMultiValueQueryError) {
+            answerUnbridged(res, plugin, 'bad-query')
+            return
+          }
+          throw error
+        }
+        if (verdict.kind === 'local') {
+          await passthrough(bufferedBody)
+          return
+        }
+        if (verdict.kind === 'mixed') {
+          answerUnbridged(res, plugin, 'bad-query')
+          return
+        }
+        // Remote: the route's method wall, then per-id server walls.
+        if (!route.methods.includes(method)) {
+          answerUnbridged(res, plugin, 'method-not-bridged')
+          return
+        }
+        // MS-4: one home server for every located id.
+        const home = serverOfHits(verdict.hits)
+        if (home === 'bad-query' || home === 'server-changed') {
+          answerUnbridged(res, plugin, home)
+          return
+        }
+        const serverId = home.serverId
+        // The bridge verdicts (version skew, consent, offline…) judged from
+        // the SAME live table the cooperative surrogate reads — the
+        // adapter's registry entry makes the plugin indistinguishable from
+        // a cooperative one here.
+        const status = statusesOfServer(serverId).find((entry) => entry.plugin === plugin)
+        if (status === undefined || !status.bridged) {
+          answerUnbridged(res, plugin, status?.reason ?? 'not-on-server')
+          return
+        }
+
+        // Real ids in, coordinates rewritten.
+        const rewrite = rewriteAdapterRequest(route, pathname, searchParams, bodyGiven ? parsedBody : undefined, verdict.hits, (virtualId) => fromVirtual(virtualId)!.id)
+        // The client hook: refuse, or replace the parsed body wholesale.
+        // The hook sees the REWRITTEN body — the ids are already real (the
+        // design's order: locate → rewrite → hook → forward).
+        const hook = adapter.hooks.client?.request
+        if (hook !== undefined) {
+          const hookedBody = bodyGiven && rewrite.bodyText !== undefined ? JSON.parse(rewrite.bodyText) : bodyGiven ? parsedBody : undefined
+          let hookVerdict: AdapterVerdict
+          try {
+            hookVerdict = hook({ method, pathname, route, query: rewrite.query, body: hookedBody })
+          } catch {
+            answerUnbridged(res, plugin, 'internal')
+            return
+          }
+          if (!hookVerdict.allow) {
+            answerUnbridged(res, plugin, hookVerdict.reason)
+            return
+          }
+          if (hookedBody !== undefined && hookVerdict.body !== undefined) {
+            rewrite.bodyText = JSON.stringify(hookVerdict.body)
+          }
+        }
+
+        controller = new AbortController()
+        adapterForwarded += 1
+        // The forward. A body-locating route sends its (possibly rewritten)
+        // buffer; any other body rides the cooperative counting gate.
+        const accept = typeof req.headers.accept === 'string' ? req.headers.accept : undefined
+        const range = typeof req.headers.range === 'string' ? req.headers.range : undefined
+        const requestContentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : undefined
+        let bodyStream: ReadableStream<Uint8Array> | null = null
+        let contentLength: number | undefined
+        if (hasBody && route.locator.in === 'json-body') {
+          const payload = rewrite.bodyText !== undefined ? Buffer.from(rewrite.bodyText, 'utf8') : bufferedBody ?? Buffer.alloc(0)
+          contentLength = payload.length
+          bodyStream = Readable.toWeb(Readable.from(payload)) as ReadableStream<Uint8Array>
+        } else if (hasBody) {
+          let pumped = 0
+          const gate = new Transform({
+            transform(chunk: Buffer, _encoding, callback) {
+              pumped += chunk.length
+              if (pumped > route.maxBody) {
+                callback(new Error('zr-plugin-body-too-large'))
+                return
+              }
+              callback(null, chunk)
+            },
+          })
+          gate.on('error', () => controller?.abort())
+          bodyStream = Readable.toWeb(gate) as ReadableStream<Uint8Array>
+          req.pipe(gate)
+        }
+        const response = await home.relay.pluginRequest(
+          {
+            plugin,
+            version: adapter.declaration.version,
+            digest: adapter.digest,
+            path: rewrite.pathname,
+            query: rewrite.query.toString(),
+            method,
+            ...(bodyStream !== null ? { body: bodyStream } : {}),
+            ...(bodyStream !== null && requestContentType !== undefined ? { contentType: requestContentType } : {}),
+            ...(bodyStream !== null && contentLength !== undefined ? { contentLength } : {}),
+            ...(accept !== undefined ? { accept } : {}),
+            ...(range !== undefined ? { range } : {}),
+          },
+          controller.signal,
+        )
+        const refusal = response.headers.get('x-zen-remote-error')
+        if (refusal !== null) {
+          await response.body?.cancel().catch(() => {})
+          answerUnbridged(res, plugin, refusal)
+          return
+        }
+        const contentType = response.headers.get('content-type')
+        const responseLength = response.headers.get('content-length')
+        const cacheControl = response.headers.get('cache-control')
+        // The adapter header allowlist (PB-12): beyond the three cooperative
+        // headers, the answers adapters carry may need their own — the HTML
+        // preview's CSP sandbox, download dispositions, range headers. The
+        // plugin wrote them; the browser needs them.
+        const allowlistedHeaders = ADAPTER_RESPONSE_HEADER_ALLOWLIST.flatMap((name) => {
+          const value = response.headers.get(name)
+          return value !== null ? [{ [name]: value }] : []
+        })
+        const responseHook = adapter.hooks.client?.response
+        const rewriteCandidate = responseHook !== undefined && !route.stream && contentType !== null && contentType.includes('application/json')
+        if (!rewriteCandidate) {
+          // The verbatim pump: chunk-for-chunk with real backpressure, the
+          // cooperative surrogate's discipline.
+          res.writeHead(response.status, {
+            ...(contentType !== null ? { 'content-type': contentType } : {}),
+            ...(responseLength !== null ? { 'content-length': responseLength } : {}),
+            ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+            ...Object.assign({}, ...allowlistedHeaders),
+          })
+          const reader = response.body?.getReader()
+          if (reader !== undefined) await pumpResponse(res, reader)
+          res.end()
+          return
+        }
+        // The buffered rewrite: the whole answer (≤ 8 MB), parsed, hooked,
+        // re-serialized with a corrected content-length. Past the cap — or
+        // on a parse/hook failure — the answer passes through untouched.
+        const reader = response.body!.getReader()
+        const chunks: Buffer[] = []
+        let size = 0
+        let overflow = false
+        while (true) {
+          const { done, value } = await reader.read()
+          if (done) break
+          size += value.length
+          // The over-cap chunk ITSELF is body content — it lands in the
+          // passthrough buffer too; only the REWRITE is cancelled.
+          chunks.push(Buffer.from(value))
+          if (size > MAX_ADAPTER_RESPONSE_BUFFER_BYTES) {
+            overflow = true
+            break
+          }
+        }
+        if (overflow) {
+          adapterResponsePassthroughs += 1
+          res.writeHead(response.status, {
+            ...(contentType !== null ? { 'content-type': contentType } : {}),
+            ...(responseLength !== null ? { 'content-length': responseLength } : {}),
+            ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+            ...Object.assign({}, ...allowlistedHeaders),
+          })
+          for (const chunk of chunks) {
+            if (!res.write(chunk)) {
+              await new Promise<void>((resolve) => {
+                const settled = (): void => {
+                  res.off('drain', settled)
+                  res.off('close', settled)
+                  resolve()
+                }
+                res.once('drain', settled)
+                res.once('close', settled)
+              })
+            }
+          }
+          await pumpResponse(res, reader)
+          res.end()
+          return
+        }
+        const text = Buffer.concat(chunks).toString('utf8')
+        let rewrittenBody: unknown
+        // PB-26a: every id the hook virtualizes is a row the browser is
+        // about to learn of (sidechat.start's childId) — collected here,
+        // reported only once the hook's answer is what the browser gets.
+        const minted = new Set<string>()
+        try {
+          rewrittenBody = responseHook({
+            status: response.status,
+            pathname,
+            body: JSON.parse(text),
+            virtualize: (id: string) => {
+              const virtualId = toVirtual(serverId, id)
+              if (isVirtual(virtualId)) minted.add(virtualId)
+              return virtualId
+            },
+            isVirtual: (value: unknown) => isVirtual(value),
+          })
+        } catch {
+          adapterResponsePassthroughs += 1
+          const passthroughBody = Buffer.from(text, 'utf8')
+          res.writeHead(response.status, {
+            ...(contentType !== null ? { 'content-type': contentType } : {}),
+            ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+            ...Object.assign({}, ...allowlistedHeaders),
+            'content-length': String(passthroughBody.length),
+          })
+          res.end(passthroughBody)
+          return
+        }
+        adapterResponseRewrites += 1
+        const outBody = Buffer.from(JSON.stringify(rewrittenBody), 'utf8')
+        res.writeHead(response.status, {
+          ...(contentType !== null ? { 'content-type': contentType } : {}),
+          ...(cacheControl !== null ? { 'cache-control': cacheControl } : {}),
+          ...Object.assign({}, ...allowlistedHeaders),
+          'content-length': String(outBody.length),
+        })
+        res.end(outBody)
+        if (minted.size > 0 && onMintedVirtualIds !== undefined) {
+          try {
+            onMintedVirtualIds([...minted])
+          } catch {
+            // Sidebar bookkeeping — never a reason to fail an answer the
+            // browser already has.
+          }
+        }
+      } catch (error) {
+        if (controller?.signal.aborted || res.destroyed || res.headersSent) {
+          try {
+            res.destroy()
+          } catch {
+            // Already gone.
+          }
+          return
+        }
+        const code = typeof (error as { code?: unknown } | null)?.code === 'string' ? (error as { code: string }).code : 'offline'
+        answerUnbridged(res, plugin, code === 'aborted' ? 'offline' : code)
+      } finally {
+        res.off('close', onClientGone)
+      }
+    }
+
+  /** The wrapped match: original verdict first, then the adapter routes
+   * (PB-11 — BEFORE the declaration lookup: the adapter's registry entry
+   * IS a declaration, and the cooperative surrogate's query-sessionParam
+   * logic is not how an adapter request is judged), then the declaration
+   * lookup — exact paths plus (PB-21) a declared prefix route's full
+   * match. An undeclared pathname returns whatever the original match
+   * answered, untouched. */
+  const wrappedMatch = function match(this: unknown, pathname: string): unknown {
+    const route = savedMatch.call(this, pathname)
+    if (!installed) return route
+    if (typeof pathname !== 'string' || !pathname.startsWith('/')) return route
+    const adapterHit = adapterRouteOf(pathname)
+    if (adapterHit !== undefined) {
+      return {
+        kind: 'exact',
+        path: pathname,
+        handler: adapterSurrogateHandler(adapterHit, handlerOf(route)),
+      }
+    }
+    const declared = declaredRouteOf(pathname)
+    if (declared !== undefined) {
+      return {
+        kind: 'exact',
+        path: pathname,
+        handler: surrogateHandler(declared, handlerOf(route)),
+      }
+    }
+    return route
+  }
+
+  // ---- PB-10: the WebSocket upgrade interception -----------------------------
+  //
+  // The host's upgrade handler reads `this.upgrades.get(pathname)` (RT
+  // dsh-host-webserver — the probe verified the shape on real instances).
+  // Shadowing that ONE method on the raw instance intercepts every upgrade
+  // lookup, including upgrades registered after us. Declared `upgrade`
+  // routes with a virtual session id become a byte tunnel to the server:
+  // the browser's WebSocket speaks to THIS process, the bytes travel the
+  // tunnel, and the REAL handshake (101, frames, close) is produced by the
+  // plugin route on the server machine — neither end parses WebSocket
+  // frames (docs/adr/0002).
+
+  const targetWithUpgrades = webServer as { upgrades: Map<string, unknown> }
+  const savedUpgradesGet = targetWithUpgrades.upgrades.get
+  /** One declared upgrade-route hit, as the surrogate consumes it. The
+   * PB-26b fields: the EFFECTIVE locator (a json-body upgrade's ids ride
+   * the post-handshake frames, never the query), the rewriteIds flags the
+   * downstream frames honor, the route's adapter-core view (the classify/
+   * rewrite runs on it), and the OWNING adapter when the route is an
+   * adapter's — its `client.response` hook rewrites the downstream frames
+   * (`undefined` for a cooperative declaration, and for an adapter that
+   * yielded its registry entry). */
+  interface DeclaredUpgrade {
+    plugin: string
+    version: string
+    digest: string
+    path: string
+    sessionParam: string
+    deny: boolean
+    locator: BridgeLocator
+    rewriteIds: boolean
+    rewriteFields: readonly string[] | undefined
+    view: NormalizedAdapterRoute
+    adapter: NormalizedAdapter | undefined
+  }
+  const upgradeRoutesOf = (pathname: string): DeclaredUpgrade | undefined => {
+    if (!installed) return undefined
+    for (const declaration of registry.list()) {
+      for (const route of declaration.routes) {
+        if (route.path === pathname && routeUpgradesOf(route)) {
+          return {
+            plugin: declaration.plugin,
+            version: declaration.version,
+            digest: declaration.digest,
+            path: route.path,
+            sessionParam: route.sessionParam,
+            deny: routeDeniesRemoteOf(route),
+            locator: routeLocatorOf(route),
+            rewriteIds: routeRewritesIdsOf(route),
+            rewriteFields: routeRewriteFieldsOf(route),
+            view: bridgeRouteAsAdapterRoute(route),
+            adapter: adapterRouteOf(pathname)?.adapter,
+          }
+        }
+      }
+    }
+    return undefined
+  }
+
+  /** PB-26b: the json-body upgrade surrogate — the frame-level twin of the
+   * HTTP surrogates. The exchange: the browser gets the 101 IMMEDIATELY (its
+   * `onopen` fires and the first frame — better-sidebar's sidechat watch —
+   * is on the wire), then every incoming text frame is located against the
+   * route's locator and classified. LOCAL ids pipe the exchange into the
+   * plugin's own upgrade handler over an in-memory socket (the handler's
+   * 101 head is stripped — the browser already has one). VIRTUAL ids open a
+   * PB-10 byte tunnel whose upstream is RE-FRAMED masked (each text frame's
+   * ids rewritten real, per-frame — the server's send gate re-checks them
+   * against the share wall) and whose downstream frames are rewritten
+   * virtual (the adapter's response hook, or the cooperative rewriteIds
+   * scan) before the browser sees them. A mixed or foreign-server frame
+   * kills the exchange — docs/adr/0001 holds frame by frame. */
+  const jsonBodyUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown, req: IncomingMessage, socket: Socket, head: Buffer): Promise<void> =>
+    (async () => {
+      const plugin = declared.plugin
+      const socketGone = (): boolean => socket.destroyed || !socket.writable
+      const destroySocket = (): void => {
+        try {
+          socket.destroy()
+        } catch {
+          // Already gone.
+        }
+      }
+      // The post-101 refusal channel: the handshake is OUT, so no HTTP
+      // status fits anymore — the refusal is recorded and the socket dies.
+      const refuseAndDie = (reason: string): void => {
+        recordRefusal(plugin, reason)
+        logRefusal('upgrade', plugin, reason)
+        destroySocket()
+      }
+      // The deny wall (the HTTP halves' current-session rule, pre-101 — the
+      // answerUnbridgedSocket answer still fits here): a remote panel never
+      // opens this route at all.
+      if (declared.deny) {
+        const current = getCurrentSession?.()
+        if (current !== undefined && isVirtual(current)) {
+          answerUnbridgedSocket(socket, plugin, 'route-denied')
+          return
+        }
+      }
+      // The two headers the handshake cannot exist without — we answer it
+      // OURSELVES this time, so a missing one refuses before anything is
+      // written.
+      const wsKey = typeof req.headers['sec-websocket-key'] === 'string' ? req.headers['sec-websocket-key'] : undefined
+      const wsVersion = typeof req.headers['sec-websocket-version'] === 'string' ? req.headers['sec-websocket-version'] : undefined
+      if (wsKey === undefined || wsVersion === undefined) {
+        answerUnbridgedSocket(socket, plugin, 'bad-query')
+        return
+      }
+      // The 101 goes out NOW: the browser's onopen fires and its first frame
+      // is what decides the route below. Extensions are offered to nobody —
+      // not echoed here, not offered upstream (the tunnel opens with the
+      // key and version alone) — so every frame stays plain text and the
+      // rewrites below can never land on compressed bytes.
+      try {
+        socket.write(
+          `HTTP/1.1 101 Switching Protocols\r\n` +
+            `Upgrade: websocket\r\n` +
+            `Connection: Upgrade\r\n` +
+            `Sec-WebSocket-Accept: ${createHash('sha1').update(wsKey + WS_GUID).digest('base64')}\r\n` +
+            `\r\n`,
+        )
+      } catch {
+        return
+      }
+
+      // ---- the local pipe: an in-memory socket behind the real handler ----
+      let localSocket: Duplex | undefined
+      const startLocal = (): void => {
+        if (typeof originalHandler !== 'function') {
+          // No local handler to serve the local verdict through — the
+          // exchange is dead either way.
+          destroySocket()
+          return
+        }
+        // The handler's writes arrive through the Duplex's writable side;
+        // its reads come from OUR writes. The 101 head the handler produces
+        // is stripped (the browser already has one) — every byte after the
+        // header end is a WebSocket frame and crosses verbatim.
+        const pipe = new Duplex({
+          write(chunk: Buffer, _encoding, callback) {
+            forwardFromLocal(chunk)
+            callback()
+          },
+          read() {},
+        })
+        // net.Socket methods the handler may call that a Duplex lacks.
+        const socketShaped = pipe as unknown as { setTimeout(): unknown; setNoDelay(): unknown }
+        socketShaped.setTimeout = () => {}
+        socketShaped.setNoDelay = () => {}
+        let headerSeen = false
+        let headerBuffer = Buffer.alloc(0)
+        const forwardFromLocal = (chunk: Buffer): void => {
+          if (socketGone()) return
+          if (headerSeen) {
+            socket.write(chunk)
+            return
+          }
+          headerBuffer = Buffer.concat([headerBuffer, chunk])
+          const end = headerBuffer.indexOf(HEADER_END)
+          if (end === -1) return
+          headerSeen = true
+          const rest = headerBuffer.subarray(end + HEADER_END.length)
+          headerBuffer = Buffer.alloc(0)
+          if (rest.length > 0) socket.write(rest)
+        }
+        pipe.on('close', () => destroySocket())
+        socket.on('close', () => {
+          try {
+            pipe.destroy()
+          } catch {
+            // Already gone.
+          }
+        })
+        localSocket = pipe
+        // The handler owns the exchange from here — its async body runs on
+        // its own, exactly as the host would run it.
+        const handler = originalHandler as (request: IncomingMessage, sock: Socket, earlyHead: Buffer) => unknown
+        void Promise.resolve(handler(req, pipe as unknown as Socket, Buffer.alloc(0))).catch(() => destroySocket())
+      }
+
+      // ---- the remote pipe: the PB-10 tunnel, frame by frame -------------
+      let tunnelHandle: { tunnel: string; frames: AsyncIterable<Uint8Array> } | undefined
+      // MS-4: the server the tunnel was opened on — set together with
+      // tunnelHandle, the relay every later send and the close travel.
+      let tunnelServer: { serverId: string; relay: RelayClient } | undefined
+      // The connection-wide real→virtual mapping the rewriteIds deep scan
+      // consults: EVERY validated remote frame's ids merge in (a watch list
+      // that grows mid-connection makes the later answers rewritable too —
+      // the deep scan only knows the ids this exchange has carried).
+      const idMapping = new Map<string, string>()
+      let upstreamSeq = 0
+      let upstreamBroken = false
+      let teardownTunnel: () => void = () => {}
+      const killExchange = (): void => {
+        teardownTunnel()
+        destroySocket()
+      }
+      /** ONE text frame onto the OPEN tunnel: the ids named by `hits`
+       * rewritten real (an empty list — the unsubscribe-all — crosses
+       * verbatim), re-framed MASKED (client style — the server's send gate
+       * parses and re-checks them), sent in the chain's order. A transport
+       * failure tears the whole exchange down (counter, close, socket) —
+       * never a silent broken flag: that would leak `tunnelsCurrent` and
+       * leave the browser hanging on a dead tunnel. */
+      const sendTextUpstream = async (frame: Rfc6455Frame, parsedJson: unknown, hits: AdapterIdHit[]): Promise<void> => {
+        if (upstreamBroken || tunnelHandle === undefined || tunnelServer === undefined) return
+        const rewrite = hits.length > 0
+          ? rewriteAdapterRequest(declared.view, declared.path, new URLSearchParams(), parsedJson, hits, (virtualId) => fromVirtual(virtualId)!.id)
+          : undefined
+        const payload = rewrite?.bodyText !== undefined ? Buffer.from(rewrite.bodyText, 'utf8') : frame.payload
+        const seq = upstreamSeq
+        upstreamSeq += 1
+        try {
+          await tunnelServer.relay.pluginTunnelSend(tunnelHandle.tunnel, seq, encodeRfc6455Frame(0x1, payload, true, frame.fin))
+        } catch {
+          killExchange()
+        }
+      }
+      /** The downstream river: the tunnel's byte frames → rewritten text
+       * frames on the browser socket. The plugin's 101 head is stripped
+       * FIRST (the browser already has ours); each text frame is rewritten
+       * (adapter hook, else the cooperative rewriteIds scan) and re-framed
+       * UNMASKED (server style); every other frame crosses verbatim. */
+      const startDownstream = (opened: { tunnel: string; frames: AsyncIterable<Uint8Array> }, serverId: string): void => {
+        void (async () => {
+          let downstream = Buffer.alloc(0)
+          let headerSeen = false
+          try {
+            for await (const chunk of opened.frames) {
+              if (socketGone()) break
+              downstream = Buffer.concat([downstream, chunk])
+              if (!headerSeen) {
+                const end = downstream.indexOf(HEADER_END)
+                if (end === -1) continue
+                headerSeen = true
+                downstream = downstream.subarray(end + HEADER_END.length)
+              }
+              const parsed = parseRfc6455Frames(downstream)
+              downstream = downstream.subarray(parsed.consumed)
+              if (parsed.violated) break
+              for (const frame of parsed.frames) {
+                if (frame.opcode !== 0x1) {
+                  socket.write(frame.raw)
+                  continue
+                }
+                let outPayload = frame.payload
+                try {
+                  const parsedJson = JSON.parse(frame.payload.toString('utf8'))
+                  const responseHook = declared.adapter?.hooks.client?.response
+                  let hooked = false
+                  if (responseHook !== undefined) {
+                    outPayload = Buffer.from(JSON.stringify(responseHook({
+                      status: 200,
+                      pathname: declared.path,
+                      body: parsedJson,
+                      virtualize: (id: string) => toVirtual(serverId, id),
+                      isVirtual: (value: unknown) => isVirtual(value),
+                    })), 'utf8')
+                    hooked = true
+                  } else if (declared.rewriteIds) {
+                    const scanned = deepRewriteIds(parsedJson, idMapping, knownRealIdsOfServer(serverId), serverId)
+                    if (declared.rewriteFields !== undefined) rewriteIdsAtFields(scanned, declared.rewriteFields, serverId)
+                    outPayload = Buffer.from(JSON.stringify(scanned), 'utf8')
+                    hooked = true
+                  }
+                  // Neither hook applies: the frame crosses verbatim.
+                  if (!hooked) outPayload = frame.payload
+                } catch {
+                  // A frame that will not parse (or a hook that threw)
+                  // crosses untouched — a rewrite is better-than-nothing,
+                  // never a reason to mangle a push.
+                }
+                if (socketGone()) break
+                // The re-frame carries the ORIGINAL frame's fin bit — a
+                // fragmented push stays fragmented, a whole frame stays
+                // whole.
+                if (!socket.write(encodeRfc6455Frame(0x1, outPayload, false, frame.fin))) {
+                  await new Promise<void>((resolve) => {
+                    const settled = (): void => {
+                      socket.off('drain', settled)
+                      socket.off('close', settled)
+                      resolve()
+                    }
+                    socket.once('drain', settled)
+                    socket.once('close', settled)
+                  })
+                  if (socketGone()) break
+                }
+              }
+            }
+          } catch {
+            // The tunnel transport died — the browser socket follows below.
+          }
+          if (!socketGone()) destroySocket()
+        })()
+      }
+      /** ONE text frame through the walls. The FIRST one decides the
+       * exchange's path (local pipe or remote tunnel) and the connection
+       * never switches: a frame that would take the OTHER path is a
+       * cross-frame mix and kills the exchange (docs/adr/0001, frame by
+       * frame). The one exception is the id-LESS frame on a tunnel-bound
+       * connection — better-sidebar's `{"op":"watch","threadIds":[]}`
+       * unsubscribe-all carries no id and no local meaning, so it keeps
+       * riding the tunnel verbatim. */
+      const handleTextFrame = async (frame: Rfc6455Frame): Promise<void> => {
+        let parsedJson: unknown
+        try {
+          parsedJson = JSON.parse(frame.payload.toString('utf8'))
+        } catch {
+          refuseAndDie('bad-query')
+          return
+        }
+        let verdict: AdapterRemoteVerdict
+        try {
+          verdict = classifyAdapterRequest(declared.view, declared.path, new URLSearchParams(), parsedJson)
+        } catch {
+          refuseAndDie('bad-query')
+          return
+        }
+        if (verdict.kind === 'mixed') {
+          refuseAndDie('bad-query')
+          return
+        }
+        const rawHits = locateAdapterIds(declared.view, declared.path, new URLSearchParams(), parsedJson)
+        if (verdict.kind === 'local') {
+          if (tunnelHandle !== undefined) {
+            // Bound to the remote tunnel: the id-less frame stays on it, a
+            // REAL local id is a cross-frame mix — never a pivot to the
+            // local plugin.
+            if (rawHits.length === 0) {
+              await sendTextUpstream(frame, parsedJson, [])
+              return
+            }
+            refuseAndDie('bad-query')
+            killExchange()
+            return
+          }
+          if (localSocket === undefined) {
+            startLocal()
+            if (localSocket === undefined) return
+          }
+          // The browser's frame enters the handler's READ side (push) — the
+          // Duplex's write side is the handler's own answer channel.
+          localSocket.push(frame.raw)
+          return
+        }
+        // Remote. The FIRST remote frame opens the tunnel; every hit must
+        // belong to THIS handshake's server. A connection already bound to
+        // the local pipe never pivots to the tunnel.
+        if (localSocket !== undefined) {
+          refuseAndDie('bad-query')
+          try {
+            localSocket.destroy()
+          } catch {
+            // Already gone.
+          }
+          return
+        }
+        // MS-4: the frame's ids name one served server, and once the tunnel
+        // is open every later frame must name the tunnel's own server.
+        const home = serverOfHits(verdict.hits)
+        if (home === 'bad-query' || home === 'server-changed' || (tunnelServer !== undefined && home.serverId !== tunnelServer.serverId)) {
+          refuseAndDie('server-changed')
+          return
+        }
+        const serverId = home.serverId
+        // This frame's ids join the connection-wide mapping (see idMapping).
+        for (const idHit of verdict.hits) idMapping.set(fromVirtual(idHit.value)!.id, idHit.value)
+        if (tunnelHandle === undefined) {
+          const status = statusesOfServer(serverId).find((entry) => entry.plugin === plugin)
+          if (status === undefined || !status.bridged) {
+            refuseAndDie(status?.reason ?? 'not-on-server')
+            return
+          }
+          const controller = new AbortController()
+          socket.on('close', () => controller.abort())
+          let opened: { tunnel: string; frames: AsyncIterable<Uint8Array> }
+          try {
+            log?.('opening tunnel for %s', declared.path)
+            opened = await home.relay.pluginTunnelOpen(
+              {
+                plugin,
+                version: declared.version,
+                digest: declared.digest,
+                path: declared.path,
+                query: '',
+                wsHeaders: { 'sec-websocket-key': wsKey, 'sec-websocket-version': wsVersion },
+              },
+              controller.signal,
+            )
+          } catch (error) {
+            const rawCode = (error as { code?: unknown } | null)?.code
+            refuseAndDie(typeof rawCode === 'string' && rawCode !== '' ? rawCode : 'offline')
+            return
+          }
+          tunnelsCurrent += 1
+          tunnelsOpened += 1
+          tunnelServer = home
+          tunnelHandle = opened
+          log?.('tunnel open for %s: %s', declared.path, opened.tunnel)
+          teardownTunnel = (): void => {
+            if (upstreamBroken) return
+            upstreamBroken = true
+            tunnelsCurrent -= 1
+            tunnelsClosed += 1
+            void home.relay.pluginTunnelClose(opened.tunnel).catch(() => {})
+          }
+          socket.on('close', teardownTunnel)
+          socket.on('error', teardownTunnel)
+          startDownstream(opened, serverId)
+        }
+        await sendTextUpstream(frame, parsedJson, verdict.hits)
+      }
+      const handleFrame = async (frame: Rfc6455Frame): Promise<void> => {
+        // Control frames (close/ping/pong) carry no session ids and cross
+        // VERBATIM on whichever path exists — the close handshake completes
+        // the honest way (the plugin's reply close rides back downstream,
+        // the socket-close handlers tear the tunnel down in turn). With no
+        // path yet, a close just closes.
+        if (frame.opcode !== 0x1 && frame.opcode !== 0x2) {
+          if (localSocket !== undefined) {
+            localSocket.push(frame.raw)
+            return
+          }
+          if (tunnelHandle !== undefined && tunnelServer !== undefined && !upstreamBroken) {
+            const seq = upstreamSeq
+            upstreamSeq += 1
+            try {
+              await tunnelServer.relay.pluginTunnelSend(tunnelHandle.tunnel, seq, frame.raw)
+            } catch {
+              // The send died: tear the exchange down COMPLETELY — the
+              // counter, the close, the browser socket (a bare broken flag
+              // would leak `tunnelsCurrent` and hang the browser).
+              killExchange()
+            }
+            return
+          }
+          if (frame.opcode === 0x8) killExchange()
+          return
+        }
+        await handleTextFrame(frame)
+      }
+      // ---- frame intake: the early head bytes, then every socket byte ----
+      // Complete frames dispatch through ONE serialized chain (the arrival
+      // order is the wire order the plugin and the browser both assume); a
+      // declared-oversize frame is a broken sender — refused, never awaited.
+      let intake = Buffer.from(head)
+      let chain: Promise<void> = Promise.resolve()
+      socket.on('data', (chunk: Buffer) => {
+        if (socketGone()) return
+        intake = Buffer.concat([intake, chunk])
+        const parsedFrames = parseRfc6455Frames(intake)
+        intake = intake.subarray(parsedFrames.consumed)
+        if (parsedFrames.violated) {
+          refuseAndDie('bad-query')
+          return
+        }
+        for (const frame of parsedFrames.frames) {
+          chain = chain
+            .then(() => handleFrame(frame))
+            .catch(() => destroySocket())
+        }
+      })
+    })().catch(() => {
+      try {
+        socket.destroy()
+      } catch {
+        // Already gone.
+      }
+    })
+
+  /** The tunnel's surrogate upgrade handler. Every outcome — refusal,
+   * teardown, the byte pumping — owns the socket's whole remaining life. */
+  const surrogateUpgrade = (declared: DeclaredUpgrade, originalHandler: unknown) =>
+    (req: IncomingMessage, socket: Socket, head: Buffer): void => {
+      // The host never awaits an upgrade handler — the async body runs on
+      // its own and every failure path owns the socket's teardown.
+      void (async () => {
+        if (!installed || isLoopbackBypass(req)) {
+          if (typeof originalHandler === 'function') originalHandler(req, socket, head)
+          else {
+            try { socket.destroy() } catch { /* Already gone. */ }
+          }
+          return
+        }
+        log?.('upgrade entered for %s', declared.path)
+        // PB-26b: a json-body upgrade's ids ride the POST-HANDSHAKE frames —
+        // there is no session query parameter for the byte-tunnel half below
+        // to read, so the frame-level half owns the whole exchange.
+        if (declared.locator.in !== 'query') {
+          await jsonBodyUpgrade(declared, originalHandler, req, socket, head)
+          return
+        }
+      const socketGone = (): boolean => socket.destroyed || !socket.writable
+      const passthrough = (): void => {
+        if (typeof originalHandler === 'function') {
+          originalHandler(req, socket, head)
+          return
+        }
+        try {
+          socket.destroy()
+        } catch {
+          // Already gone.
+        }
+      }
+      try {
+        // ONE parse of the query — the session parameter's home.
+        let searchParams: URLSearchParams
+        try {
+          searchParams = new URL(req.url ?? '/', 'http://local').searchParams
+        } catch {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        const values = searchParams.getAll(declared.sessionParam)
+        if (values.length > 1) {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        const value = values.length === 1 ? values[0] : undefined
+        // PB-22: the deny wall on the tunnel — the HTTP surrogate's rule
+        // verbatim. A remote context (the request's own virtual id, or the
+        // browser's reported current session) never opens a byte tunnel into
+        // a route declared `deny: true`; a local session's upgrade passes
+        // through untouched.
+        if (declared.deny) {
+          const current = getCurrentSession?.()
+          if ((current !== undefined && isVirtual(current)) || (value !== undefined && value.startsWith('zr~'))) {
+            answerUnbridgedSocket(socket, declared.plugin, 'route-denied')
+            return
+          }
+        }
+        // A LOCAL session (or no parameter at all): the original upgrade
+        // handler's business, the head bytes untouched.
+        if (value === undefined || value === '' || !value.startsWith('zr~')) {
+          passthrough()
+          return
+        }
+        const parts = fromVirtual(value)
+        if (parts === undefined || parts.id === '') {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        const tunnelRelay = relayOfServer(parts.serverId)
+        if (tunnelRelay === undefined) {
+          answerUnbridgedSocket(socket, declared.plugin, 'server-changed')
+          return
+        }
+        // The PB-2 bridge verdict, the SAME wall the HTTP surrogate raises:
+        // the tunnel opens only for a plugin bridged RIGHT NOW — an absent
+        // or unbridged status refuses with its own reason, and the local
+        // plugin handler is never reached.
+        const bridgeStatus = statusesOfServer(parts.serverId).find((entry) => entry.plugin === declared.plugin)
+        if (bridgeStatus === undefined || !bridgeStatus.bridged) {
+          answerUnbridgedSocket(socket, declared.plugin, bridgeStatus?.reason ?? 'not-on-server')
+          return
+        }
+        // ---- bridged: open the byte tunnel (PB-10) ---------------------
+        const controller = new AbortController()
+        socket.on('close', () => controller.abort())
+        const wsKey = typeof req.headers['sec-websocket-key'] === 'string' ? req.headers['sec-websocket-key'] : undefined
+        const wsVersion = typeof req.headers['sec-websocket-version'] === 'string' ? req.headers['sec-websocket-version'] : undefined
+        if (wsKey === undefined || wsVersion === undefined) {
+          answerUnbridgedSocket(socket, declared.plugin, 'bad-query')
+          return
+        }
+        const protocol = typeof req.headers['sec-websocket-protocol'] === 'string' ? req.headers['sec-websocket-protocol'] : undefined
+        const extensions = typeof req.headers['sec-websocket-extensions'] === 'string' ? req.headers['sec-websocket-extensions'] : undefined
+        const query = new URLSearchParams(searchParams)
+        query.set(declared.sessionParam, parts.id)
+        let tunnel: { tunnel: string; frames: AsyncIterable<Uint8Array> }
+        try {
+          log?.('opening tunnel for %s', declared.path)
+          tunnel = await tunnelRelay.pluginTunnelOpen(
+            {
+              plugin: declared.plugin,
+              version: declared.version,
+              digest: declared.digest,
+              path: declared.path,
+              query: query.toString(),
+              wsHeaders: {
+                'sec-websocket-key': wsKey,
+                'sec-websocket-version': wsVersion,
+                ...(protocol !== undefined ? { 'sec-websocket-protocol': protocol } : {}),
+                ...(extensions !== undefined ? { 'sec-websocket-extensions': extensions } : {}),
+              },
+              ...(head.length > 0 ? { head: head.toString('base64') } : {}),
+            },
+            controller.signal,
+          )
+        } catch (error) {
+          // The relay refused the open (unbridged walls arrive with their
+          // code in the error). The browser's handshake never completes.
+          const rawCode = (error as { code?: unknown } | null)?.code
+          const code = typeof rawCode === 'string' && rawCode !== '' ? rawCode : 'offline'
+          answerUnbridgedSocket(socket, declared.plugin, code)
+          return
+        }
+        tunnelsCurrent += 1
+        tunnelsOpened += 1
+        log?.('tunnel open for %s: %s', declared.path, tunnel.tunnel)
+        // ---- downstream: tunnel frames → the browser socket -------------
+        void (async () => {
+          try {
+            for await (const chunk of tunnel.frames) {
+              if (socketGone()) break
+              if (!socket.write(chunk)) {
+                // Real backpressure: the NEXT frame is not pulled until the
+                // browser socket drained — the tunnel's server half pauses
+                // its upstream read in turn (the same discipline the NDJSON
+                // streams run).
+                await new Promise<void>((resolve) => {
+                  const settled = (): void => {
+                    socket.off('drain', settled)
+                    socket.off('close', settled)
+                    resolve()
+                  }
+                  socket.once('drain', settled)
+                  socket.once('close', settled)
+                })
+                if (socketGone()) break
+              }
+            }
+          } catch {
+            // The tunnel died (transport or server-side failure) — the
+            // browser socket follows, below.
+          }
+          // Upstream is over: the browser's WebSocket ends here. A WebSocket
+          // close frame cannot be synthesized (this is a byte tunnel — the
+          // upstream's own close bytes, when the plugin sent any, already
+          // travelled as data), so the socket is cut the honest way.
+          if (!socketGone()) socket.destroy()
+        })()
+        // ---- upstream: browser bytes → ordered sends --------------------
+        let sendSeq = 0
+        let upstreamBroken = false
+        let pending = Promise.resolve()
+        socket.on('data', (chunk: Buffer) => {
+          let offset = 0
+          while (offset < chunk.length) {
+            const part = chunk.subarray(offset, Math.min(offset + 65536, chunk.length))
+            offset += part.length
+            const bytes = new Uint8Array(part)
+            const seq = sendSeq
+            sendSeq += 1
+            // ONE in-flight send at a time: each chunk chains behind the
+            // previous answer, which is what keeps the server-side sequence
+            // gate satisfied and the byte order intact.
+            pending = pending.then(async () => {
+              if (upstreamBroken) return
+              try {
+                await tunnelRelay.pluginTunnelSend(tunnel.tunnel, seq, bytes, controller.signal)
+              } catch {
+                upstreamBroken = true
+              }
+            })
+          }
+        })
+        const teardownTunnel = (): void => {
+          upstreamBroken = true
+          tunnelsCurrent -= 1
+          tunnelsClosed += 1
+          void tunnelRelay.pluginTunnelClose(tunnel.tunnel).catch(() => {})
+        }
+        socket.on('close', teardownTunnel)
+        socket.on('error', teardownTunnel)
+        } catch {
+          // Any unexpected failure in the bridged path: the socket goes.
+          try {
+            socket.destroy()
+          } catch {
+            // Already gone.
+          }
+        }
+      })().catch(() => {
+        try {
+          socket.destroy()
+        } catch {
+          // Already gone.
+        }
+      })
+      void originalHandler
+    }
+
+  const wrappedUpgradesGet = function get(this: Map<string, unknown>, pathname: string): unknown {
+    const entry = savedUpgradesGet.call(this, pathname)
+    if (!installed) return entry
+    if (typeof pathname !== 'string' || !pathname.startsWith('/')) return entry
+    const declared = upgradeRoutesOf(pathname)
+    if (declared === undefined) return entry
+    const originalHandler = entry !== undefined && isRecord(entry) && typeof (entry as { handler?: unknown }).handler === 'function'
+      ? (entry as { handler: unknown }).handler
+      : undefined
+    return {
+      path: pathname,
+      handler: surrogateUpgrade(declared, originalHandler),
+    }
+  } as unknown as typeof targetWithUpgrades.upgrades.get
+
+  target.match = wrappedMatch as typeof target.match
+  // Instance-owning property shadows Map.prototype.get — exactly the seam
+  // the probe verified (the host calls `this.upgrades.get(pathname)`).
+  targetWithUpgrades.upgrades.get = wrappedUpgradesGet
+
+  return {
+    uninstall() {
+      if (!installed) return
+      installed = false
+      // Only restore while the instance still holds OUR wrapper — a later
+      // wrapper chained over us captured this function, and restoring the
+      // original would silently drop ITS wrap. Ours goes inert instead.
+      if (target.match === wrappedMatch) target.match = savedMatch
+      if (targetWithUpgrades.upgrades.get === wrappedUpgradesGet) {
+        targetWithUpgrades.upgrades.get = savedUpgradesGet
+      }
+    },
+    diagnostics(): PluginRouteInterceptDiagnostics {
+      return {
+        installed,
+        shape: checkWebServerShape(webServer),
+        forwarded,
+        refused,
+        refusalsByReason: { ...refusalsByReason },
+        recentFailures: [...recentFailures],
+        adapterForwarded,
+        adapterResponseRewrites,
+        adapterResponsePassthroughs,
+        tunnelsCurrent,
+        tunnelsOpened,
+        tunnelsClosed,
+      }
+    },
+  }
+}

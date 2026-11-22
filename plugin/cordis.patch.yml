@@ -1,0 +1,11 @@
+# dsh-remote-bots — bundle patch layer (one package, one insert row).
+# Vendored from kadaliao/dsh-bots@0.17.1 and KyoMio/dsh-zen-remote@2.5.4;
+# see VENDORING.md. Row config is flat: zen-remote keys plus bots'
+# workdir / workdirs / language (defaults below mirror the upstreams).
+- insert:
+    - id: dsh-remote-bots
+      name: dsh-remote-bots
+      config:
+        enabled: true
+        workdir: ''
+        workdirs: {}
