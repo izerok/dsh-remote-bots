@@ -4,43 +4,72 @@ on:
     tags: ['v*']
 permissions:
   contents: write
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+env:
+  # Set to 'false' when a tag should publish a normal release instead of a
+  # prerelease. Tags containing a hyphen are always prereleases.
+  RELEASE_PRERELEASE: 'true'
+  DSH_VERSION: '0.2.2-rc.5'
 jobs:
-  build-and-release:
+  release:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      # Gate: the patch must still verify against its pinned upstream commit
-      # before anything is packaged.
-      - run: bash scripts/verify-patch.sh
-      - name: Assemble release package
+          node-version: '24'
+      - name: Install pnpm and the DSH CLI
+        run: npm install -g pnpm@11 "@deepseek-ai/dsh@${DSH_VERSION}"
+      - name: Verify sources and tag
+        run: bash scripts/verify-release.sh "${GITHUB_REF_NAME}"
+      - name: Build the single plugin tarball
         run: |
           set -euo pipefail
-          TAG="${{ github.ref_name }}"
-          PKG="dsh-remote-bots-${TAG}"
-          mkdir -p "${PKG}"
-          cp README.md LICENSE "${PKG}/"
-          cp -r docs patches scripts "${PKG}/"
-          zip -r "${PKG}.zip" "${PKG}"
-          cp patches/dsh-bots-zen-bridge.patch "dsh-bots-zen-bridge-${TAG}.patch"
-          sha256sum "${PKG}.zip" "dsh-bots-zen-bridge-${TAG}.patch" patches/dsh-bots-zen-bridge-0.17.0.patch > sha256sums.txt
-          ls -l "${PKG}.zip" "dsh-bots-zen-bridge-${TAG}.patch" patches/dsh-bots-zen-bridge-0.17.0.patch sha256sums.txt
-          cat sha256sums.txt
-      - name: Create prerelease
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          mkdir -p dist
+          (cd plugin && npm pack --silent --pack-destination ../dist >/dev/null)
+          TGZ="dist/dsh-remote-bots-${VERSION}.tgz"
+          [[ -f "${TGZ}" ]] || { echo "missing ${TGZ}" >&2; ls -l dist >&2; exit 1; }
+          (cd dist && sha256sum "dsh-remote-bots-${VERSION}.tgz" > SHA256SUMS.txt)
+          ls -l "${TGZ}" dist/SHA256SUMS.txt
+          cat dist/SHA256SUMS.txt
+      - name: Install smoke test in an isolated DSH_HOME
+        run: bash scripts/smoke-install.sh "dist/dsh-remote-bots-${GITHUB_REF_NAME#v}.tgz"
+      - name: Render release notes
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          BOTS_VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync('plugin/src/bots/package.json','utf8')).version")"
+          ZEN_VERSION="$(node -p "JSON.parse(require('node:fs').readFileSync('plugin/src/zen-remote/package.json','utf8')).version")"
+          sed \
+            -e "s/{{TAG}}/${TAG}/g" \
+            -e "s/{{VERSION}}/${VERSION}/g" \
+            -e "s/{{BOTS_VERSION}}/${BOTS_VERSION}/g" \
+            -e "s/{{ZEN_VERSION}}/${ZEN_VERSION}/g" \
+            .github/release-notes.md > dist/RELEASE_NOTES.md
+          head -20 dist/RELEASE_NOTES.md
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          TAG="${{ github.ref_name }}"
-          PKG="dsh-remote-bots-${TAG}"
-          gh release create "${TAG}" \
-            --prerelease \
-            --title "${TAG}" \
-            --notes-file .github/release-notes.md \
-            "${PKG}.zip" \
-            "dsh-bots-zen-bridge-${TAG}.patch" \
-            patches/dsh-bots-zen-bridge-0.17.0.patch \
-            sha256sums.txt
-          gh release view "${TAG}" --json tagName,isPrerelease,assets --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[] | {name: .name, size: .size}]}'
+          TAG="${GITHUB_REF_NAME}"
+          VERSION="${TAG#v}"
+          FLAGS=(--title "dsh-remote-bots ${TAG}")
+          if [[ "${RELEASE_PRERELEASE}" == "true" || "${TAG}" == *-* ]]; then
+            FLAGS+=(--prerelease)
+          fi
+          ASSETS=("dist/dsh-remote-bots-${VERSION}.tgz" dist/SHA256SUMS.txt)
+          if gh release view "${TAG}" >/dev/null 2>&1; then
+            gh release upload "${TAG}" "${ASSETS[@]}" --clobber
+            gh release edit "${TAG}" "${FLAGS[@]}" --notes-file dist/RELEASE_NOTES.md
+          else
+            gh release create "${TAG}" "${FLAGS[@]}" --notes-file dist/RELEASE_NOTES.md "${ASSETS[@]}"
+          fi
+          gh release view "${TAG}" --json tagName,isPrerelease,assets \
+            --jq '{tag: .tagName, prerelease: .isPrerelease, assets: [.assets[] | {name: .name, size: .size}]}'

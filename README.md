@@ -5,7 +5,33 @@
 - 上游 A：[kadaliao/dsh-bots](https://github.com/kadaliao/dsh-bots) — Grok 式 Bot 团队，每个 Bot 有自己的人设、模型、技能、记忆，dispatcher（Atlas）分活，任务在独立会话里跑。
 - 上游 B：[KyoMio/dsh-zen-remote](https://github.com/KyoMio/dsh-zen-remote) — DSH 远程访问层，peer 组网 / host 手机 PWA / client 桌面挂载，零公网 IP、E2EE 加密、锁屏推送。
 
-本仓**不 fork、不改上游代码**。它只提供三样东西：组合部署指南、一份可选的桥接 patch、以及校验这份 patch 的脚本。
+本仓有两种交付方式：
+
+1. **单插件包（推荐）**：把两半 vendor 成一个 DSH 插件 `dsh-remote-bots`，桥接声明已内置，从 Releases 下载 tgz 手动安装。
+2. **旧的分装流程**：分别安装两个上游插件，再用 `patches/` 里的桥接 patch 改 bots。保留用于对照和上游未合并时的回退。
+
+## 安装（单插件，推荐）
+
+从 [Releases](https://github.com/izerok/dsh-remote-bots/releases) 下载 `dsh-remote-bots-<version>.tgz`：
+
+```bash
+# 完全退出 DSH；建议先备份 ~/.dsh
+# 同一 profile 装过旧的两个插件时，先移除
+dsh plugin --profile web remove dsh-zen-remote @kadaliao/dsh-bots
+
+# profile 会记录这个 file: 路径，安装后不要删 tgz
+mkdir -p ~/.dsh/plugin-packages
+mv dsh-remote-bots-<version>.tgz ~/.dsh/plugin-packages/
+dsh plugin --profile web add ~/.dsh/plugin-packages/dsh-remote-bots-<version>.tgz
+
+# 重启 DSH
+```
+
+- 单插件包**替代** `dsh-zen-remote` 和 `@kadaliao/dsh-bots`，同一个 profile 不要同时装三者。
+- DSH Desktop 使用 `--profile desktop`，并先完全退出 App。
+- `dsh` 不在 PATH 时，可用 `npx --yes @deepseek-ai/dsh@<本机 DSH 版本> plugin ...`。
+- 也可以直接安装 release URL：`dsh plugin --profile web add https://github.com/izerok/dsh-remote-bots/releases/download/<tag>/dsh-remote-bots-<version>.tgz`。
+- 安装需要从 npm registry 拉 `web-push` 依赖。
 
 ## 组合长什么样
 
@@ -22,12 +48,15 @@ Bot 队的定时任务（早报、收件箱扫荡）本来就在主机上跑，�
 
 | 组件 | 已核版本 | 说明 |
 | --- | --- | --- |
+| dsh-remote-bots（本仓单插件包） | 1.0.0 | Releases 里的 `dsh-remote-bots-<version>.tgz`；内含下面两半 + 桥接声明 |
 | DeepSeek Harness | 0.2.2-rc.5 | zen-remote 要求 `>=0.2.1-alpha.2 <0.3.0`；0.1.x 上 zen-remote 不支持；npm 最新是 rc.5，无 0.2.2 正式版 |
 | dsh-zen-remote | 2.5.4 | npm `dsh-zen-remote` |
 | dsh-bots | 0.17.1（上游 commit `c265612`） | npm `@kadaliao/dsh-bots`；patch 针对此 commit |
 | 桥接后 bots 版本 | 0.17.2-zen.2 | 只在打了 patch 的副本里，见下；zen.1（无 rewriteIds）已归档 |
 
-## 开箱即用的部分（不用打 patch）
+## 旧流程：分别安装两个上游插件
+
+> 单插件包已内置桥接声明，正常安装不需要下面这些步骤；本节保留给旧流程和排查对照。
 
 两插件同装一个 profile 没有冲突：cordis patch id 不同（`dsh-zen-remote` / `bots`），包名、路由、存储目录都不同。
 
@@ -44,9 +73,11 @@ bash scripts/install.sh
 
 然后在 host 上把想远程聊的 Bot 会话逐个开远程：侧边栏会话 `…` 菜单 → Enable remote，或会话标题栏的 globe 图标。Bot 的 home 是普通 DSH 会话（`session-<uuid>`），任务是 `ticket-<id>` 会话；ticket 是独立顶层会话，不会自动跟随 home 共享，需要时单独开。`autoShareNewSessions`（默认 `false`）建议保持关闭——开它等于分享所有新会话，没有“只分享 ticket”的粒度（实证见 [docs/bridge.md](docs/bridge.md) 的分享策略一节）。
 
-手机上能做的：跟已共享的 Bot 会话聊天、跟进任务、看文件 diff、收推送。不能做的：见下一节。
+手机上能做的：跟已共享的 Bot 会话聊天、跟进任务、看文件 diff、收推送。Bots 管理面板要远程用，需要安装本仓单插件包，并在 host 的 zen-remote 设置页打开「插件桥」同意（默认 OFF）；旧流程则还要打 patch，背景见下一节。
 
-## 缺口：Bots 面板本身远程用不了（开箱状态）
+## 缺口：Bots 面板本身远程用不了（旧流程背景）
+
+> 用单插件包可以跳过本节：桥接声明已经内置。以下描述的是旧的分装流程和缺口背景。
 
 Bots 的管理面板（招团队、改 Bot 人设/模型、Requests 看板、用量统计）数据走它自己的后端路由 `GET/POST /__dsh_bots/*`。zen-remote 没有给它做内置适配，bots 上游也没有声明 zen-remote 的 Plugin Bridge。
 
@@ -78,6 +109,8 @@ Bots 的管理面板（招团队、改 Bot 人设/模型、Requests 看板、用
 
 ## 验证状态（诚实版）
 
+**单插件包冒烟（CI）**：在临时 `DSH_HOME` 里 `dsh plugin --profile web add <tgz>`，确认 bundle 自动进入 `dsh.profile.bundles`、`--dump-config` 含 `dsh-remote-bots` row、web profile 启动、`/__dsh_bots/state` 返回 200 且含 Bot 数据、zen 半边注册 `push_notify`。该测试覆盖接线层；下面 2026-11-22 的记录针对两半的上游组件，不是对单插件包的重复验证。
+
 **2026-11-22 全面测试已跑完**（隔离环境，DSH 0.2.2-rc.5 + zen-remote 2.5.4 + bots 0.17.1，三个独立 DSH_HOME，未碰主力 profile，无真实模型 key）。完整记录在 [docs/validation-2026-11-22.md](docs/validation-2026-11-22.md)，主代理已从盘上复核关键证据。
 
 已验：
@@ -108,5 +141,5 @@ Bots 的管理面板（招团队、改 Bot 人设/模型、Requests 看板、用
 
 ## 出处与许可
 
-- dsh-bots：MIT，作者 kadaliao；dsh-zen-remote：MIT，作者 KyoMio。本仓新增内容（指南、patch、脚本）同样 MIT。
+- dsh-bots：MIT，作者 kadaliao；dsh-zen-remote：MIT，作者 KyoMio。本仓新增内容（单插件接线层、指南、patch、脚本）同样 MIT。
 - 本仓与两个上游作者均无隶属关系；patch 若被上游接受，本仓即失去存在意义，那是最好的结局。

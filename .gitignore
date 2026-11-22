@@ -2,3 +2,7 @@
 # link: installs). Recreate with `pnpm install` inside plugin/.
 # Never commit node_modules; the plugin's pnpm-lock.yaml IS committed.
 plugin/node_modules/
+
+# Release/pack artifacts (built by the release workflow and npm pack).
+dist/
+plugin/*.tgz

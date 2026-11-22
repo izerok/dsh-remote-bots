@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# LEGACY: install the two upstream plugins separately.
+# The recommended path is the single merged package from Releases:
+#   dsh plugin --profile web add /path/to/dsh-remote-bots-<version>.tgz
 # Install dsh-bots + dsh-zen-remote into the DSH `web` profile.
 # Only runs the two install commands documented in the two upstreams' READMEs.
 # Pinned versions expected (checked afterwards from the profile if present):

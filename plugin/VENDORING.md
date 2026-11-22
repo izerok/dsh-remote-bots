@@ -41,7 +41,7 @@ GitHub Release）；zen-remote 最新 Release 仍是 `v2.5.4`（2026-11-20 发�
 | M1 | `src/bots/index.js`，约 6491–6528 行（纯插入，0 行上游改动） | 插入桥接声明段（`ctx.inject(['zenRemote'])` + 声明），与 `patches/dsh-bots-zen-bridge.patch` 的桥接段相同，**仅** `version` 由 `'0.17.2-zen.2'` 改为 `'1.0.0'`；`plugin` 保持 `'@kadaliao/dsh-bots'` | 合并后仍需向 zen 的改道层登记；版本改为合并插件版本；`plugin` 保持旧键使现有 `pluginBridgeConsent` 同意不用重开（有意偏离文档字面，见下） |
 | M2 | 其余 bots 文件 | 零改动（含 `client.js` 的 `BOTS_VERSION = '0.17.1'`、`package.json` 的 `0.17.1`） | 它就是 bots 0.17.1 的代码 |
 | M3 | 全部 zen-remote 文件 | 零改动 | 原样 vendor |
-| M4 | 新增（接线层，全部新写） | `plugin/package.json`、`plugin/index.js`、`plugin/client.js`（由 `scripts/build-plugin-client.mjs` 生成）、`plugin/cordis.patch.yml`、本文件、`plugin/icon.svg`（沿用 bots 的）、`plugin/LICENSES/` | 单插件入口与发布单元 |
+| M4 | 新增（接线层，全部新写） | `plugin/package.json`、`plugin/index.js`、`plugin/client.js`（由 `scripts/build-plugin-client.mjs` 生成）、`plugin/cordis.patch.yml`、本文件、`plugin/README.md`、`plugin/icon.svg`（沿用 bots 的）、`plugin/LICENSES/` | 单插件入口与发布单元 |
 
 声明的其余字段与 patch 完全一致：
 `routes: [{path: '/__dsh_bots', prefix: true, scope: 'server', methods: ['GET','POST'], maxBody: 41943040, rewriteIds: {fields: ['sessionId']}}]`。

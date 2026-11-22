@@ -12,3 +12,30 @@ jobs:
         with:
           node-version: '20'
       - run: bash scripts/verify-patch.sh
+  verify-plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - run: bash scripts/verify-release.sh
+  install-smoke:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - name: Install pnpm and the DSH CLI
+        run: npm install -g pnpm@11 @deepseek-ai/dsh@0.2.2-rc.5
+      - name: Pack the single plugin
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          (cd plugin && npm pack --silent --pack-destination ../dist >/dev/null)
+          ls -l dist
+      - name: Install and boot in an isolated DSH_HOME
+        run: bash scripts/smoke-install.sh dist/dsh-remote-bots-*.tgz
