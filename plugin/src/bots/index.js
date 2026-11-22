@@ -6517,7 +6517,7 @@ export function apply(ctx, config, deps = {}) {
     if (!bridge || typeof bridge.bridge !== 'function') return;
     const declaration = {
       plugin: '@kadaliao/dsh-bots',
-      version: '1.0.0',
+      version: '1.0.1',
       routes: [
         { path: '/__dsh_bots', prefix: true, scope: 'server', methods: ['GET', 'POST'], maxBody: 41943040, rewriteIds: { fields: ['sessionId'] } },
       ],

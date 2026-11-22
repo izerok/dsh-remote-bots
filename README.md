@@ -48,7 +48,7 @@ Bot 队的定时任务（早报、收件箱扫荡）本来就在主机上跑，�
 
 | 组件 | 已核版本 | 说明 |
 | --- | --- | --- |
-| dsh-remote-bots（本仓单插件包） | 1.0.0 | Releases 里的 `dsh-remote-bots-<version>.tgz`；内含下面两半 + 桥接声明 |
+| dsh-remote-bots（本仓单插件包） | 1.0.1 | Releases 里的 `dsh-remote-bots-<version>.tgz`；内含下面两半 + 桥接声明 |
 | DeepSeek Harness | 0.2.2-rc.5 | zen-remote 要求 `>=0.2.1-alpha.2 <0.3.0`；0.1.x 上 zen-remote 不支持；npm 最新是 rc.5，无 0.2.2 正式版 |
 | dsh-zen-remote | 2.5.4 | npm `dsh-zen-remote` |
 | dsh-bots | 0.17.1（上游 commit `c265612`） | npm `@kadaliao/dsh-bots`；patch 针对此 commit |

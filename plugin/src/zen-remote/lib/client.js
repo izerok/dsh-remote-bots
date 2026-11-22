@@ -20483,9 +20483,9 @@ const shares_ts_1 = require("./client-data/shares.js");
 const locales_ts_1 = require("./client/locales.js");
 const settings_css_ts_1 = require("./client/settings/settings-css.js");
 /** Settings entry (= profile entry id = bundle row id) this page edits. */
-exports.SETTINGS_ENTRY_ID = 'dsh-zen-remote';
+exports.SETTINGS_ENTRY_ID = 'dsh-remote-bots';
 /** `plugins.row.config` key: <package name>#<row id> as the bundle patch declares the row. */
-exports.SETTINGS_ROW_KEY = 'dsh-zen-remote#dsh-zen-remote';
+exports.SETTINGS_ROW_KEY = 'dsh-remote-bots#dsh-remote-bots';
 /**
  * Register the dictionaries, the settings stylesheet, and (lazily, only where
  * the settings service exists) the plugin-row configuration block.
@@ -22463,7 +22463,7 @@ function GatewayWizard(props) {
     };
     // Only show on the bundle detail page (never on a component row page).
     const subject = props.subject;
-    if (subject !== undefined && (subject.kind === 'row' || (subject.pkg?.name !== undefined && subject.pkg.name !== 'dsh-zen-remote'))) {
+    if (subject !== undefined && (subject.kind === 'row' || (subject.pkg?.name !== undefined && subject.pkg.name !== 'dsh-remote-bots'))) {
         return null;
     }
     const baseHostLights = (0, wizard_ts_1.deriveWizardLights)({ gatewayReachable, poll, startResult });
@@ -24056,7 +24056,7 @@ const locales_ts_1 = require("./client/locales.js");
 const register_settings_ts_1 = require("./client/settings/register-settings.js");
 const wizard_css_ts_1 = require("./client/wizard/wizard-css.js");
 /** `plugins.bundle.config` key: the bundle's package name. */
-exports.WIZARD_BUNDLE_KEY = 'dsh-zen-remote';
+exports.WIZARD_BUNDLE_KEY = 'dsh-remote-bots';
 /**
  * Register the wizard stylesheet and (lazily, only where the settings
  * service exists) the bundle detail-page top block.

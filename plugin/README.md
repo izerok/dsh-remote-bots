@@ -27,7 +27,7 @@ dsh plugin --profile web add /absolute/path/to/dsh-remote-bots-<version>.tgz
 
 | 组件 | 版本 |
 | --- | --- |
-| 合并插件 `dsh-remote-bots` | `1.0.0` |
+| 合并插件 `dsh-remote-bots` | `1.0.1` |
 | bots 一半 | `0.17.1` |
 | zen-remote 一半 | `2.5.4` |
 
